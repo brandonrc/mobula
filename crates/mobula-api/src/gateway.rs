@@ -82,6 +82,11 @@ async fn proxy(
     req: Request,
 ) -> Result<Response, GatewayError> {
     let started = std::time::Instant::now();
+    let subject = req
+        .extensions()
+        .get::<mobula_auth::Identity>()
+        .map(|i| i.subject.clone())
+        .unwrap_or_else(|| "-".into());
     let (parts, body) = req.into_parts();
 
     let path_and_query = parts
@@ -129,10 +134,10 @@ async fn proxy(
     }
 
     // Append-only audit trail (issue #8): every proxied request, one
-    // structured line. Caller identity joins this record when Phase 2
-    // authn lands.
+    // structured line. Subject is "-" only in dev-unauthenticated mode.
     tracing::info!(
         target: "mobula::audit",
+        subject = %subject,
         cluster = %cluster.id,
         %method,
         path = %path,
@@ -212,6 +217,11 @@ mod ws {
     use tokio_tungstenite::tungstenite::protocol::Message as TsMessage;
 
     pub async fn proxy_upgrade(cluster: &ClusterEndpoint, req: Request) -> Response {
+        let subject = req
+            .extensions()
+            .get::<mobula_auth::Identity>()
+            .map(|i| i.subject.clone())
+            .unwrap_or_else(|| "-".into());
         let (mut parts, _body) = req.into_parts();
 
         let path_and_query = parts
@@ -262,6 +272,14 @@ mod ws {
             Ok(u) => u,
             Err(e) => return e.into_response(),
         };
+        tracing::info!(
+            target: "mobula::audit",
+            subject = %subject,
+            cluster = %cluster.id,
+            method = "WS",
+            path = %parts.uri.path(),
+            "gateway websocket bridge opened"
+        );
         upgrade
             .on_upgrade(move |client| bridge(client, upstream))
             .into_response()

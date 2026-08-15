@@ -57,12 +57,22 @@ viewer = ["*"]          # any authenticated user can read
 ```
 
 ```bash
-mobula serve --registry clusters.toml --auth-config auth.toml --bind 0.0.0.0:8484
-# clients attach their JWT; it never reaches the cluster (swapped for the
-# cluster's Ray token at the gateway):
-export RAY_JOB_HEADERS='{"Authorization": "Bearer <user-jwt>"}'
+mobula serve --registry clusters.toml --auth-config auth.toml \
+  --bind 0.0.0.0:8484 --audit-log /var/log/mobula/audit.jsonl
+
+# humans: device-code sign-in, token stored with 0600 perms
+mobula login --issuer https://keycloak.example.com/realms/nebari
+export RAY_JOB_HEADERS="{\"Authorization\": \"Bearer $(mobula token)\"}"
 ray job submit --address http://demo.ray.example.com:8484 -- python train.py
+
+# machines: service-account token via client-credentials
+MOBULA_CLIENT_SECRET=... mobula token \
+  --issuer https://keycloak.example.com/realms/nebari --client-id ci-bot
 ```
+
+The caller's JWT never reaches the cluster — the gateway swaps it for the
+cluster's static Ray token and records `subject`, cluster, method, path,
+status, and latency in the audit log.
 
 Without `--auth-config`, non-loopback binds require
 `--dev-allow-unauthenticated` (the gateway would otherwise expose

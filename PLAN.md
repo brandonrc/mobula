@@ -84,8 +84,18 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 > the dev flag). Six e2e tests against a mock OIDC issuer with real
 > RSA-signed tokens: 401 (missing/garbage/expired/wrong-aud), 403
 > (viewer-write, unmapped groups), 200 (developer submit), public-path
-> narrowing, ext_authz matrix. Outstanding: device-code flow for CLI,
-> service-account tokens, durable audit records, FIPS crypto provider.
+> narrowing, ext_authz matrix.
+>
+> **Phase 2 complete 2026-08-15:** device-code flow (`mobula login`, RFC
+> 8628 with slow_down handling, credentials stored 0600), service-account
+> tokens (`mobula token --issuer/--client-id/--client-secret`, RFC 6749
+> client-credentials — Mobula never mints tokens itself), caller identity
+> in every gateway audit event (HTTP + websocket), and `serve --audit-log`
+> writing `mobula::audit` as append-only JSONL. Explicitly deferred:
+> Postgres-backed audit records (lands with the Phase 3 storage layer —
+> the JSONL file satisfies append-only/exportable until then) and the
+> FIPS crypto provider (aws-lc-rs; grouped with the release-engineering
+> item, required before any DISA accreditation claim, ADR-0008).
 - Mobula owns JWT validation, device-code flow for CLI, and service-account
   tokens **in both modes** — NebariApp/SecurityPolicy auth is browser-only
   (redirect OIDC + cookies) and would break bearer clients. Nebari mode

@@ -77,11 +77,40 @@ pub enum AuthError {
     InvalidToken(String),
     #[error("token key id not found in JWKS")]
     UnknownKeyId,
+    #[error("token flow failed: {0}")]
+    Flow(String),
 }
 
-#[derive(Deserialize)]
-struct DiscoveryDoc {
-    jwks_uri: String,
+pub mod flows;
+
+/// Subset of the OIDC provider metadata Mobula uses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderMetadata {
+    pub jwks_uri: String,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    #[serde(default)]
+    pub device_authorization_endpoint: Option<String>,
+}
+
+/// Fetch `{issuer}/.well-known/openid-configuration`.
+pub async fn discover_metadata(
+    client: &reqwest::Client,
+    issuer: &str,
+) -> Result<ProviderMetadata, AuthError> {
+    let url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
+    client
+        .get(&url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| AuthError::Discovery(e.without_url().to_string()))?
+        .json()
+        .await
+        .map_err(|e| AuthError::Discovery(e.without_url().to_string()))
 }
 
 #[derive(Deserialize)]
@@ -108,19 +137,7 @@ impl Validator {
     /// Run OIDC discovery and the initial JWKS fetch. Fails fast — a
     /// control plane that cannot validate tokens must not start serving.
     pub async fn discover(config: AuthConfig, client: reqwest::Client) -> Result<Self, AuthError> {
-        let url = format!(
-            "{}/.well-known/openid-configuration",
-            config.issuer.trim_end_matches('/')
-        );
-        let doc: DiscoveryDoc = client
-            .get(&url)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| AuthError::Discovery(e.without_url().to_string()))?
-            .json()
-            .await
-            .map_err(|e| AuthError::Discovery(e.without_url().to_string()))?;
+        let doc = discover_metadata(&client, &config.issuer).await?;
 
         let validator = Self {
             config,
