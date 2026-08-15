@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Opaque identifier for a managed Ray cluster.
 ///
@@ -19,7 +20,7 @@ impl std::fmt::Display for ClusterId {
 ///
 /// v0 targets the KubeRay backend only; fields deliberately mirror what maps
 /// onto a RayCluster CR so the provisioner stays a thin translation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClusterSpec {
     pub name: String,
     pub project: String,
@@ -37,7 +38,7 @@ pub struct ClusterSpec {
 /// Autoscaling in v0 is actuated exclusively through these replica bounds,
 /// which translate to KubeRay worker-group fields — never by reading demand
 /// from GCS (ADR-0002).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WorkerGroup {
     pub name: String,
     pub cpu: String,
@@ -49,7 +50,7 @@ pub struct WorkerGroup {
 }
 
 /// Lifecycle states of a managed cluster (PLAN.md §3.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ClusterState {
     Pending,

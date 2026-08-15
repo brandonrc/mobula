@@ -23,18 +23,64 @@ use utoipa_swagger_ui::SwaggerUi;
 /// API contract users see.
 #[derive(OpenApi)]
 #[openapi(
-    paths(healthz, version),
-    components(schemas(VersionInfo)),
+    paths(
+        healthz,
+        version,
+        clusters::list_clusters,
+        clusters::get_cluster,
+        clusters::create_cluster,
+        clusters::delete_cluster,
+    ),
+    components(
+        schemas(
+            VersionInfo,
+            clusters::CreateCluster,
+            clusters::ClusterView,
+            mobula_core::ClusterSpec,
+            mobula_core::WorkerGroup,
+            mobula_core::ClusterState,
+        )
+    ),
+    modifiers(&BearerAuth),
+    tags(
+        (name = "system", description = "Health and version probes."),
+        (name = "clusters", description = "Cluster lifecycle. Reads need any \
+         authenticated role; create/terminate need Write on the cluster \
+         target (Operator or Admin). Mounted only when the lifecycle \
+         controller is enabled (`serve --kuberay-namespace`)."),
+    ),
     info(
         title = "Mobula",
-        description = "FOSS control plane for Ray clusters. Cluster-bound \
-        traffic (the Ray Jobs API) is served by hostname, not documented \
-        here: each registered cluster's hostname exposes Ray's own \
-        /api/jobs/ surface through the federating gateway.",
+        description = "FOSS control plane for Ray clusters. All endpoints \
+        take a Bearer JWT (OIDC). Note: the Ray Jobs API is NOT documented \
+        here — it is served by hostname, each registered cluster's hostname \
+        proxying Ray's own /api/jobs/ surface through the federating \
+        gateway. This spec covers Mobula's own control-plane routes.",
         license(name = "Apache-2.0")
     )
 )]
 struct ApiDoc;
+
+/// Adds the `bearer` HTTP security scheme so generated clients know every
+/// route expects `Authorization: Bearer <jwt>`.
+struct BearerAuth;
+
+impl utoipa::Modify for BearerAuth {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("JWT")
+                        .build(),
+                ),
+            );
+        }
+    }
+}
 
 #[derive(Serialize, ToSchema)]
 struct VersionInfo {
@@ -268,6 +314,31 @@ mod tests {
         assert!(doc["paths"]["/healthz"].is_object());
         assert!(doc["paths"]["/api/v1/version"].is_object());
         assert!(doc["components"]["schemas"]["VersionInfo"].is_object());
+        // The cluster lifecycle contract the UI generates against.
+        assert!(doc["paths"]["/api/v1/clusters"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/clusters"]["post"].is_object());
+        assert!(doc["paths"]["/api/v1/clusters/{id}"]["delete"].is_object());
+        assert!(doc["components"]["schemas"]["ClusterView"].is_object());
+        assert!(doc["components"]["schemas"]["ClusterSpec"].is_object());
+        assert!(doc["components"]["schemas"]["WorkerGroup"].is_object());
+        // Bearer security scheme is advertised for client codegen.
+        assert_eq!(
+            doc["components"]["securitySchemes"]["bearer"]["scheme"],
+            "bearer"
+        );
+    }
+
+    /// Emit the OpenAPI document to `openapi.json` at the repo root so
+    /// mobula-ui (and its codegen) can vendor a committed contract without
+    /// running the server. Run with `cargo test -p mobula-api export_openapi`.
+    #[test]
+    fn export_openapi() {
+        let json = serde_json::to_string_pretty(&ApiDoc::openapi()).unwrap();
+        // CARGO_MANIFEST_DIR = crates/mobula-api; write to the workspace root.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        std::fs::write(root.join("openapi.json"), json + "\n").unwrap();
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
+utoipa.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

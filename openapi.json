@@ -1,0 +1,396 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Mobula",
+    "description": "FOSS control plane for Ray clusters. All endpoints take a Bearer JWT (OIDC). Note: the Ray Jobs API is NOT documented here — it is served by hostname, each registered cluster's hostname proxying Ray's own /api/jobs/ surface through the federating gateway. This spec covers Mobula's own control-plane routes.",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "version": "0.0.1"
+  },
+  "paths": {
+    "/api/v1/clusters": {
+      "get": {
+        "tags": [
+          "clusters"
+        ],
+        "operationId": "list_clusters",
+        "responses": {
+          "200": {
+            "description": "All managed clusters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ClusterView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No/invalid token"
+          },
+          "403": {
+            "description": "Missing Read on cluster"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "clusters"
+        ],
+        "operationId": "create_cluster",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCluster"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Desired state recorded; reconciler will converge"
+          },
+          "403": {
+            "description": "Missing Write on cluster (Operator/Admin only)"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/clusters/{id}": {
+      "get": {
+        "tags": [
+          "clusters"
+        ],
+        "operationId": "get_cluster",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cluster id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The cluster",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such cluster"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "clusters"
+        ],
+        "operationId": "delete_cluster",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cluster id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Marked for termination; reconciler tears it down"
+          },
+          "404": {
+            "description": "No such cluster"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/version": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Control-plane identity and version.",
+        "operationId": "version",
+        "responses": {
+          "200": {
+            "description": "Name and semver",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Liveness/readiness probe.",
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "Control plane is up",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ClusterSpec": {
+        "type": "object",
+        "description": "Declarative spec for a managed Ray cluster.\n\nv0 targets the KubeRay backend only; fields deliberately mirror what maps\nonto a RayCluster CR so the provisioner stays a thin translation.",
+        "required": [
+          "name",
+          "project",
+          "ray_version",
+          "image",
+          "head_cpu",
+          "head_memory",
+          "worker_groups"
+        ],
+        "properties": {
+          "head_cpu": {
+            "type": "string"
+          },
+          "head_memory": {
+            "type": "string"
+          },
+          "image": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "project": {
+            "type": "string"
+          },
+          "ray_version": {
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Idle TTL in seconds; `None` disables reaping.",
+            "minimum": 0
+          },
+          "worker_groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkerGroup"
+            }
+          }
+        }
+      },
+      "ClusterState": {
+        "type": "string",
+        "description": "Lifecycle states of a managed cluster (PLAN.md §3.1).",
+        "enum": [
+          "pending",
+          "provisioning",
+          "running",
+          "degraded",
+          "updating",
+          "suspending",
+          "suspended",
+          "terminating",
+          "terminated"
+        ]
+      },
+      "ClusterView": {
+        "type": "object",
+        "description": "A cluster as the control plane sees it: desired spec metadata plus the\nlast observed state (reconstructed from the provisioner, ADR-0006).",
+        "required": [
+          "id",
+          "generation",
+          "desired",
+          "observed_generation",
+          "project",
+          "ray_version"
+        ],
+        "properties": {
+          "desired": {
+            "type": "string",
+            "description": "\"running\" | \"terminated\" — the operator's intent."
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bumps when the spec changes; drives the reconcile idempotency key.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "observed_generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "observed_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Observed lifecycle state, if the cluster has been reconciled."
+          },
+          "project": {
+            "type": "string"
+          },
+          "ray_version": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateCluster": {
+        "type": "object",
+        "description": "Request body for creating/updating a managed cluster.",
+        "required": [
+          "id",
+          "spec"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable cluster id (also the gateway routing key / RayCluster name)."
+          },
+          "spec": {
+            "$ref": "#/components/schemas/ClusterSpec"
+          }
+        }
+      },
+      "VersionInfo": {
+        "type": "object",
+        "required": [
+          "name",
+          "version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Always \"mobula\".",
+            "example": "mobula"
+          },
+          "version": {
+            "type": "string",
+            "description": "Control-plane semver.",
+            "example": "0.0.1"
+          }
+        }
+      },
+      "WorkerGroup": {
+        "type": "object",
+        "description": "A homogeneous group of Ray worker nodes.\n\nAutoscaling in v0 is actuated exclusively through these replica bounds,\nwhich translate to KubeRay worker-group fields — never by reading demand\nfrom GCS (ADR-0002).",
+        "required": [
+          "name",
+          "cpu",
+          "memory",
+          "min_replicas",
+          "max_replicas",
+          "replicas"
+        ],
+        "properties": {
+          "cpu": {
+            "type": "string"
+          },
+          "gpu": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_replicas": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "memory": {
+            "type": "string"
+          },
+          "min_replicas": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "replicas": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "system",
+      "description": "Health and version probes."
+    },
+    {
+      "name": "clusters",
+      "description": "Cluster lifecycle. Reads need any authenticated role; create/terminate need Write on the cluster target (Operator or Admin). Mounted only when the lifecycle controller is enabled (`serve --kuberay-namespace`)."
+    }
+  ]
+}

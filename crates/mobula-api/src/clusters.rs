@@ -17,6 +17,7 @@ use mobula_auth::{Identity, PermissionType, Target};
 use mobula_controller::{DesiredState, Store};
 use mobula_core::{ClusterId, ClusterSpec};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::auth_layer::authorize;
 
@@ -25,17 +26,24 @@ pub struct ClusterApiState {
     pub store: Arc<dyn Store>,
 }
 
-#[derive(Deserialize)]
+/// Request body for creating/updating a managed cluster.
+#[derive(Deserialize, ToSchema)]
 pub struct CreateCluster {
+    /// Stable cluster id (also the gateway routing key / RayCluster name).
     pub id: String,
     pub spec: ClusterSpec,
 }
 
-#[derive(Serialize)]
+/// A cluster as the control plane sees it: desired spec metadata plus the
+/// last observed state (reconstructed from the provisioner, ADR-0006).
+#[derive(Serialize, ToSchema)]
 pub struct ClusterView {
     pub id: String,
+    /// Bumps when the spec changes; drives the reconcile idempotency key.
     pub generation: u64,
+    /// "running" | "terminated" — the operator's intent.
     pub desired: String,
+    /// Observed lifecycle state, if the cluster has been reconciled.
     pub observed_state: Option<String>,
     pub observed_generation: u64,
     pub project: String,
@@ -71,6 +79,13 @@ fn store_err(e: mobula_controller::StoreError) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/clusters", tag = "clusters",
+    responses((status = 200, description = "All managed clusters", body = [ClusterView]),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Read on cluster")),
+    security(("bearer" = []))
+)]
 async fn list_clusters(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
@@ -87,6 +102,13 @@ async fn list_clusters(
     }
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/clusters/{id}", tag = "clusters",
+    params(("id" = String, Path, description = "Cluster id")),
+    responses((status = 200, description = "The cluster", body = ClusterView),
+              (status = 404, description = "No such cluster")),
+    security(("bearer" = []))
+)]
 async fn get_cluster(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
@@ -102,6 +124,13 @@ async fn get_cluster(
     }
 }
 
+#[utoipa::path(
+    post, path = "/api/v1/clusters", tag = "clusters",
+    request_body = CreateCluster,
+    responses((status = 201, description = "Desired state recorded; reconciler will converge"),
+              (status = 403, description = "Missing Write on cluster (Operator/Admin only)")),
+    security(("bearer" = []))
+)]
 async fn create_cluster(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
@@ -130,6 +159,13 @@ async fn create_cluster(
     }
 }
 
+#[utoipa::path(
+    delete, path = "/api/v1/clusters/{id}", tag = "clusters",
+    params(("id" = String, Path, description = "Cluster id")),
+    responses((status = 202, description = "Marked for termination; reconciler tears it down"),
+              (status = 404, description = "No such cluster")),
+    security(("bearer" = []))
+)]
 async fn delete_cluster(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,

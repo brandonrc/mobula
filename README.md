@@ -78,6 +78,15 @@ Without `--auth-config`, non-loopback binds require
 `--dev-allow-unauthenticated` (the gateway would otherwise expose
 registered clusters to anyone who can reach the port).
 
+## API contract
+
+The full control-plane API is described by OpenAPI, served live at
+`/api/v1/openapi.json` (Swagger UI at `/docs`) and committed at
+[`openapi.json`](openapi.json) for offline codegen — `mobula-ui` and other
+clients generate a typed client from it. CI fails if the committed spec
+drifts from the code. Every route takes a Bearer JWT; the Ray Jobs API is
+hostname-routed through the gateway and intentionally out of this spec.
+
 Workspace layout: `mobula-core` (domain model, no cloud/K8s deps) ·
 `mobula-provision` (Provisioner trait; KubeRay backend first) · `mobula-api`
 (HTTP surface + future Jobs gateway) · `mobula-proxy` (standalone-mode
