@@ -7,6 +7,8 @@
 
 pub mod cluster;
 pub mod registry;
+pub mod service;
 
 pub use cluster::{ClusterId, ClusterSpec, ClusterState, TransitionError, WorkerGroup};
 pub use registry::{ClusterEndpoint, ClusterRegistry, RegistryError};
+pub use service::{ServiceSpec, UpgradeStrategy};

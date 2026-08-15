@@ -140,6 +140,20 @@ pub async fn authed_app_with_store(idp: &Idp, store: Arc<dyn Store>) -> Router {
     )
 }
 
+/// Full app with auth enabled and the Serve-service routes mounted.
+pub async fn authed_app_with_services(
+    idp: &Idp,
+    provisioner: Arc<dyn mobula_provision::ServiceProvisioner>,
+) -> Router {
+    mobula_api::build_app_full_svc(
+        ClusterRegistry::default(),
+        Some(validator_for(idp).await),
+        None,
+        Default::default(),
+        Some(provisioner),
+    )
+}
+
 /// Same, but with a governance policy (quotas/prices) for Phase 4 tests.
 pub async fn authed_app_with_policy(
     idp: &Idp,

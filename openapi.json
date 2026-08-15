@@ -141,6 +141,129 @@
         ]
       }
     },
+    "/api/v1/services": {
+      "get": {
+        "tags": [
+          "services"
+        ],
+        "operationId": "list_services",
+        "responses": {
+          "200": {
+            "description": "All managed services",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ServiceView"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "services"
+        ],
+        "operationId": "deploy_service",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeployService"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Deploy accepted; KubeRay rolls it out"
+          },
+          "403": {
+            "description": "Missing Write on service (Developer/Admin only)"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/services/{name}": {
+      "get": {
+        "tags": [
+          "services"
+        ],
+        "operationId": "get_service",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The service",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such service"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "services"
+        ],
+        "operationId": "delete_service",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Teardown accepted"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/version": {
       "get": {
         "tags": [
@@ -327,6 +450,109 @@
           }
         }
       },
+      "DeployService": {
+        "type": "object",
+        "description": "Request body to deploy or update a service.",
+        "required": [
+          "name",
+          "spec"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Stable service name (the RayService name)."
+          },
+          "spec": {
+            "$ref": "#/components/schemas/ServiceSpec"
+          }
+        }
+      },
+      "ServiceSpec": {
+        "type": "object",
+        "description": "Declarative spec for a managed Serve service.",
+        "required": [
+          "name",
+          "project",
+          "ray_version",
+          "image",
+          "serve_config_v2",
+          "head_cpu",
+          "head_memory",
+          "worker_replicas",
+          "worker_cpu",
+          "worker_memory"
+        ],
+        "properties": {
+          "head_cpu": {
+            "type": "string"
+          },
+          "head_memory": {
+            "type": "string"
+          },
+          "image": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "project": {
+            "type": "string"
+          },
+          "ray_version": {
+            "type": "string"
+          },
+          "serve_config_v2": {
+            "type": "string",
+            "description": "The Serve application config (KubeRay `serveConfigV2`), passed\nthrough verbatim as a YAML string — Mobula does not interpret it."
+          },
+          "upgrade": {
+            "$ref": "#/components/schemas/UpgradeStrategy"
+          },
+          "worker_cpu": {
+            "type": "string"
+          },
+          "worker_memory": {
+            "type": "string"
+          },
+          "worker_replicas": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Fixed worker replicas backing the service (autoscaling of Serve\ndeployments is Ray Serve's own concern).",
+            "minimum": 0
+          }
+        }
+      },
+      "ServiceView": {
+        "type": "object",
+        "required": [
+          "name",
+          "state"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "Observed lifecycle state: provisioning | running | updating | ..."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "External Serve endpoint base URL, when ready."
+          }
+        }
+      },
+      "UpgradeStrategy": {
+        "type": "string",
+        "description": "How to roll out a new version of a service.",
+        "enum": [
+          "canary",
+          "in_place"
+        ]
+      },
       "VersionInfo": {
         "type": "object",
         "required": [
@@ -407,6 +633,10 @@
     {
       "name": "clusters",
       "description": "Cluster lifecycle. Reads need any authenticated role; create/terminate need Write on the cluster target (Operator or Admin). Mounted only when the lifecycle controller is enabled (`serve --kuberay-namespace`)."
+    },
+    {
+      "name": "services",
+      "description": "Ray Serve services (RayService). Deploy/update/delete need Write on the service target (Developer or Admin — deploying is code); reads are open to any authenticated role. KubeRay handles zero-downtime canary rollout."
     }
   ]
 }

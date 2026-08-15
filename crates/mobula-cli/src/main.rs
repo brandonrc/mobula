@@ -147,6 +147,9 @@ async fn main() -> std::io::Result<()> {
             // stand up the desired-state store + KubeRay provisioner, spawn
             // the resync loop, and mount the cluster routes on that store
             // (Phase 3, ADR-0006). Without it, serve is gateway-only.
+            let mut service_provisioner: Option<
+                std::sync::Arc<dyn mobula_provision::ServiceProvisioner>,
+            > = None;
             let store: Option<std::sync::Arc<dyn mobula_controller::Store>> =
                 match &kuberay_namespace {
                     Some(ns) => {
@@ -174,6 +177,9 @@ async fn main() -> std::io::Result<()> {
                                 .await
                                 .map_err(|e| std::io::Error::other(e.to_string()))?,
                         );
+                        // The same provisioner backs both the reconcile loop
+                        // (clusters) and the Serve-service routes.
+                        service_provisioner = Some(provisioner.clone());
                         let reconciler =
                             mobula_controller::Reconciler::new(concrete.clone(), provisioner);
                         let interval = std::time::Duration::from_secs(reconcile_interval_secs);
@@ -184,7 +190,7 @@ async fn main() -> std::io::Result<()> {
                                 })
                                 .await;
                         });
-                        tracing::info!(namespace = %ns, "cluster lifecycle controller enabled");
+                        tracing::info!(namespace = %ns, "cluster lifecycle controller + services enabled");
                         Some(concrete)
                     }
                     None => None,
@@ -202,6 +208,7 @@ async fn main() -> std::io::Result<()> {
                     allow_insecure_transport,
                     store,
                     policy: Default::default(),
+                    services: service_provisioner,
                 },
             )
             .await

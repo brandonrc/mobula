@@ -1298,6 +1298,7 @@ dependencies = [
 name = "mobula-api"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "axum",
  "futures",
  "jsonwebtoken",
@@ -1305,6 +1306,7 @@ dependencies = [
  "mobula-controller",
  "mobula-core",
  "mobula-policy",
+ "mobula-provision",
  "rand 0.8.7",
  "reqwest",
  "rsa",

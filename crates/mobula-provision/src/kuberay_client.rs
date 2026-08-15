@@ -11,10 +11,10 @@ use kube::api::{Api, DeleteParams, DynamicObject, ListParams, Patch, PatchParams
 use kube::core::{GroupVersionKind, ObjectMeta};
 use kube::discovery::ApiResource;
 use kube::Client;
-use mobula_core::{ClusterId, ClusterSpec};
+use mobula_core::{ClusterId, ClusterSpec, ServiceSpec};
 
 use crate::kuberay::{self, CLUSTER_ID_LABEL, FIELD_MANAGER, MANAGED_BY_LABEL};
-use crate::{ObservedCluster, ProvisionError, Provisioner};
+use crate::{ObservedCluster, ObservedService, ProvisionError, Provisioner, ServiceProvisioner};
 
 impl From<kube::Error> for ProvisionError {
     fn from(e: kube::Error) -> Self {
@@ -36,6 +36,14 @@ fn raycluster_resource() -> ApiResource {
         group: "ray.io".into(),
         version: "v1".into(),
         kind: "RayCluster".into(),
+    })
+}
+
+fn rayservice_resource() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind {
+        group: "ray.io".into(),
+        version: "v1".into(),
+        kind: "RayService".into(),
     })
 }
 
@@ -152,6 +160,85 @@ impl Provisioner for KubeRayProvisioner {
                     state: kuberay::status_to_state(&status),
                     api_base_url: Some(format!(
                         "http://{name}-head-svc.{}.svc:8265",
+                        self.namespace
+                    )),
+                })
+            })
+            .collect())
+    }
+}
+
+#[async_trait]
+impl ServiceProvisioner for KubeRayProvisioner {
+    async fn deploy(&self, name: &str, spec: &ServiceSpec) -> Result<(), ProvisionError> {
+        let manifest = kuberay::to_rayservice(name, spec);
+        let mut obj = DynamicObject::new(name, &rayservice_resource());
+        obj.metadata = ObjectMeta {
+            name: Some(name.to_string()),
+            labels: Some(std::collections::BTreeMap::from([
+                (MANAGED_BY_LABEL.to_string(), FIELD_MANAGER.to_string()),
+                (CLUSTER_ID_LABEL.to_string(), name.to_string()),
+            ])),
+            ..Default::default()
+        };
+        obj.data = serde_json::json!({ "spec": manifest["spec"] });
+        let params = PatchParams::apply(FIELD_MANAGER).force();
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &rayservice_resource());
+        api.patch(name, &params, &Patch::Apply(&obj)).await?;
+        Ok(())
+    }
+
+    async fn get(&self, name: &str) -> Result<Option<ObservedService>, ProvisionError> {
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &rayservice_resource());
+        Ok(api.get_opt(name).await?.map(|obj| {
+            let status = obj
+                .data
+                .get("status")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            ObservedService {
+                name: name.to_string(),
+                state: kuberay::service_status_to_state(&status),
+                url: Some(format!(
+                    "http://{name}-serve-svc.{}.svc:8000",
+                    self.namespace
+                )),
+            }
+        }))
+    }
+
+    async fn delete(&self, name: &str) -> Result<(), ProvisionError> {
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &rayservice_resource());
+        match api.delete(name, &DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn list(&self) -> Result<Vec<ObservedService>, ProvisionError> {
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &rayservice_resource());
+        let params = ListParams::default().labels(&format!("{MANAGED_BY_LABEL}={FIELD_MANAGER}"));
+        Ok(api
+            .list(&params)
+            .await?
+            .into_iter()
+            .filter_map(|obj| {
+                let name = obj.metadata.name.clone()?;
+                let status = obj
+                    .data
+                    .get("status")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                Some(ObservedService {
+                    name: name.clone(),
+                    state: kuberay::service_status_to_state(&status),
+                    url: Some(format!(
+                        "http://{name}-serve-svc.{}.svc:8000",
                         self.namespace
                     )),
                 })

@@ -11,7 +11,7 @@ pub mod kuberay_client;
 #[cfg(feature = "kuberay")]
 pub use kuberay_client::KubeRayProvisioner;
 
-use mobula_core::{ClusterId, ClusterSpec, ClusterState};
+use mobula_core::{ClusterId, ClusterSpec, ClusterState, ServiceSpec};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
@@ -51,4 +51,30 @@ pub trait Provisioner: Send + Sync {
 
     /// List every cluster this backend manages (field-manager scoped).
     async fn list(&self) -> Result<Vec<ObservedCluster>, ProvisionError>;
+}
+
+/// Observed state of a Serve service.
+#[derive(Debug, Clone)]
+pub struct ObservedService {
+    pub name: String,
+    pub state: ClusterState,
+    /// The service's external Serve endpoint base URL, if ready.
+    pub url: Option<String>,
+}
+
+/// Manages Ray Serve services (RayService CRs). Distinct from
+/// [`Provisioner`] because KubeRay's RayService controller owns
+/// convergence and zero-downtime upgrades — Mobula is a thin
+/// authenticated CRUD proxy here, with no desired-state store or reconcile
+/// loop of its own.
+#[async_trait::async_trait]
+pub trait ServiceProvisioner: Send + Sync {
+    /// Deploy or update a service (server-side apply of a RayService).
+    /// Idempotent; the upgrade strategy in the spec drives canary vs
+    /// in-place rollout.
+    async fn deploy(&self, name: &str, spec: &ServiceSpec) -> Result<(), ProvisionError>;
+    async fn get(&self, name: &str) -> Result<Option<ObservedService>, ProvisionError>;
+    /// Idempotent teardown; succeeds if already gone.
+    async fn delete(&self, name: &str) -> Result<(), ProvisionError>;
+    async fn list(&self) -> Result<Vec<ObservedService>, ProvisionError>;
 }

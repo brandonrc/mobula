@@ -188,9 +188,20 @@ that converges a cluster with no manual reconcile then stops on shutdown.
 > `ClusterView` carries `est_min_hourly`/`est_max_hourly`. `PolicyConfig`
 > (prices + quotas) threads through `build_app_full`/`ServeOptions`. Note:
 > per ADR-0007 this is governance/accounting, NOT a live autoscaler (Ray
-> owns scaling; Mobula shapes bounds and admits). 93 tests, 92.8%. Next:
-> Ray Serve service management; spot-strategy annotations; the Autopilot
-> asymmetric cost function as the scale-policy baseline.
+> owns scaling; Mobula shapes bounds and admits). 93 tests, 92.8%.
+>
+> Slice 2 (2026-08-15): **Ray Serve service management**. `ServiceSpec`
+> domain type + pure `to_rayservice` translation (serveConfigV2 passthrough;
+> canary=`NewCluster` vs in-place=`None` upgrade strategy) + status mapping.
+> New `Target::Service` in the RBAC model — deploying a Serve app is code,
+> so Developer/Admin write, Operator/Viewer read-only. `ServiceProvisioner`
+> trait (mockable) implemented live by `KubeRayProvisioner` over the
+> RayService GVK; **no Mobula store/reconcile — KubeRay's RayService
+> controller owns convergence and zero-downtime rollout**, so Mobula is a
+> thin authenticated CRUD proxy. `/api/v1/services` routes (list/get/
+> deploy/delete) unit-tested via a mock provisioner; OpenAPI + committed
+> contract updated. 97 tests, 91.9%. Next: spot-strategy annotations,
+> Autopilot cost function as scale-policy baseline; Postgres Store.
 - Autoscaler policy engine (spot strategy, fair share, cost model), ephemeral
   per-job clusters, Ray Serve service management (canary/rollback).
 

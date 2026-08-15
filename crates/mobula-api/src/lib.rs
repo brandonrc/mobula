@@ -7,6 +7,7 @@
 pub mod auth_layer;
 pub mod clusters;
 pub mod gateway;
+pub mod services;
 
 use std::sync::Arc;
 
@@ -30,15 +31,23 @@ use utoipa_swagger_ui::SwaggerUi;
         clusters::get_cluster,
         clusters::create_cluster,
         clusters::delete_cluster,
+        services::list_services,
+        services::get_service,
+        services::deploy_service,
+        services::delete_service,
     ),
     components(
         schemas(
             VersionInfo,
             clusters::CreateCluster,
             clusters::ClusterView,
+            services::DeployService,
+            services::ServiceView,
             mobula_core::ClusterSpec,
             mobula_core::WorkerGroup,
             mobula_core::ClusterState,
+            mobula_core::ServiceSpec,
+            mobula_core::UpgradeStrategy,
         )
     ),
     modifiers(&BearerAuth),
@@ -48,6 +57,10 @@ use utoipa_swagger_ui::SwaggerUi;
          authenticated role; create/terminate need Write on the cluster \
          target (Operator or Admin). Mounted only when the lifecycle \
          controller is enabled (`serve --kuberay-namespace`)."),
+        (name = "services", description = "Ray Serve services (RayService). \
+         Deploy/update/delete need Write on the service target \
+         (Developer or Admin — deploying is code); reads are open to any \
+         authenticated role. KubeRay handles zero-downtime canary rollout."),
     ),
     info(
         title = "Mobula",
@@ -147,6 +160,19 @@ pub fn build_app_full(
     store: Option<Arc<dyn mobula_controller::Store>>,
     policy: clusters::PolicyConfig,
 ) -> Router {
+    build_app_full_svc(registry, validator, store, policy, None)
+}
+
+/// As [`build_app_full`], plus an optional Serve-service provisioner; when
+/// present, the `/api/v1/services` routes are mounted.
+#[allow(clippy::too_many_arguments)]
+pub fn build_app_full_svc(
+    registry: ClusterRegistry,
+    validator: Option<Arc<Validator>>,
+    store: Option<Arc<dyn mobula_controller::Store>>,
+    policy: clusters::PolicyConfig,
+    services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
+) -> Router {
     let registry = Arc::new(registry);
     let gw = gateway::GatewayState::new(registry.clone());
     let auth = auth_layer::AuthState {
@@ -164,6 +190,9 @@ pub fn build_app_full(
         .with_state(auth.clone());
     if let Some(store) = store {
         app = app.merge(clusters::router(store, Arc::new(policy)));
+    }
+    if let Some(services) = services {
+        app = app.merge(services::router(services));
     }
     app
         // Fallback is registered before the layers so gateway dispatch
@@ -197,6 +226,9 @@ pub struct ServeOptions {
     /// Cost/quota governance for the cluster routes (Phase 4). Default =
     /// no cost shown, no quota enforced.
     pub policy: clusters::PolicyConfig,
+    /// Serve-service provisioner; when present, the `/api/v1/services`
+    /// routes are mounted (Phase 4).
+    pub services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
 }
 
 /// Serve the API until ctrl-c.
@@ -232,7 +264,13 @@ pub async fn serve_with_shutdown(
     tracing::info!(%addr, "mobula-api listening");
     axum::serve(
         listener,
-        build_app_full(opts.registry, opts.validator, opts.store, opts.policy),
+        build_app_full_svc(
+            opts.registry,
+            opts.validator,
+            opts.store,
+            opts.policy,
+            opts.services,
+        ),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -271,6 +309,7 @@ mod tests {
                 allow_insecure_transport: true,
                 store: None,
                 policy: Default::default(),
+                services: None,
             },
             async {
                 let _ = rx.await;

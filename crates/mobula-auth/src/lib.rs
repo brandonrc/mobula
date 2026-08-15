@@ -35,6 +35,8 @@ pub enum Target {
     Job,
     /// Mobula's own cluster lifecycle (create/suspend/terminate).
     Cluster,
+    /// Ray Serve services — deploying/updating a Serve app is "code".
+    Service,
 }
 
 /// Built-in v0 roles (ADR-0003). Roles are permission-sets over
@@ -60,12 +62,15 @@ impl Role {
             (Role::Admin, _) => true,
             // Viewer: read-only, any target.
             (Role::Viewer, _) => action == Read,
-            // Developer: full job access (submit code), read-only clusters.
-            (Role::Developer, Job) => matches!(action, Read | Write | Delete),
+            // Developer: full job + service access (both are "code"),
+            // read-only clusters.
+            (Role::Developer, Job) | (Role::Developer, Service) => {
+                matches!(action, Read | Write | Delete)
+            }
             (Role::Developer, Cluster) => action == Read,
-            // Operator: full cluster lifecycle, read-only jobs (no code).
+            // Operator: full cluster lifecycle, read-only code surfaces.
             (Role::Operator, Cluster) => matches!(action, Read | Write | Delete),
-            (Role::Operator, Job) => action == Read,
+            (Role::Operator, Job) | (Role::Operator, Service) => action == Read,
         }
     }
 }
@@ -434,11 +439,14 @@ mod tests {
         assert!(Role::Developer.grants(Write, Job));
         assert!(!Role::Developer.grants(Write, Cluster));
         assert!(Role::Developer.grants(Read, Cluster));
-        // Operator: cluster lifecycle yes, job code no — the capability the
-        // ordinal model couldn't express (#25).
+        // Operator: cluster lifecycle yes, job/service code no — the
+        // capability the ordinal model couldn't express (#25).
         assert!(Role::Operator.grants(Write, Cluster));
         assert!(!Role::Operator.grants(Write, Job));
         assert!(Role::Operator.grants(Read, Job));
+        // Services are code: Developer deploys, Operator read-only.
+        assert!(Role::Developer.grants(Write, Service));
+        assert!(!Role::Operator.grants(Write, Service));
         // Viewer: read-only everywhere.
         assert!(Role::Viewer.grants(Read, Cluster));
         assert!(!Role::Viewer.grants(Write, Job));

@@ -9,7 +9,9 @@
 //! The live client wiring (server-side apply, observe, delete) is added on
 //! top of these functions.
 
-use mobula_core::{ClusterId, ClusterSpec, ClusterState, WorkerGroup};
+use mobula_core::{
+    ClusterId, ClusterSpec, ClusterState, ServiceSpec, UpgradeStrategy, WorkerGroup,
+};
 use serde_json::{json, Value};
 
 pub const API_VERSION: &str = "ray.io/v1";
@@ -104,6 +106,64 @@ fn pod_template(
     json!({ "spec": { "containers": [container] } })
 }
 
+pub const SERVICE_KIND: &str = "RayService";
+
+/// Build the RayService manifest for a Serve service. The `serveConfigV2`
+/// is passed through verbatim; `upgradeStrategy` selects canary
+/// (NewCluster — zero-downtime with safe rollback) vs in-place (None).
+pub fn to_rayservice(name: &str, spec: &ServiceSpec) -> Value {
+    let upgrade = match spec.upgrade {
+        UpgradeStrategy::Canary => "NewCluster",
+        UpgradeStrategy::InPlace => "None",
+    };
+    let worker = WorkerGroup {
+        name: "worker".into(),
+        cpu: spec.worker_cpu.clone(),
+        memory: spec.worker_memory.clone(),
+        gpu: None,
+        min_replicas: spec.worker_replicas,
+        max_replicas: spec.worker_replicas,
+        replicas: spec.worker_replicas,
+    };
+    json!({
+        "apiVersion": API_VERSION,
+        "kind": SERVICE_KIND,
+        "metadata": {
+            "name": name,
+            "labels": {
+                MANAGED_BY_LABEL: FIELD_MANAGER,
+                CLUSTER_ID_LABEL: name,
+            },
+        },
+        "spec": {
+            "serveConfigV2": spec.serve_config_v2,
+            "upgradeStrategy": { "type": upgrade },
+            "rayClusterConfig": {
+                "rayVersion": spec.ray_version,
+                "headGroupSpec": {
+                    "rayStartParams": { "dashboard-host": "0.0.0.0" },
+                    "template": pod_template("ray-head", &spec.image, &spec.head_cpu, &spec.head_memory, None),
+                },
+                // Serve worker replicas are fixed here; Serve autoscaling is
+                // Ray Serve's own concern (deployment num_replicas).
+                "workerGroupSpecs": [worker_group_spec(&worker, false)],
+            },
+        },
+    })
+}
+
+/// Map a RayService `.status.serviceStatus` to a Mobula [`ClusterState`].
+/// KubeRay reports "Running" once the Serve app is healthy and serving.
+pub fn service_status_to_state(status: &Value) -> ClusterState {
+    match status.get("serviceStatus").and_then(|s| s.as_str()) {
+        Some("Running") => ClusterState::Running,
+        // A new version is being rolled out / health-checked.
+        Some("Restarting") | Some("UpgradingCluster") => ClusterState::Updating,
+        Some("") | None => ClusterState::Provisioning,
+        _ => ClusterState::Provisioning,
+    }
+}
+
 /// Map a RayCluster `.status` object to a Mobula [`ClusterState`]
 /// (observation-first, ADR-0006 — derived from observed reality, never a
 /// stored phase). KubeRay reports `.status.state` as "ready"/"unhealthy"/
@@ -121,7 +181,57 @@ pub fn status_to_state(status: &Value) -> ClusterState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mobula_core::WorkerGroup;
+    use mobula_core::{ServiceSpec, UpgradeStrategy, WorkerGroup};
+
+    fn service_spec(upgrade: UpgradeStrategy) -> ServiceSpec {
+        ServiceSpec {
+            name: "svc".into(),
+            project: "p".into(),
+            ray_version: "2.57.0".into(),
+            image: "rayproject/ray:2.57.0".into(),
+            serve_config_v2: "applications:\n  - name: app\n".into(),
+            head_cpu: "1".into(),
+            head_memory: "2Gi".into(),
+            worker_replicas: 2,
+            worker_cpu: "1".into(),
+            worker_memory: "2Gi".into(),
+            upgrade,
+        }
+    }
+
+    #[test]
+    fn rayservice_canary_vs_inplace_upgrade_strategy() {
+        let canary = to_rayservice("svc", &service_spec(UpgradeStrategy::Canary));
+        assert_eq!(canary["kind"], "RayService");
+        assert_eq!(canary["spec"]["upgradeStrategy"]["type"], "NewCluster");
+        assert!(canary["spec"]["serveConfigV2"]
+            .as_str()
+            .unwrap()
+            .contains("applications"));
+        assert_eq!(
+            canary["spec"]["rayClusterConfig"]["workerGroupSpecs"][0]["replicas"],
+            2
+        );
+
+        let inplace = to_rayservice("svc", &service_spec(UpgradeStrategy::InPlace));
+        assert_eq!(inplace["spec"]["upgradeStrategy"]["type"], "None");
+    }
+
+    #[test]
+    fn rayservice_status_mapping() {
+        assert_eq!(
+            service_status_to_state(&json!({"serviceStatus": "Running"})),
+            ClusterState::Running
+        );
+        assert_eq!(
+            service_status_to_state(&json!({"serviceStatus": "Restarting"})),
+            ClusterState::Updating
+        );
+        assert_eq!(
+            service_status_to_state(&json!({})),
+            ClusterState::Provisioning
+        );
+    }
 
     fn spec(autoscale_groups: &[(&str, u32, u32, u32)]) -> ClusterSpec {
         ClusterSpec {
