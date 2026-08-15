@@ -181,6 +181,21 @@ Findings from the Rust-rewrite prior-art sweep; each reinforces a decision:
 | P4 | v1 scope as written is 3–5 person-years. | **Accepted.** "v0 cut line" section added below; REQUIREMENTS v1 targets stand as direction, not commitment. |
 | P5 | Trademark: "Mobula, a control plane for Ray®" is correct nominative form; add LF attribution to README; keep "ray" out of domains. | **Accepted.** README updated. |
 
+### Review 4 — distributed-systems literature audit (2026-08-15, web + ray-source verified)
+
+Full reading list: [docs/READING.md](docs/READING.md).
+
+| # | Finding | Disposition |
+|---|---|---|
+| L1 | Enforced cluster state machine conflicts with K8s design principles ("status must be 100% reconstructable by observation"; `phase` enums deprecated) — `can_transition` would reject observed reality (out-of-band deletion = Running→Terminated = TransitionError). | **Accepted — ADR-0006.** Level-triggered reconcile with resync + backoff workqueue; status = Conditions + observedGeneration reconstructed from observation; the enum survives only to validate user lifecycle *commands* and as reporting vocabulary. |
+| L2 | `.spec.workerGroupSpecs[].replicas` is owned by Ray's autoscaler sidecar (pairs decrements with `workersToDelete`); external writers fight it (Ray ArgoCD guide, ray#55736, ray#50868). CA FAQ: never run a second autoscaler over the same capacity. | **Accepted — ADR-0007.** Field partition: autoscaling on → Mobula owns min/max bounds only, `replicas` excluded from SSA; autoscaling off → Mobula owns `replicas`. Scale-down via Ray's rejectable drain only. |
+| L3 | Idempotency under-specified; leader election doesn't fence (client-go docs, Kleppmann); Postgres+CR is a dual write. | **Accepted — ADR-0007.** Keys derived as `{cluster_uid}/{spec_generation}`; transactional-outbox intent rows; stale-generation writes rejected; restored DBs boot in read-only quarantine. |
+| L4 | "Weighted fair share" conflicts with DRF (NSDI'11 — weighted slot fairness violates sharing incentive); Borg: quota is admission control, priority-banded and oversold, and "reduces the need for policies like DRF". H-DRF starvation if hierarchies sum raw. | **Accepted.** REQUIREMENTS §3.2 rewritten: quota + priority bands first; where arbitration is needed, Kueue Fair Sharing / weighted DRF — never home-grown weighted fair share. |
+| L5 | Spot-first is unsafe as a blanket default for Ray: `ray.put` objects unrecoverable, owner death = `OwnerDiedError` not reschedule, Train `max_failures` defaults to 0; 120s best-effort notice vs 600s drain defaults. | **Accepted.** §3.2 rewritten: head/driver on-demand always; do-not-disrupt semantics for object-holding workers; drain+checkpoint budget ≤120s; spot only for stateless/reconstructable tasks. |
+| L6 | Kueue caveats: autoscaling RayClusters escape quota without elastic Workload Slices (v0.15.2+, gated); Kueue-managed RayJob can't target an existing RayCluster. | **Accepted.** Documented as constraints in §3.2/§3.3. |
+| L7 | Cluster-as-only-grouping repeats Borg's §8.1 regret (job-name topology encoding); add labels/selectors early. | **Accepted.** Labels + label queries on clusters/jobs pulled into the v0 domain model. |
+| L8 | Autoscaling cost function must be explicit and asymmetric (Autopilot): under-provision ≫ waste, churn priced, fast-up/slow-down with deadband; warm pools via balloon pods ≥ priority −10. | **Accepted.** Recorded as the Phase 4 policy-engine spec baseline. |
+
 ## v0 cut line (one quarter, 1–3 people)
 
 **In:** KubeRay backend only; single binary; SQLite/Postgres, no HA. Cluster

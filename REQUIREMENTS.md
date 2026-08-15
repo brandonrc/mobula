@@ -118,13 +118,23 @@ cannot serve bearer-token clients.
   optional warm pools).
 - **Heterogeneous pools:** CPU / GPU (by SKU) / high-mem worker groups with
   per-group scaling rules; GPU fractional awareness passthrough.
-- **Spot/preemptible strategy:** spot-first with on-demand fallback, preemption
-  signal handling (drain before reclaim where the cloud allows it).
-- **Quotas & fair share:** hard quotas per org/project (vCPU, GPU-by-type, RAM,
-  $/hr estimate); optional weighted fair-share arbitration when aggregate demand
-  exceeds capacity. On Kubernetes, delegate queueing/admission to **Kueue** where
-  present (map our org/project quotas onto ClusterQueues/LocalQueues) instead of
-  reinventing it; our own admission layer is the fallback for VM/static backends.
+- **Spot/preemptible strategy (rewritten per lit-audit L5):** never blanket
+  spot-first — Ray's ownership model makes owner death unrecoverable
+  (`OwnerDiedError`; `ray.put` objects are not lineage-reconstructable).
+  Head and driver nodes always on-demand; do-not-disrupt semantics for
+  workers holding object-store data; spot only for stateless/reconstructable
+  worker groups, with a drain+checkpoint budget sized to the ~120s
+  best-effort preemption notice.
+- **Quotas first, arbitration second (rewritten per lit-audit L4):**
+  Borg-style admission control — quota as a resource vector per
+  org/project at a priority band, checked at admission, deliberately
+  oversellable at low priority, with an explicit admitted-but-pending
+  state. On Kubernetes, delegate to **Kueue** where present (ClusterQueues/
+  LocalQueues; note: autoscaling RayClusters escape Kueue accounting
+  without elastic Workload Slices, and Kueue-managed RayJobs can't target
+  existing clusters). Where multi-resource arbitration is genuinely
+  needed, use Kueue Fair Sharing / weighted **DRF** — never single-resource
+  weighted fair share, and never raw-summed hierarchies (H-DRF starvation).
 - Bin-packing / consolidation: prefer filling existing nodes before provisioning;
   compact under-utilized groups on a configurable cadence.
 - Cost model: per-cluster and per-job cost estimation from provider price sheets

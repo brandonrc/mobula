@@ -71,13 +71,13 @@ pub struct TransitionError {
 }
 
 impl ClusterState {
-    /// Whether `self -> to` is a legal transition.
+    /// Whether `self -> to` is a legal transition for a **user-issued
+    /// lifecycle command** against desired state (e.g. you cannot ask a
+    /// Terminated cluster to Suspend).
     ///
-    /// Reconcilers must route every state change through [`transition`]
-    /// so illegal jumps (e.g. `Terminated -> Running`) are structurally
-    /// impossible rather than a matter of caller discipline.
-    ///
-    /// [`transition`]: ClusterState::transition
+    /// Never apply this to observed state: observed reality is not
+    /// validated, it is recorded (ADR-0006). Reconcilers reconstruct
+    /// status from observation; drift is a Condition, not an error.
     pub fn can_transition(self, to: ClusterState) -> bool {
         use ClusterState::*;
         matches!(

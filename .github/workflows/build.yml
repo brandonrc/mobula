@@ -62,9 +62,28 @@ jobs:
           docker build -t "$IMAGE:${GITHUB_SHA}-${{ matrix.arch }}" .
           docker push "$IMAGE:${GITHUB_SHA}-${{ matrix.arch }}"
 
-  manifest:
+  scan:
     if: github.event_name == 'push'
     needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trivy vulnerability gate
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}-amd64
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+  manifest:
+    if: github.event_name == 'push'
+    needs: [image, scan]
     runs-on: ubuntu-latest
     steps:
       - uses: docker/login-action@v3
