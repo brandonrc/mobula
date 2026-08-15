@@ -106,9 +106,10 @@ async fn main() -> std::io::Result<()> {
                         )
                     })?;
                     tracing::info!(issuer = %cfg.issuer, audience = %cfg.audience, "OIDC discovery");
-                    let v = Validator::discover(cfg, reqwest::Client::new())
-                        .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let v =
+                        Validator::discover(cfg, reqwest::Client::new(), allow_insecure_transport)
+                            .await
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
                     Some(Arc::new(v))
                 }
                 None => None,

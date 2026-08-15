@@ -236,6 +236,25 @@ Phase 3 it becomes a dynamically written one (SSRF surface).
 | #7 repo governance | **Fixed.** Branch protection on main (required checks test/coverage/deny/hygiene, no force pushes), SECURITY.md + private vulnerability reporting enabled, Dependabot alerts + security fixes enabled, dependabot.yml (cargo/actions/docker), CODEOWNERS with security-sensitive paths. |
 | #8 no audit log; registry not validated | **Fixed (partial).** Structured `mobula::audit` event per proxied request (cluster, method, path, status, latency); duplicate hostname/id + URL validation fails startup; (id, hostname) pairs logged at boot. Remaining (open): durable Postgres audit records with caller identity — lands with Phase 2. |
 
+### Review 6 — inline auth self-review (2026-08-15)
+
+Adversarial pass over the Phase 2 identity code (the commissioned reviewer
+fork hit a spend limit; this is the interim check). Two real findings,
+both fixed in-line:
+
+| # | Finding | Disposition |
+|---|---|---|
+| R1 | OIDC issuer/JWKS fetched over whatever scheme is configured — an `http://` issuer lets a MITM substitute signing keys and forge identities (same class as issue #2). | **Fixed.** `Validator::discover` rejects non-https issuers unless `--allow-insecure-transport`; tested. |
+| R2 | A token with empty `sub` but a group-mapped role would authorize with a blank audit subject. | **Fixed.** `validate` returns `MissingSubject` when `sub` is empty; tested. |
+
+Confirmed-correct during the pass (no change needed): RS256-only decode
+(blocks alg-confusion / `alg:none`), `exp` required + `aud`/`iss`
+enforced, JWKS refresh cooldown collapses unknown-kid floods into one
+upstream fetch, auth middleware is outermost so it runs before gateway
+dispatch, cluster hosts are never in the public allowlist. **Still owed:
+the full external reviewer round** (auth deep-dive, RBAC-vs-requirements,
+plan-vs-reality) — re-run when budget allows.
+
 ## v0 cut line (one quarter, 1–3 people)
 
 **In:** KubeRay backend only; single binary; SQLite/Postgres, no HA. Cluster

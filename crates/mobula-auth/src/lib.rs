@@ -79,6 +79,14 @@ pub enum AuthError {
     UnknownKeyId,
     #[error("token flow failed: {0}")]
     Flow(String),
+    #[error(
+        "issuer {0} is not https — JWKS would be fetched over cleartext, letting a \
+         network attacker substitute signing keys. Use https, or pass an explicit \
+         insecure-transport override for local dev."
+    )]
+    InsecureIssuer(String),
+    #[error("token has no subject (sub) claim")]
+    MissingSubject,
 }
 
 pub mod flows;
@@ -136,7 +144,14 @@ const REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 impl Validator {
     /// Run OIDC discovery and the initial JWKS fetch. Fails fast — a
     /// control plane that cannot validate tokens must not start serving.
-    pub async fn discover(config: AuthConfig, client: reqwest::Client) -> Result<Self, AuthError> {
+    pub async fn discover(
+        config: AuthConfig,
+        client: reqwest::Client,
+        allow_insecure: bool,
+    ) -> Result<Self, AuthError> {
+        if !config.issuer.starts_with("https://") && !allow_insecure {
+            return Err(AuthError::InsecureIssuer(config.issuer.clone()));
+        }
         let doc = discover_metadata(&client, &config.issuer).await?;
 
         let validator = Self {
@@ -211,7 +226,11 @@ impl Validator {
         let data = decode::<serde_json::Value>(token, &key, &validation)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
-        Ok(self.identity_from_claims(&data.claims))
+        let identity = self.identity_from_claims(&data.claims);
+        if identity.subject.is_empty() {
+            return Err(AuthError::MissingSubject);
+        }
+        Ok(identity)
     }
 
     fn identity_from_claims(&self, claims: &serde_json::Value) -> Identity {

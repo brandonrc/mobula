@@ -136,7 +136,8 @@ async fn validator_for(idp: &Idp) -> Arc<Validator> {
         },
     };
     Arc::new(
-        Validator::discover(config, reqwest::Client::new())
+        // Mock issuer is http://127.0.0.1 — allow insecure transport in tests.
+        Validator::discover(config, reqwest::Client::new(), true)
             .await
             .unwrap(),
     )
@@ -183,6 +184,49 @@ fn post(path: &str, host: &str, token: Option<&str>) -> Request<Body> {
         req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
     }
     req.body(Body::from("{}")).unwrap()
+}
+
+#[tokio::test]
+async fn http_issuer_is_refused_without_override() {
+    let idp = spawn_idp().await; // http://127.0.0.1
+    let config = AuthConfig {
+        issuer: idp.issuer.clone(),
+        audience: "mobula".into(),
+        groups_claim: "groups".into(),
+        roles: RoleMappings::default(),
+    };
+    let err = match Validator::discover(config.clone(), reqwest::Client::new(), false).await {
+        Err(e) => e,
+        Ok(_) => panic!("http issuer should be refused without override"),
+    };
+    assert!(err.to_string().contains("not https"), "{err}");
+    // With the override it proceeds to real discovery.
+    assert!(Validator::discover(config, reqwest::Client::new(), true)
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn token_without_subject_is_rejected() {
+    let idp = spawn_idp().await;
+    let validator = validator_for(&idp).await;
+    // Sign a token whose `sub` is empty.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let claims = serde_json::json!({
+        "sub": "",
+        "iss": idp.issuer,
+        "aud": "mobula",
+        "exp": now + 300,
+        "groups": ["/ml-eng"],
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(KID.into());
+    let token = encode(&header, &claims, &idp.encoding_key).unwrap();
+    let err = validator.validate(&token).await.unwrap_err();
+    assert!(err.to_string().contains("no subject"), "{err}");
 }
 
 #[tokio::test]
