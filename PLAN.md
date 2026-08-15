@@ -42,6 +42,10 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 - Postgres schema v0 (SQLite dev mode); config loading; structured logging.
 
 ### Phase 1 — Multi-cluster job gateway (first drop-in artifact)
+
+> Progress 2026-08-15: static registry + host-routed proxy with token
+> injection landed, with mock-Ray-head integration tests. Outstanding:
+> websocket log tail, durable log capture, Python-client contract tests.
 - Serve the Ray Job Submission REST surface in Rust as a **gateway in front of
   each cluster's native job API** — never a reimplementation of the dashboard
   head (its endpoints write GCS KV and spawn JobSupervisor actors internally;

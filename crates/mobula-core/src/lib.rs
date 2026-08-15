@@ -6,5 +6,7 @@
 //! never depend on a cloud SDK or Kubernetes client (see ADR-0002).
 
 pub mod cluster;
+pub mod registry;
 
 pub use cluster::{ClusterId, ClusterSpec, ClusterState, TransitionError, WorkerGroup};
+pub use registry::{ClusterEndpoint, ClusterRegistry};

@@ -23,6 +23,8 @@ mobula-proxy = { path = "crates/mobula-proxy" }
 
 async-trait = "0.1"
 axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+toml = "0.9"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
