@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mobula-core",
+    "crates/mobula-provision",
+    "crates/mobula-api",
+    "crates/mobula-proxy",
+    "crates/mobula-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/brandonrc/mobula"
+rust-version = "1.85"
+
+[workspace.dependencies]
+mobula-core = { path = "crates/mobula-core" }
+mobula-provision = { path = "crates/mobula-provision" }
+mobula-api = { path = "crates/mobula-api" }
+mobula-proxy = { path = "crates/mobula-proxy" }
+
+async-trait = "0.1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

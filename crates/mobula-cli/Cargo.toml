@@ -1,0 +1,19 @@
+[package]
+name = "mobula-cli"
+description = "Mobula command-line interface and control-plane entrypoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mobula"
+path = "src/main.rs"
+
+[dependencies]
+mobula-api.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
