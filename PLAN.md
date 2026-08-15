@@ -112,6 +112,19 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
   routing; sweep reconciler for orphaned Keycloak clients.
 
 ### Phase 3 — Cluster lifecycle controller
+
+> Progress 2026-08-15 (slice 1 of 4): `mobula-controller` crate — the
+> `Store` trait (desired spec + generation/observed_generation drift
+> signal + transactional-outbox intents) with an in-memory impl, and the
+> **observation-first reconcile engine** (ADR-0006/0007): every pass
+> reconstructs state from the provisioner, actuates drift through an
+> idempotency key derived as `{id}/{generation}` (stable across passes for
+> the same desired state, new key on spec change). 6 reconcile scenarios
+> green against a recording mock provisioner (create→noop, drift repair,
+> spec-change re-key, stable-key-on-flap, terminate→noop). Next slices:
+> (2) sqlx-SQLite/Postgres `Store` impl behind the same trait; (3) KubeRay
+> `Provisioner` backend (kube-rs) + cluster CRUD API routes with explicit
+> per-route permissions (#26); (4) resync loop + TTL reaping + suspend.
 - Reconciler over KubeRay CRs: declarative cluster specs, state machine,
   suspend/resume, TTL reaping, per-project quotas (Kueue delegation where
   present).

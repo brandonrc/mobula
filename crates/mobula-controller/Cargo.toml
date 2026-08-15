@@ -1,0 +1,16 @@
+[package]
+name = "mobula-controller"
+description = "Desired-state store and observation-first reconcile engine for Mobula clusters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mobula-core.workspace = true
+mobula-provision.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true

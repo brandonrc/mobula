@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/mobula-core",
     "crates/mobula-provision",
+    "crates/mobula-controller",
     "crates/mobula-auth",
     "crates/mobula-api",
     "crates/mobula-proxy",
@@ -19,6 +20,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 mobula-core = { path = "crates/mobula-core" }
 mobula-provision = { path = "crates/mobula-provision" }
+mobula-controller = { path = "crates/mobula-controller" }
 mobula-api = { path = "crates/mobula-api" }
 mobula-auth = { path = "crates/mobula-auth" }
 mobula-proxy = { path = "crates/mobula-proxy" }

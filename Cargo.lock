@@ -1023,6 +1023,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mobula-controller"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "mobula-core",
+ "mobula-provision",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mobula-core"
 version = "0.0.1"
 dependencies = [
