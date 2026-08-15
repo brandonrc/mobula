@@ -17,9 +17,18 @@ use axum::response::{IntoResponse, Response};
 use mobula_core::{ClusterEndpoint, ClusterRegistry};
 
 /// Request bodies are buffered before forwarding; job submissions are tiny
-/// and runtime-env package uploads are capped by Ray itself. Streaming
-/// upload passthrough is a follow-up.
-const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// and runtime-env package uploads are modest. Bounded (with the
+/// concurrency limit below) so N concurrent uploads can't OOM the gateway
+/// (#30). Streaming passthrough is a follow-up.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Max concurrent proxied requests. Caps peak buffered-body memory at
+/// roughly `MAX_INFLIGHT × MAX_BODY_BYTES` and bounds upstream fan-out
+/// (#30). Excess requests wait for a permit rather than piling up.
+const MAX_INFLIGHT: usize = 64;
+
+/// A black-holing cluster must not pin a websocket half-open forever (#31).
+const WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Header carrying the cluster's static Ray token (Ray >= 2.52 token
 /// auth). Pinned by the contract-test suite against each supported Ray
@@ -30,12 +39,16 @@ const RAY_AUTH_HEADER: header::HeaderName = header::AUTHORIZATION;
 pub struct GatewayState {
     registry: Arc<ClusterRegistry>,
     client: reqwest::Client,
+    /// Bounds concurrent proxied requests so buffered bodies can't OOM the
+    /// gateway (#30). Shared across HTTP and websocket paths.
+    inflight: Arc<tokio::sync::Semaphore>,
 }
 
 impl GatewayState {
     pub fn new(registry: Arc<ClusterRegistry>) -> Self {
         Self {
             registry,
+            inflight: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT)),
             // Reverse-proxy client posture (security issues #3/#5):
             // never follow redirects southbound (SSRF amplifier — 3xx
             // passes through to the caller untouched), and bound how long
@@ -59,13 +72,20 @@ pub async fn host_gateway(State(gw): State<GatewayState>, req: Request, next: Ne
         .and_then(|h| h.to_str().ok())
         .and_then(|h| gw.registry.by_hostname(h))
         .cloned();
-
-    match cluster {
-        Some(cluster) if is_websocket_upgrade(req.headers()) => {
-            ws::proxy_upgrade(&cluster, req).await
-        }
-        Some(cluster) => proxy(&gw, &cluster, req).await.into_response(),
-        None => next.run(req).await,
+    let Some(cluster) = cluster else {
+        // Not a cluster host → control-plane routes.
+        return next.run(req).await;
+    };
+    // One permit per proxied request bounds peak buffered-body memory and
+    // upstream fan-out (#30); held across HTTP and websocket paths.
+    let _permit = match gw.inflight.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "gateway closing").into_response(),
+    };
+    if is_websocket_upgrade(req.headers()) {
+        ws::proxy_upgrade(&cluster, req).await
+    } else {
+        proxy(&gw, &cluster, req).await.into_response()
     }
 }
 
@@ -283,12 +303,19 @@ mod ws {
         }
 
         // Connect southbound BEFORE accepting the client upgrade so an
-        // unreachable cluster surfaces as 502, not a dead socket.
-        let upstream = match tokio_tungstenite::connect_async(southbound).await {
-            Ok((stream, _resp)) => stream,
-            Err(e) => {
+        // unreachable cluster surfaces as 502, not a dead socket — and
+        // bound the connect so a black-holing head can't pin the client's
+        // half-open upgrade indefinitely (#31).
+        let connect = tokio_tungstenite::connect_async(southbound);
+        let upstream = match tokio::time::timeout(super::WS_CONNECT_TIMEOUT, connect).await {
+            Ok(Ok((stream, _resp))) => stream,
+            Ok(Err(e)) => {
                 tracing::warn!(cluster = %cluster.id, error = %e, "upstream ws connect failed");
                 return (StatusCode::BAD_GATEWAY, "cluster unreachable").into_response();
+            }
+            Err(_) => {
+                tracing::warn!(cluster = %cluster.id, "upstream ws connect timed out");
+                return (StatusCode::GATEWAY_TIMEOUT, "cluster connect timed out").into_response();
             }
         };
 

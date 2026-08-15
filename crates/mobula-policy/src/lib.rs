@@ -74,6 +74,15 @@ pub fn cluster_demand(spec: &ClusterSpec) -> Result<(ResourceVector, ResourceVec
     let mut min = head;
     let mut max = head;
     for g in &spec.worker_groups {
+        // A group with min > max is nonsensical and would make the
+        // "max" demand smaller than the min — quota admits against max,
+        // so this must be rejected, not silently mischarged (review R2#4).
+        if g.min_replicas > g.max_replicas {
+            return Err(PolicyError::Quantity(format!(
+                "worker group {}: min_replicas ({}) > max_replicas ({})",
+                g.name, g.min_replicas, g.max_replicas
+            )));
+        }
         let unit = worker_unit(g)?;
         min = min + unit.scale(g.min_replicas as f64);
         max = max + unit.scale(g.max_replicas as f64);

@@ -111,7 +111,10 @@ pub async fn poll_device_token(
     client_id: &str,
     device_code: &str,
 ) -> Result<DevicePoll, AuthError> {
-    let res = client
+    // A transport hiccup (IdP/ingress blip, DNS, reset) is transient — keep
+    // polling until the caller's deadline rather than aborting the whole
+    // device flow (#22).
+    let res = match client
         .post(token_endpoint)
         .form(&[
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
@@ -120,22 +123,30 @@ pub async fn poll_device_token(
         ])
         .send()
         .await
-        .map_err(|e| AuthError::Flow(e.without_url().to_string()))?;
+    {
+        Ok(r) => r,
+        Err(_) => return Ok(DevicePoll::Pending { slow_down: false }),
+    };
 
-    if res.status().is_success() {
+    let status = res.status();
+    if status.is_success() {
         let token = res
             .json::<TokenResponse>()
             .await
             .map_err(|e| AuthError::Flow(e.without_url().to_string()))?;
         return Ok(DevicePoll::Ready(Box::new(token)));
     }
-    let err = res
-        .json::<TokenError>()
-        .await
-        .map_err(|e| AuthError::Flow(e.without_url().to_string()))?;
+    // Non-2xx: if the body is a well-formed RFC 8628 error, act on it;
+    // otherwise (a 502 HTML page from an ingress, a truncated body) treat
+    // it as transient and keep polling (#22).
+    let err = match res.json::<TokenError>().await {
+        Ok(e) => e,
+        Err(_) => return Ok(DevicePoll::Pending { slow_down: false }),
+    };
     match err.error.as_str() {
         "authorization_pending" => Ok(DevicePoll::Pending { slow_down: false }),
         "slow_down" => Ok(DevicePoll::Pending { slow_down: true }),
+        // Terminal grant errors (access_denied, expired_token, ...).
         other => Err(AuthError::Flow(format!(
             "{other}: {}",
             err.error_description.unwrap_or_default()

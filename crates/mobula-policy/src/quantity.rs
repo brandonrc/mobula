@@ -1,16 +1,28 @@
 //! Minimal Kubernetes quantity parsing for CPU and memory strings.
 
+/// Reject NaN, infinities, and negatives — a quantity must be a finite,
+/// non-negative number (review R2#4: a negative demand would lower a
+/// project's quota usage and let over-provisioning slip through).
+fn finite_nonneg(v: f64, what: &str) -> Result<f64, String> {
+    if v.is_finite() && v >= 0.0 {
+        Ok(v)
+    } else {
+        Err(format!("invalid {what}: {v}"))
+    }
+}
+
 /// Parse a CPU quantity to whole cores: `"1"` → 1.0, `"500m"` → 0.5.
 pub fn cpu_cores(s: &str) -> Result<f64, String> {
     let s = s.trim();
-    if let Some(milli) = s.strip_suffix('m') {
+    let v = if let Some(milli) = s.strip_suffix('m') {
         milli
             .parse::<f64>()
             .map(|m| m / 1000.0)
-            .map_err(|_| format!("invalid cpu {s:?}"))
+            .map_err(|_| format!("invalid cpu {s:?}"))?
     } else {
-        s.parse::<f64>().map_err(|_| format!("invalid cpu {s:?}"))
-    }
+        s.parse::<f64>().map_err(|_| format!("invalid cpu {s:?}"))?
+    };
+    finite_nonneg(v, "cpu")
 }
 
 /// Parse a memory quantity to GiB. Supports Ki/Mi/Gi/Ti (binary) and
@@ -37,20 +49,25 @@ pub fn mem_gib(s: &str) -> Result<f64, String> {
     } else {
         (s, 1.0)
     };
-    num.trim()
+    let v = num
+        .trim()
         .parse::<f64>()
         .map(|v| v * bytes_per / GIB)
-        .map_err(|_| format!("invalid memory {s:?}"))
+        .map_err(|_| format!("invalid memory {s:?}"))?;
+    finite_nonneg(v, "memory")
 }
 
 /// Parse a GPU count (optional field). `None`/empty → 0.
 pub fn gpu_count(s: Option<&str>) -> Result<f64, String> {
     match s {
         None | Some("") => Ok(0.0),
-        Some(v) => v
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| format!("invalid gpu {v:?}")),
+        Some(v) => {
+            let n = v
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| format!("invalid gpu {v:?}"))?;
+            finite_nonneg(n, "gpu")
+        }
     }
 }
 

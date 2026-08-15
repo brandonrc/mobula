@@ -130,6 +130,8 @@ async fn list_clusters(
     get, path = "/api/v1/clusters/{id}", tag = "clusters",
     params(("id" = String, Path, description = "Cluster id")),
     responses((status = 200, description = "The cluster", body = ClusterView),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Read on cluster"),
               (status = 404, description = "No such cluster")),
     security(("bearer" = []))
 )]
@@ -151,8 +153,14 @@ async fn get_cluster(
 #[utoipa::path(
     post, path = "/api/v1/clusters", tag = "clusters",
     request_body = CreateCluster,
-    responses((status = 201, description = "Desired state recorded; reconciler will converge"),
-              (status = 403, description = "Missing Write on cluster (Operator/Admin only)")),
+    responses(
+        (status = 201, description = "Desired state recorded; reconciler will converge"),
+        (status = 400, description = "Invalid spec (bad quantity, min>max)"),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Missing Write on cluster (Operator/Admin only)"),
+        (status = 409, description = "Project quota exceeded"),
+        (status = 500, description = "Store/quota-accounting failure"),
+    ),
     security(("bearer" = []))
 )]
 async fn create_cluster(
@@ -177,15 +185,30 @@ async fn create_cluster(
                 return (StatusCode::BAD_REQUEST, format!("invalid spec: {e}")).into_response()
             }
         };
+        // Sum the project's other live clusters' max-demand. A stored spec
+        // that fails to parse must FAIL CLOSED (error out), never contribute
+        // zero — zeroing would undercount usage and admit past the limit
+        // (review R2#2).
         let in_use = match st.store.list().await {
-            Ok(clusters) => clusters
-                .iter()
-                .filter(|c| {
+            Ok(clusters) => {
+                let mut acc = ResourceVector::default();
+                for c in clusters.iter().filter(|c| {
                     c.spec.project == project && c.id != id && c.desired == DesiredState::Running
-                })
-                .fold(ResourceVector::default(), |acc, c| {
-                    acc + cluster_demand(&c.spec).map(|(_, m)| m).unwrap_or_default()
-                }),
+                }) {
+                    match cluster_demand(&c.spec) {
+                        Ok((_, m)) => acc = acc + m,
+                        Err(e) => {
+                            tracing::error!(cluster = %c.id, error = %e, "unparseable stored spec blocks quota accounting");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "quota accounting failed: an existing cluster has an invalid spec",
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+                acc
+            }
             Err(e) => return store_err(e),
         };
         if let Err(exceeded) = admit(&project, limit, in_use, requested) {
@@ -222,6 +245,8 @@ async fn create_cluster(
     delete, path = "/api/v1/clusters/{id}", tag = "clusters",
     params(("id" = String, Path, description = "Cluster id")),
     responses((status = 202, description = "Marked for termination; reconciler tears it down"),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Write on cluster (Operator/Admin only)"),
               (status = 404, description = "No such cluster")),
     security(("bearer" = []))
 )]
@@ -246,7 +271,13 @@ async fn delete_cluster(
             );
             StatusCode::ACCEPTED.into_response()
         }
-        Err(_) => (StatusCode::NOT_FOUND, "no such cluster").into_response(),
+        // Distinguish "not found" from a real store failure (review R3#6):
+        // the store returns a Backend error naming the missing id vs a
+        // genuine backend fault.
+        Err(mobula_controller::StoreError::Backend(m)) if m.contains("no such cluster") => {
+            (StatusCode::NOT_FOUND, "no such cluster").into_response()
+        }
+        Err(e) => store_err(e),
     }
 }
 

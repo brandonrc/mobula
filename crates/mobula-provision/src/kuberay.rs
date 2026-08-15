@@ -28,7 +28,7 @@ pub fn to_raycluster(id: &ClusterId, spec: &ClusterSpec, autoscaling: bool) -> V
     let worker_specs: Vec<Value> = spec
         .worker_groups
         .iter()
-        .map(|g| worker_group_spec(g, autoscaling))
+        .map(|g| worker_group_spec(g, &spec.image, autoscaling))
         .collect();
 
     json!({
@@ -63,13 +63,16 @@ fn head_group_spec(spec: &ClusterSpec) -> Value {
     })
 }
 
-fn worker_group_spec(g: &WorkerGroup, autoscaling: bool) -> Value {
+fn worker_group_spec(g: &WorkerGroup, image: &str, autoscaling: bool) -> Value {
+    // Workers run the cluster image (Kubernetes requires an image on every
+    // container; KubeRay does NOT copy the head image onto worker groups,
+    // so an empty image would be rejected — review R2#1).
     let mut ws = json!({
         "groupName": g.name,
         "minReplicas": g.min_replicas,
         "maxReplicas": g.max_replicas,
         "rayStartParams": {},
-        "template": pod_template("ray-worker", "", &g.cpu, &g.memory, g.gpu.as_deref()),
+        "template": pod_template("ray-worker", image, &g.cpu, &g.memory, g.gpu.as_deref()),
     });
     // ADR-0007: only set `replicas` when we own it (autoscaling off). With
     // the in-tree autoscaler on, the sidecar owns replicas + scaleStrategy;
@@ -97,9 +100,8 @@ fn pod_template(
         "name": container_name,
         "resources": { "limits": limits, "requests": requests },
     });
-    // The head container inherits the cluster image; worker image is set by
-    // the caller's group template in a later slice. Empty image is omitted
-    // so KubeRay's default/the head image applies.
+    // Both head and workers carry the cluster image; only omitted if a
+    // caller passes empty (KubeRay then applies its default).
     if !image.is_empty() {
         container["image"] = json!(image);
     }
@@ -146,7 +148,7 @@ pub fn to_rayservice(name: &str, spec: &ServiceSpec) -> Value {
                 },
                 // Serve worker replicas are fixed here; Serve autoscaling is
                 // Ray Serve's own concern (deployment num_replicas).
-                "workerGroupSpecs": [worker_group_spec(&worker, false)],
+                "workerGroupSpecs": [worker_group_spec(&worker, &spec.image, false)],
             },
         },
     })
@@ -280,6 +282,12 @@ mod tests {
         assert_eq!(wg["replicas"], 2);
         assert_eq!(wg["minReplicas"], 0);
         assert_eq!(wg["maxReplicas"], 4);
+        // Workers must carry the cluster image or the API server rejects
+        // the pod (review R2#1).
+        assert_eq!(
+            wg["template"]["spec"]["containers"][0]["image"],
+            "rayproject/ray:2.57.0"
+        );
     }
 
     #[test]

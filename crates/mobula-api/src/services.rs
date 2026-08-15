@@ -68,7 +68,9 @@ fn prov_err(e: mobula_provision::ProvisionError) -> Response {
 
 #[utoipa::path(
     get, path = "/api/v1/services", tag = "services",
-    responses((status = 200, description = "All managed services", body = [ServiceView])),
+    responses((status = 200, description = "All managed services", body = [ServiceView]),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Read on service")),
     security(("bearer" = []))
 )]
 async fn list_services(
@@ -90,6 +92,8 @@ async fn list_services(
     get, path = "/api/v1/services/{name}", tag = "services",
     params(("name" = String, Path, description = "Service name")),
     responses((status = 200, description = "The service", body = ServiceView),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Read on service"),
               (status = 404, description = "No such service")),
     security(("bearer" = []))
 )]
@@ -112,7 +116,9 @@ async fn get_service(
     post, path = "/api/v1/services", tag = "services",
     request_body = DeployService,
     responses((status = 202, description = "Deploy accepted; KubeRay rolls it out"),
-              (status = 403, description = "Missing Write on service (Developer/Admin only)")),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Write on service (Developer/Admin only)"),
+              (status = 502, description = "Service backend error")),
     security(("bearer" = []))
 )]
 async fn deploy_service(
@@ -141,7 +147,9 @@ async fn deploy_service(
 #[utoipa::path(
     delete, path = "/api/v1/services/{name}", tag = "services",
     params(("name" = String, Path, description = "Service name")),
-    responses((status = 202, description = "Teardown accepted")),
+    responses((status = 202, description = "Teardown accepted"),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Write on service (Developer/Admin only)")),
     security(("bearer" = []))
 )]
 async fn delete_service(

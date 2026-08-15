@@ -148,3 +148,58 @@ async fn client_credentials_success_and_bad_secret() {
         .unwrap_err();
     assert!(err.to_string().contains("invalid_client"), "{err}");
 }
+
+/// A token endpoint that returns a non-RFC 502 (like an ingress blip) on
+/// the first poll, then succeeds — the flow must treat the 502 as
+/// transient and keep polling (#22).
+mod transient {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn flaky_token(State(polls): State<Arc<AtomicUsize>>) -> axum::response::Response {
+        if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "<html>502 Bad Gateway</html>",
+            )
+                .into_response()
+        } else {
+            Json(serde_json::json!({
+                "access_token": "ok-after-blip", "token_type": "Bearer"
+            }))
+            .into_response()
+        }
+    }
+
+    #[tokio::test]
+    async fn device_poll_retries_through_a_502() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/token", axum::routing::post(flaky_token))
+            .with_state(polls);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let ep = format!("http://{addr}/token");
+
+        // First poll: 502 → Pending (not an error).
+        match flows::poll_device_token(&client, &ep, "cli", "dc")
+            .await
+            .unwrap()
+        {
+            DevicePoll::Pending { .. } => {}
+            DevicePoll::Ready(_) => panic!("should have been pending on 502"),
+        }
+        // Second poll: success.
+        match flows::poll_device_token(&client, &ep, "cli", "dc")
+            .await
+            .unwrap()
+        {
+            DevicePoll::Ready(t) => assert_eq!(t.access_token, "ok-after-blip"),
+            DevicePoll::Pending { .. } => panic!("should have succeeded"),
+        }
+    }
+}

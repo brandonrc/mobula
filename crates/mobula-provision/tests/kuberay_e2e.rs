@@ -18,15 +18,18 @@ fn tiny_spec() -> ClusterSpec {
         // head pod crash-loop. 2.5Gi is a safe floor on a kind node.
         head_cpu: "1".into(),
         head_memory: "2560Mi".into(),
-        // One worker group, no replicas needed for the head to go Ready.
+        // One real worker so the e2e actually exercises the worker path
+        // (a prior worker-image bug was masked by a zero-worker e2e —
+        // review R2#1). RayService/RayCluster only reports Running once the
+        // worker schedules, so this asserts the worker manifest is valid.
         worker_groups: vec![WorkerGroup {
             name: "cpu".into(),
             cpu: "500m".into(),
             memory: "1Gi".into(),
             gpu: None,
-            min_replicas: 0,
+            min_replicas: 1,
             max_replicas: 2,
-            replicas: 0,
+            replicas: 1,
         }],
         ttl_seconds: None,
     }

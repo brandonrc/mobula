@@ -61,8 +61,20 @@
           "201": {
             "description": "Desired state recorded; reconciler will converge"
           },
+          "400": {
+            "description": "Invalid spec (bad quantity, min>max)"
+          },
+          "401": {
+            "description": "No/invalid token"
+          },
           "403": {
             "description": "Missing Write on cluster (Operator/Admin only)"
+          },
+          "409": {
+            "description": "Project quota exceeded"
+          },
+          "500": {
+            "description": "Store/quota-accounting failure"
           }
         },
         "security": [
@@ -100,6 +112,12 @@
               }
             }
           },
+          "401": {
+            "description": "No/invalid token"
+          },
+          "403": {
+            "description": "Missing Read on cluster"
+          },
           "404": {
             "description": "No such cluster"
           }
@@ -129,6 +147,12 @@
         "responses": {
           "202": {
             "description": "Marked for termination; reconciler tears it down"
+          },
+          "401": {
+            "description": "No/invalid token"
+          },
+          "403": {
+            "description": "Missing Write on cluster (Operator/Admin only)"
           },
           "404": {
             "description": "No such cluster"
@@ -160,6 +184,12 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "No/invalid token"
+          },
+          "403": {
+            "description": "Missing Read on service"
           }
         },
         "security": [
@@ -187,8 +217,14 @@
           "202": {
             "description": "Deploy accepted; KubeRay rolls it out"
           },
+          "401": {
+            "description": "No/invalid token"
+          },
           "403": {
             "description": "Missing Write on service (Developer/Admin only)"
+          },
+          "502": {
+            "description": "Service backend error"
           }
         },
         "security": [
@@ -226,6 +262,12 @@
               }
             }
           },
+          "401": {
+            "description": "No/invalid token"
+          },
+          "403": {
+            "description": "Missing Read on service"
+          },
           "404": {
             "description": "No such service"
           }
@@ -255,6 +297,12 @@
         "responses": {
           "202": {
             "description": "Teardown accepted"
+          },
+          "401": {
+            "description": "No/invalid token"
+          },
+          "403": {
+            "description": "Missing Write on service (Developer/Admin only)"
           }
         },
         "security": [
