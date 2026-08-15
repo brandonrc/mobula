@@ -8,6 +8,8 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
+    # webpki-roots (Mozilla CA bundle data, via rustls)
+    "CDLA-Permissive-2.0",
 ]
 
 [advisories]
