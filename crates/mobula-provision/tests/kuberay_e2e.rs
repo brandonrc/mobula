@@ -14,8 +14,10 @@ fn tiny_spec() -> ClusterSpec {
         project: "e2e".into(),
         ray_version: "2.57.0".into(),
         image: "rayproject/ray:2.57.0".into(),
-        head_cpu: "500m".into(),
-        head_memory: "1Gi".into(),
+        // Ray's head reserves object-store/GCS memory; too little makes the
+        // head pod crash-loop. 2.5Gi is a safe floor on a kind node.
+        head_cpu: "1".into(),
+        head_memory: "2560Mi".into(),
         // One worker group, no replicas needed for the head to go Ready.
         worker_groups: vec![WorkerGroup {
             name: "cpu".into(),

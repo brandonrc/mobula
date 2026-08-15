@@ -48,3 +48,9 @@ jobs:
           kubectl get rayclusters -o wide || true
           kubectl get pods -o wide || true
           kubectl describe rayclusters || true
+          echo "=== head pod describe ==="
+          kubectl describe pod -l ray.io/node-type=head || true
+          echo "=== head pod logs (current) ==="
+          kubectl logs -l ray.io/node-type=head --tail=100 || true
+          echo "=== head pod logs (previous, if crashed) ==="
+          kubectl logs -l ray.io/node-type=head --previous --tail=100 || true
