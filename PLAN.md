@@ -148,9 +148,11 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 > manager, idempotent teardown (404=ok), observe→status_to_state, label-
 > scoped list. Gated behind the `kuberay` feature (default-on so CI checks
 > it); the live client is coverage-excluded (e2e-only) and exercised by a
-> new `kuberay-e2e` workflow: kind + KubeRay operator + an `--ignored`
-> integration test doing apply→observe-until-Running→terminate. 79 tests,
-> 92.1%. Next: (4) resync loop wired into `serve` + TTL reaping + suspend;
+> `kuberay-e2e` workflow (**green 2026-08-15, 2m52s** — real kind +
+> KubeRay): an `--ignored` integration test doing
+> apply→observe-until-Running→terminate against a live RayCluster. The
+> live backend is proven end-to-end. 79 unit/integration tests, 92.1%.
+> Next: (4) resync loop wired into `serve` + TTL reaping + suspend;
 > Postgres `Store` (same SQL).
 - Reconciler over KubeRay CRs: declarative cluster specs, state machine,
   suspend/resume, TTL reaping, per-project quotas (Kueue delegation where
