@@ -15,10 +15,7 @@ use tokio::sync::{Mutex, RwLock};
 
 /// A permission verb, mirroring artifact-keeper's `PermissionType`
 /// (Read/Write/Delete/Admin) so Mobula's RBAC vocabulary matches the
-/// rest of the ecosystem. `Admin` always wins. The *target* (which
-/// cluster/project) is the scoping dimension — modelled config-side in
-/// v0, DB-backed with the Phase 3 storage layer (roles/permissions/
-/// role_assignments tables, per artifact-keeper).
+/// rest of the ecosystem. `Admin` always wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionType {
     Read,
@@ -27,11 +24,24 @@ pub enum PermissionType {
     Admin,
 }
 
-/// Built-in v0 roles (ADR-0003). Roles are permission-sets, not an
-/// ordinal rank — `Operator` (lifecycle but not code) overlaps
-/// `Developer` without containing it, which a total order can't express
-/// (review #25). In Phase 3 these become `is_system` rows alongside
-/// custom roles, matching artifact-keeper's named-role model.
+/// What a permission applies to — artifact-keeper's `target_type`. This is
+/// what lets `Operator` (cluster lifecycle) differ from `Developer` (job
+/// code) with the same verbs. Per-resource-instance scoping (which
+/// cluster/project) lands with the Phase 3 role_assignments table
+/// (ADR-0009); this is the target *type*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// The proxied Ray job surface — submitting/stopping jobs is "code".
+    Job,
+    /// Mobula's own cluster lifecycle (create/suspend/terminate).
+    Cluster,
+}
+
+/// Built-in v0 roles (ADR-0003). Roles are permission-sets over
+/// (verb, target), not an ordinal rank — `Operator` (lifecycle but not
+/// code) overlaps `Developer` without containing it, which a total order
+/// can't express (review #25). In Phase 3 these become `is_system` rows
+/// alongside custom roles, matching artifact-keeper's named-role model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Viewer,
@@ -41,23 +51,22 @@ pub enum Role {
 }
 
 impl Role {
-    /// The permission verbs this role grants on the resources it is bound
-    /// to. `Operator` gets Write/Delete for *lifecycle* but not the
-    /// job-submission surface (enforced by target in Phase 3; on the v0
-    /// proxied gateway, mutating a cluster's Ray API needs Write, which
-    /// Operator lacks — so it is read-only there).
-    pub fn permissions(self) -> &'static [PermissionType] {
+    /// Whether this role grants `action` on `target`.
+    pub fn grants(self, action: PermissionType, target: Target) -> bool {
         use PermissionType::*;
-        match self {
-            Role::Viewer => &[Read],
-            Role::Developer => &[Read, Write, Delete],
-            Role::Operator => &[Read],
-            Role::Admin => &[Read, Write, Delete, Admin],
+        use Target::*;
+        match (self, target) {
+            // Admin: everything, everywhere.
+            (Role::Admin, _) => true,
+            // Viewer: read-only, any target.
+            (Role::Viewer, _) => action == Read,
+            // Developer: full job access (submit code), read-only clusters.
+            (Role::Developer, Job) => matches!(action, Read | Write | Delete),
+            (Role::Developer, Cluster) => action == Read,
+            // Operator: full cluster lifecycle, read-only jobs (no code).
+            (Role::Operator, Cluster) => matches!(action, Read | Write | Delete),
+            (Role::Operator, Job) => action == Read,
         }
-    }
-
-    pub fn grants(self, permission: PermissionType) -> bool {
-        self.permissions().contains(&permission)
     }
 }
 
@@ -72,10 +81,10 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// Whether any held role grants `permission` (deny-by-default: an
-    /// empty role set grants nothing).
-    pub fn permits(&self, permission: PermissionType) -> bool {
-        self.roles.iter().any(|r| r.grants(permission))
+    /// Whether any held role grants `action` on `target` (deny-by-default:
+    /// an empty role set grants nothing).
+    pub fn permits(&self, action: PermissionType, target: Target) -> bool {
+        self.roles.iter().any(|r| r.grants(action, target))
     }
 
     pub fn is_authorized(&self) -> bool {
@@ -416,28 +425,37 @@ mod tests {
     }
 
     #[test]
-    fn role_permission_sets() {
+    fn role_permission_sets_by_target() {
         use PermissionType::*;
-        assert!(Role::Admin.grants(Admin));
-        assert!(Role::Developer.grants(Write) && Role::Developer.grants(Read));
-        assert!(!Role::Developer.grants(Admin));
-        // Operator: lifecycle but not code — read-only on the proxied
-        // job surface (Write is what job submission needs).
-        assert!(Role::Operator.grants(Read));
-        assert!(!Role::Operator.grants(Write));
-        assert!(!Role::Viewer.grants(Write));
+        use Target::*;
+        // Admin: everything.
+        assert!(Role::Admin.grants(Admin, Cluster) && Role::Admin.grants(Write, Job));
+        // Developer: job code yes, cluster lifecycle no.
+        assert!(Role::Developer.grants(Write, Job));
+        assert!(!Role::Developer.grants(Write, Cluster));
+        assert!(Role::Developer.grants(Read, Cluster));
+        // Operator: cluster lifecycle yes, job code no — the capability the
+        // ordinal model couldn't express (#25).
+        assert!(Role::Operator.grants(Write, Cluster));
+        assert!(!Role::Operator.grants(Write, Job));
+        assert!(Role::Operator.grants(Read, Job));
+        // Viewer: read-only everywhere.
+        assert!(Role::Viewer.grants(Read, Cluster));
+        assert!(!Role::Viewer.grants(Write, Job));
     }
 
     #[test]
     fn identity_permits_is_union_of_roles() {
+        // Holding both Developer and Operator = job code AND cluster
+        // lifecycle.
         let id = Identity {
             subject: "u".into(),
             email: None,
             groups: vec![],
-            roles: vec![Role::Viewer, Role::Operator],
+            roles: vec![Role::Developer, Role::Operator],
         };
-        assert!(id.permits(PermissionType::Read));
-        assert!(!id.permits(PermissionType::Write));
+        assert!(id.permits(PermissionType::Write, Target::Job));
+        assert!(id.permits(PermissionType::Write, Target::Cluster));
         assert!(id.is_authorized());
 
         let none = Identity {
@@ -447,7 +465,7 @@ mod tests {
             roles: vec![],
         };
         assert!(!none.is_authorized());
-        assert!(!none.permits(PermissionType::Read));
+        assert!(!none.permits(PermissionType::Read, Target::Job));
     }
 
     #[test]

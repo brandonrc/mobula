@@ -12,7 +12,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use mobula_auth::{Identity, PermissionType, Validator};
+use mobula_auth::{Identity, PermissionType, Target, Validator};
 use mobula_core::ClusterRegistry;
 
 #[derive(Clone)]
@@ -92,21 +92,48 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
         }
     };
 
-    let required = required_permission(req.method());
-    if identity.permits(required) {
-        let mut req = req;
-        req.extensions_mut().insert(identity);
-        next.run(req).await
-    } else {
-        tracing::info!(
-            target: "mobula::audit",
-            decision = "deny", reason = "insufficient_permission",
-            subject = %identity.subject,
-            required = ?required,
-            granted = ?identity.roles,
-            "authorization denied"
-        );
-        (StatusCode::FORBIDDEN, "insufficient permission").into_response()
+    // Cluster-host traffic is the proxied Ray surface: it goes straight to
+    // the gateway with no per-route handler, so enforce its Job permission
+    // here. Control-plane API routes attach the identity and let each route
+    // check its own target (e.g. cluster lifecycle needs Cluster, not Job).
+    if host_is_cluster {
+        let required = required_permission(req.method());
+        if !identity.permits(required, Target::Job) {
+            tracing::info!(
+                target: "mobula::audit",
+                decision = "deny", reason = "insufficient_permission",
+                subject = %identity.subject, required = ?required, target = "job",
+                granted = ?identity.roles, "authorization denied"
+            );
+            return (StatusCode::FORBIDDEN, "insufficient permission").into_response();
+        }
+    }
+    let mut req = req;
+    req.extensions_mut().insert(identity);
+    next.run(req).await
+}
+
+/// Route-handler authorization helper. Returns `Some(denial_response)` when
+/// access is refused, `None` when permitted. `identity` is `None` only in
+/// dev/no-auth mode (guarded by `--dev-allow-unauthenticated`), where all
+/// access is permitted; otherwise deny-by-default against (action, target).
+pub fn authorize(
+    identity: Option<&Identity>,
+    action: PermissionType,
+    target: Target,
+) -> Option<Response> {
+    match identity {
+        None => None,
+        Some(id) if id.permits(action, target) => None,
+        Some(id) => {
+            tracing::info!(
+                target: "mobula::audit",
+                decision = "deny", reason = "insufficient_permission",
+                subject = %id.subject, required = ?action, target = ?target,
+                granted = ?id.roles, "authorization denied"
+            );
+            Some((StatusCode::FORBIDDEN, "insufficient permission").into_response())
+        }
     }
 }
 
@@ -153,7 +180,7 @@ pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response 
         }
     };
     let required = required_permission(&method);
-    if identity.permits(required) {
+    if identity.permits(required, Target::Job) {
         tracing::info!(
             target: "mobula::audit",
             decision = "allow", subject = %identity.subject,

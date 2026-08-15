@@ -1119,6 +1119,7 @@ dependencies = [
  "futures",
  "jsonwebtoken",
  "mobula-auth",
+ "mobula-controller",
  "mobula-core",
  "rand 0.8.7",
  "reqwest",

@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 mobula-core.workspace = true
+mobula-controller.workspace = true
 mobula-auth.workspace = true
 axum.workspace = true
 futures.workspace = true

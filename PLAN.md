@@ -128,9 +128,19 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 > the SQL ports to Postgres unchanged. A store-conformance suite runs the
 > same scenarios against BOTH impls (behaviourally identical), plus a
 > reopen-durability test and the engine reconciling over a real SQLite DB.
-> 71 tests, 91.8%. Next: (3) KubeRay `Provisioner` backend (kube-rs) +
-> cluster CRUD API routes with explicit per-route permissions (#26);
-> (4) resync loop + TTL reaping + suspend; Postgres `Store` (same SQL).
+> 71 tests, 91.8%.
+>
+> Slice 3a (2026-08-15): target-aware RBAC + cluster CRUD API. Added
+> `Target {Job, Cluster}` to the permission model (artifact-keeper's
+> target_type) so `Operator` = cluster-lifecycle-but-not-code and
+> `Developer` = code-but-not-lifecycle — the #25/#26 capability now
+> *enforced* on real routes. `/api/v1/clusters` GET/POST/DELETE wired to
+> the Store with explicit per-route (action, target) checks; DELETE sets
+> desired=Terminated for the reconciler. The gateway proxied surface uses
+> `Target::Job`. Tripwire test: developer denied cluster-create, operator
+> allowed. 76 tests, 91.4%. Next: (3b) KubeRay `Provisioner` backend
+> (kube-rs) + kind e2e; (4) resync loop + TTL reaping + suspend; Postgres
+> `Store` (same SQL).
 - Reconciler over KubeRay CRs: declarative cluster specs, state machine,
   suspend/resume, TTL reaping, per-project quotas (Kueue delegation where
   present).

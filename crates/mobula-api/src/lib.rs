@@ -5,6 +5,7 @@
 //! path per cluster.
 
 pub mod auth_layer;
+pub mod clusters;
 pub mod gateway;
 
 use std::sync::Arc;
@@ -84,17 +85,40 @@ pub fn build_router() -> Router {
 ///    hostname can't be shadowed by a control-plane path,
 /// 3. routes + fallback.
 pub fn build_app(registry: ClusterRegistry, validator: Option<Arc<Validator>>) -> Router {
+    build_app_full(registry, validator, None)
+}
+
+/// Build the full app. When a `store` is provided, the cluster lifecycle
+/// routes (`/api/v1/clusters`) are mounted (Phase 3). Layer order matters:
+/// 1. auth middleware (outermost) — attaches identity, enforces the Job
+///    permission for proxied cluster-host traffic (ADR-0003),
+/// 2. gateway host dispatch — before route matching so a cluster hostname
+///    can't be shadowed by a control-plane path,
+/// 3. routes + fallback.
+pub fn build_app_full(
+    registry: ClusterRegistry,
+    validator: Option<Arc<Validator>>,
+    store: Option<Arc<dyn mobula_controller::Store>>,
+) -> Router {
     let registry = Arc::new(registry);
     let gw = gateway::GatewayState::new(registry.clone());
     let auth = auth_layer::AuthState {
         validator,
         registry,
     };
-    Router::new()
+    // Resolve each sub-router's own state before merging (they differ:
+    // AuthState vs ClusterApiState), then apply the shared layers to the
+    // state-complete router.
+    let mut app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/api/v1/openapi.json", ApiDoc::openapi()))
         .route("/healthz", get(healthz))
         .route("/api/v1/version", get(version))
         .route("/api/v1/authz/check", any(auth_layer::authz_check))
+        .with_state(auth.clone());
+    if let Some(store) = store {
+        app = app.merge(clusters::router(store));
+    }
+    app
         // Fallback is registered before the layers so gateway dispatch
         // also wraps unmatched paths — cluster traffic like /api/jobs/
         // has no control-plane route and must still hit the middleware.
@@ -104,10 +128,9 @@ pub fn build_app(registry: ClusterRegistry, validator: Option<Arc<Validator>>) -
             gateway::host_gateway,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            auth.clone(),
+            auth,
             auth_layer::require_auth,
         ))
-        .with_state(auth)
 }
 
 /// Everything [`serve`] needs, including the fail-closed switches. Kept in
