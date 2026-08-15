@@ -255,6 +255,29 @@ dispatch, cluster hosts are never in the public allowlist. **Still owed:
 the full external reviewer round** (auth deep-dive, RBAC-vs-requirements,
 plan-vs-reality) — re-run when budget allows.
 
+### Review 7 — red-team round 2 (issues #16–#36, triaged 2026-08-15)
+
+Independent auth/RBAC/plan-vs-reality passes. **Fixed + closed (9):**
+#16 (required claims exp/iss/aud/sub + issuer cross-check), #27 (nbf),
+#28 (JWKS cooldown bypass), #29 (IdP client timeouts + mutex release),
+#32 (Cookie/XFF/Location/Server header hygiene), #34 (log-injection),
+#35 (wildcard warning), #36 (fail-closed in library via ServeOptions),
+#23 (ext_authz + 401 audit). **Partial:** #33/#4 (token-struct Debug +
+0600 audit log done; TOML perms + SecretStore owed).
+
+**Open — genuine scope items, several need a decision:**
+
+| # | Item | Where it lands |
+|---|---|---|
+| #24 | No org/project RBAC scoping — any Developer token reaches every cluster. PLAN §Phase-2 bullet overstated "org→project→resource"; the flat-3-role v0 cut is what shipped. | **Decision:** implement project scoping (identity.project vs cluster.project) OR amend REQUIREMENTS/PLAN to declare flat-v0 explicit. Recommend the latter for v0, former early in Phase 3. |
+| #25 | Ordinal role enum can't express `operator`/`project-admin` or per-user/SA bindings (§3.7). | Phase 3 — replace with permission-set model (cedar per REQUIREMENTS §6) **before** admin-only lifecycle routes exist. |
+| #26 | Method-only role matrix: Admin is a no-op, GET=Viewer is an assumption, CORS preflight breaks. | Phase 3 — explicit per-route required roles + a "developer can't delete cluster" tripwire test when lifecycle routes land. |
+| #17 | `mobula-proxy` is an empty stub vs ADR-0003 standalone inline proxy. | **Decision:** implement thin ext_authz path OR scope §3.7 enforcement to gateway+Envoy in docs. |
+| #18 | No session mgmt: refresh token stored-but-unused, no expires_at, no revocation. | Phase 3 (revocation needs Postgres). Quick interim: track expires_at / delete the dead refresh token. |
+| #30/#31 | DoS: 256MiB buffering, no northbound timeouts/concurrency caps; ws bridge unbounded. | Hardening — tower limits + inbound timeouts + ws caps. Recommend before any networked v0. |
+| #22 | Device-flow poll aborts on transient IdP errors instead of retrying to deadline. | Quick fix — treat 5xx/transport as Pending. |
+| #19/#20/#21 | Contract-gate gaps (KubeRay vs bare head, version matrix), PLAN bookkeeping (Postgres schema/queueing), stale docs. | Bookkeeping/CI — fold into Phase 3 kickoff. |
+
 ## v0 cut line (one quarter, 1–3 people)
 
 **In:** KubeRay backend only; single binary; SQLite/Postgres, no HA. Cluster
