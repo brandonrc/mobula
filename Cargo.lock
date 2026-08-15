@@ -1382,6 +1382,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "mobula-core",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",

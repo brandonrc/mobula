@@ -45,6 +45,11 @@ impl KubeRayProvisioner {
         namespace: impl Into<String>,
         autoscaling: bool,
     ) -> Result<Self, ProvisionError> {
+        // reqwest and kube each bring a rustls crypto provider; with more
+        // than one in the tree rustls refuses to auto-pick a default and
+        // panics on first TLS use. Install one explicitly (idempotent —
+        // Err just means already installed).
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = Client::try_default()
             .await
             .map_err(|e| ProvisionError::Backend(e.to_string()))?;
