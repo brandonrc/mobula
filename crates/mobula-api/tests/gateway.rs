@@ -438,6 +438,35 @@ async fn southbound_redirects_are_not_followed() {
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::FOUND, "3xx must pass through");
-    assert!(res.headers().get(header::LOCATION).is_some());
+    assert_eq!(res.status(), StatusCode::FOUND, "3xx status passes through");
+    // ...but the internal Location is stripped so it can't leak cluster
+    // topology (169.254.x, internal service names) to the caller (#32).
+    assert!(
+        res.headers().get(header::LOCATION).is_none(),
+        "internal Location must not leak to the client"
+    );
+}
+
+#[tokio::test]
+async fn cookie_and_forwarded_headers_are_stripped_southbound() {
+    // The mock records what the cluster actually received.
+    let (addr, log) = spawn_mock_ray_head().await;
+    let app = app_with_cluster(addr, None);
+    let res = app
+        .oneshot(
+            Request::get("/api/jobs/")
+                .header(header::HOST, "demo.ray.test")
+                .header(header::COOKIE, "session=abc")
+                .header("x-forwarded-for", "1.2.3.4")
+                .header("forwarded", "for=1.2.3.4")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    // spawn_mock_ray_head only records method/path/auth/body, so assert on
+    // the request count and rely on the src-level unit tests of
+    // southbound_headers for exact header assertions.
+    assert_eq!(log.lock().unwrap().len(), 1);
 }

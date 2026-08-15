@@ -106,37 +106,38 @@ async fn main() -> std::io::Result<()> {
                         )
                     })?;
                     tracing::info!(issuer = %cfg.issuer, audience = %cfg.audience, "OIDC discovery");
-                    let v =
-                        Validator::discover(cfg, reqwest::Client::new(), allow_insecure_transport)
-                            .await
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let v = Validator::discover(
+                        cfg,
+                        mobula_auth::idp_client(),
+                        allow_insecure_transport,
+                    )
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                     Some(Arc::new(v))
                 }
                 None => None,
             };
-            if validator.is_none() && !bind.ip().is_loopback() && !dev_allow_unauthenticated {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "refusing to bind {bind}: no authentication is configured, so a \
-                         non-loopback bind exposes every registered cluster to \
-                         unauthenticated code execution. Pass --auth-config, or \
-                         --dev-allow-unauthenticated only on trusted networks."
-                    ),
-                ));
-            }
             let registry = match registry {
                 Some(path) => load_registry(&path)?,
                 None => ClusterRegistry::default(),
             };
-            registry
-                .validate(allow_insecure_transport)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             for c in &registry.clusters {
                 tracing::info!(id = %c.id, hostname = %c.hostname, "cluster registered");
             }
             tracing::info!(clusters = registry.clusters.len(), "registry loaded");
-            mobula_api::serve(bind, registry, validator).await
+            // Fail-closed invariants (non-loopback needs auth, registry
+            // validation) are enforced inside serve() so they can't be
+            // bypassed by library embedders (#36).
+            mobula_api::serve(
+                bind,
+                mobula_api::ServeOptions {
+                    registry,
+                    validator,
+                    allow_unauthenticated: dev_allow_unauthenticated,
+                    allow_insecure_transport,
+                },
+            )
+            .await
         }
         Command::Login {
             issuer,
@@ -162,7 +163,7 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn login(issuer: &str, client_id: &str, scope: &str) -> std::io::Result<()> {
-    let client = reqwest::Client::new();
+    let client = mobula_auth::idp_client();
     let meta = mobula_auth::discover_metadata(&client, issuer)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -227,7 +228,7 @@ async fn service_token(
     client_secret: &str,
     scope: Option<&str>,
 ) -> std::io::Result<()> {
-    let client = reqwest::Client::new();
+    let client = mobula_auth::idp_client();
     let meta = mobula_auth::discover_metadata(&client, issuer)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -319,10 +320,16 @@ fn init_tracing(audit_log: Option<&std::path::Path>) -> std::io::Result<()> {
     );
     match audit_log {
         Some(path) => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            // Audit records carry subjects, paths, and cluster ids — not
+            // world/group readable (#33).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let file = opts.open(path)?;
             let audit = tracing_subscriber::fmt::layer()
                 .json()
                 .with_writer(Arc::new(file))

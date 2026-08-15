@@ -128,9 +128,19 @@ async fn proxy(
     let nominated = connection_nominated(upstream.headers());
     let mut response_headers = HeaderMap::new();
     for (name, value) in upstream.headers() {
-        if !is_hop_by_hop(name) && !nominated.contains(name.as_str()) {
-            response_headers.insert(name.clone(), value.clone());
+        // Drop hop-by-hop, Connection-nominated, and headers that leak
+        // internal topology: a 3xx `Location` carries internal service
+        // names/IPs, and `Server` advertises the Ray/dashboard version
+        // (#32). Redirects aren't followed, so the client doesn't need
+        // the internal Location.
+        if is_hop_by_hop(name)
+            || nominated.contains(name.as_str())
+            || name == header::LOCATION
+            || name == header::SERVER
+        {
+            continue;
         }
+        response_headers.insert(name.clone(), value.clone());
     }
 
     // Append-only audit trail (issue #8): every proxied request, one
@@ -176,17 +186,31 @@ fn southbound_headers(inbound: &HeaderMap) -> HeaderMap {
     let nominated = connection_nominated(inbound);
     let mut headers = HeaderMap::new();
     for (name, value) in inbound {
+        // Also drop, beyond the obvious credential/host headers (#32):
+        //  - Cookie: the caller's control-plane session cookie must not be
+        //    shipped to every cluster head they route to;
+        //  - X-Forwarded-*/Forwarded: client-supplied values would spoof
+        //    source identity in cluster-side logs/ACLs. Mobula does not
+        //    currently append a trusted XFF; it strips inbound ones.
         if is_hop_by_hop(name)
             || nominated.contains(name.as_str())
             || name == header::HOST
             || name == header::AUTHORIZATION
             || name == header::CONTENT_LENGTH
+            || name == header::COOKIE
+            || name == header::FORWARDED
+            || is_forwarded(name)
         {
             continue;
         }
         headers.append(name.clone(), value.clone());
     }
     headers
+}
+
+fn is_forwarded(name: &header::HeaderName) -> bool {
+    let n = name.as_str();
+    n == "x-forwarded-for" || n == "x-forwarded-host" || n == "x-forwarded-proto"
 }
 
 fn is_hop_by_hop(name: &header::HeaderName) -> bool {
@@ -405,6 +429,25 @@ mod tests {
         assert!(out.get(header::CONTENT_LENGTH).is_none());
         assert_eq!(out.get(header::CONTENT_TYPE).unwrap(), "application/json");
         assert_eq!(out.get("x-request-id").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn southbound_strips_cookie_and_forwarded() {
+        let inbound = headers(&[
+            ("cookie", "session=abc"),
+            ("x-forwarded-for", "1.2.3.4"),
+            ("x-forwarded-host", "evil.example"),
+            ("x-forwarded-proto", "http"),
+            ("forwarded", "for=1.2.3.4"),
+            ("content-type", "application/json"),
+        ]);
+        let out = southbound_headers(&inbound);
+        assert!(out.get(header::COOKIE).is_none());
+        assert!(out.get("x-forwarded-for").is_none());
+        assert!(out.get("x-forwarded-host").is_none());
+        assert!(out.get("x-forwarded-proto").is_none());
+        assert!(out.get(header::FORWARDED).is_none());
+        assert_eq!(out.get(header::CONTENT_TYPE).unwrap(), "application/json");
     }
 
     #[test]

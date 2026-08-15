@@ -110,29 +110,51 @@ pub fn build_app(registry: ClusterRegistry, validator: Option<Arc<Validator>>) -
         .with_state(auth)
 }
 
+/// Everything [`serve`] needs, including the fail-closed switches. Kept in
+/// one struct so the invariants live in the library, not only the CLI —
+/// any embedder (or the Phase 3 lifecycle controller) calling `serve` gets
+/// the same guards (#36).
+pub struct ServeOptions {
+    pub registry: ClusterRegistry,
+    pub validator: Option<Arc<Validator>>,
+    /// Permit binding a non-loopback address with no validator configured.
+    pub allow_unauthenticated: bool,
+    /// Permit cluster tokens over cleartext http:// (registry validation).
+    pub allow_insecure_transport: bool,
+}
+
 /// Serve the API until ctrl-c.
-pub async fn serve(
-    addr: std::net::SocketAddr,
-    registry: ClusterRegistry,
-    validator: Option<Arc<Validator>>,
-) -> std::io::Result<()> {
-    serve_with_shutdown(addr, registry, validator, async {
+pub async fn serve(addr: std::net::SocketAddr, opts: ServeOptions) -> std::io::Result<()> {
+    serve_with_shutdown(addr, opts, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
 }
 
-/// Serve the API until `shutdown` resolves. Split from [`serve`] so tests
-/// (and future embedders) control the lifecycle.
+/// Serve the API until `shutdown` resolves. Enforces the fail-closed
+/// invariants (#36) before binding: registry validation, and a refusal to
+/// expose an unauthenticated gateway on a non-loopback address.
 pub async fn serve_with_shutdown(
     addr: std::net::SocketAddr,
-    registry: ClusterRegistry,
-    validator: Option<Arc<Validator>>,
+    opts: ServeOptions,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    opts.registry
+        .validate(opts.allow_insecure_transport)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    if opts.validator.is_none() && !addr.ip().is_loopback() && !opts.allow_unauthenticated {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to bind {addr}: no authentication is configured, so a \
+                 non-loopback bind exposes every registered cluster to unauthenticated \
+                 code execution. Configure a validator, or set allow_unauthenticated."
+            ),
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "mobula-api listening");
-    axum::serve(listener, build_app(registry, validator))
+    axum::serve(listener, build_app(opts.registry, opts.validator))
         .with_graceful_shutdown(shutdown)
         .await
 }
@@ -163,8 +185,12 @@ mod tests {
 
         let server = tokio::spawn(super::serve_with_shutdown(
             addr,
-            ClusterRegistry::default(),
-            None,
+            super::ServeOptions {
+                registry: ClusterRegistry::default(),
+                validator: None,
+                allow_unauthenticated: true,
+                allow_insecure_transport: true,
+            },
             async {
                 let _ = rx.await;
             },

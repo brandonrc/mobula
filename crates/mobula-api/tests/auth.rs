@@ -230,6 +230,41 @@ async fn token_without_subject_is_rejected() {
 }
 
 #[tokio::test]
+async fn tokens_missing_iss_aud_or_with_future_nbf_are_rejected() {
+    let idp = spawn_idp().await;
+    let validator = validator_for(&idp).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let sign = |claims: serde_json::Value| {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.into());
+        encode(&header, &claims, &idp.encoding_key).unwrap()
+    };
+
+    // Missing aud.
+    let no_aud = sign(serde_json::json!({
+        "sub": "u", "iss": idp.issuer, "exp": now + 300, "groups": ["/ml-eng"]
+    }));
+    assert!(validator.validate(&no_aud).await.is_err(), "missing aud");
+
+    // Missing iss.
+    let no_iss = sign(serde_json::json!({
+        "sub": "u", "aud": "mobula", "exp": now + 300, "groups": ["/ml-eng"]
+    }));
+    assert!(validator.validate(&no_iss).await.is_err(), "missing iss");
+
+    // Future nbf (not yet valid).
+    let future_nbf = sign(serde_json::json!({
+        "sub": "u", "iss": idp.issuer, "aud": "mobula",
+        "exp": now + 600, "nbf": now + 300, "groups": ["/ml-eng"]
+    }));
+    assert!(validator.validate(&future_nbf).await.is_err(), "future nbf");
+}
+
+#[tokio::test]
 async fn cluster_traffic_requires_a_token() {
     let idp = spawn_idp().await;
     let (app, _) = authed_app(&idp).await;

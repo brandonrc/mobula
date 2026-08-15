@@ -67,6 +67,14 @@ fn default_groups_claim() -> String {
     "groups".into()
 }
 
+/// Replace ASCII control characters (newlines included) so a claim value
+/// cannot forge log lines when written to the plain-text layer (#34).
+fn sanitize_claim(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("OIDC discovery failed: {0}")]
@@ -94,11 +102,24 @@ pub mod flows;
 /// Subset of the OIDC provider metadata Mobula uses.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderMetadata {
+    /// The issuer the provider claims; cross-checked against config (#16).
+    #[serde(default)]
+    pub issuer: Option<String>,
     pub jwks_uri: String,
     #[serde(default)]
     pub token_endpoint: Option<String>,
     #[serde(default)]
     pub device_authorization_endpoint: Option<String>,
+}
+
+/// HTTP client for IdP calls: bounded timeouts so a hung/trickling IdP
+/// cannot park a request forever (#29). Mirrors the southbound posture.
+pub fn idp_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("static client config")
 }
 
 /// Fetch `{issuer}/.well-known/openid-configuration`.
@@ -154,6 +175,28 @@ impl Validator {
         }
         let doc = discover_metadata(&client, &config.issuer).await?;
 
+        // Cross-check the advertised issuer against the configured one:
+        // a provider that answers discovery for a different issuer than we
+        // trust is misconfigured or hostile (#16).
+        if let Some(advertised) = &doc.issuer {
+            if advertised.trim_end_matches('/') != config.issuer.trim_end_matches('/') {
+                return Err(AuthError::Discovery(format!(
+                    "issuer mismatch: configured {}, provider advertises {advertised}",
+                    config.issuer
+                )));
+            }
+        }
+
+        // A wildcard viewer mapping turns deny-by-default into
+        // "any authenticated caller reads everything" — warn loudly (#35).
+        if config.roles.has_wildcard() {
+            tracing::warn!(
+                "role mapping contains a \"*\" wildcard: every authenticated token \
+                 (including IdP service accounts) receives that role — deny-by-default \
+                 is disabled for it"
+            );
+        }
+
         let validator = Self {
             config,
             client,
@@ -162,15 +205,28 @@ impl Validator {
             last_refresh: Mutex::new(Instant::now() - REFRESH_COOLDOWN),
         };
         validator.refresh_jwks().await?;
+        // A provider that returns zero usable keys can never validate a
+        // token; fail fast rather than boot into a permanently-401 state
+        // that also invites JWKS refresh floods (#28).
+        if validator.keys.read().await.is_empty() {
+            return Err(AuthError::Jwks(
+                "provider returned no usable signing keys".into(),
+            ));
+        }
         Ok(validator)
     }
 
     async fn refresh_jwks(&self) -> Result<(), AuthError> {
-        // Cooldown check under the lock so concurrent unknown-kid storms
-        // collapse into one upstream fetch.
-        let mut last = self.last_refresh.lock().await;
-        if last.elapsed() < REFRESH_COOLDOWN && !self.keys.read().await.is_empty() {
-            return Ok(());
+        // Claim the refresh slot on a time basis alone — independent of
+        // whether the last fetch yielded keys (#28) — and release the lock
+        // before the network call so a hung JWKS endpoint can't park every
+        // validator behind the mutex (#29).
+        {
+            let mut last = self.last_refresh.lock().await;
+            if last.elapsed() < REFRESH_COOLDOWN {
+                return Ok(());
+            }
+            *last = Instant::now();
         }
         let doc: JwksDoc = self
             .client
@@ -195,7 +251,6 @@ impl Validator {
         }
         tracing::info!(keys = keys.len(), "JWKS refreshed");
         *self.keys.write().await = Arc::new(keys);
-        *last = Instant::now();
         Ok(())
     }
 
@@ -223,6 +278,12 @@ impl Validator {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[&self.config.audience]);
         validation.set_issuer(&[self.config.issuer.trim_end_matches('/')]);
+        // jsonwebtoken defaults required_spec_claims to {"exp"} only, so a
+        // token *omitting* iss/aud passes (only mismatches are caught) —
+        // a cross-audience confused-deputy risk. Require them, plus sub,
+        // and validate nbf (off by default) (#16, #27).
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        validation.validate_nbf = true;
         let data = decode::<serde_json::Value>(token, &key, &validation)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
@@ -244,11 +305,10 @@ impl Validator {
         };
         let role = self.config.roles.resolve(&groups);
         Identity {
-            subject: claims
-                .get("sub")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            // Sanitize: sub reaches the plain-text log layer, and a `sub`
+            // containing newlines/control chars could forge audit lines
+            // (#34). Replace control chars with '?'.
+            subject: sanitize_claim(claims.get("sub").and_then(|v| v.as_str()).unwrap_or("")),
             email: claims
                 .get("email")
                 .and_then(|v| v.as_str())
@@ -260,6 +320,13 @@ impl Validator {
 }
 
 impl RoleMappings {
+    /// Whether any role maps a `"*"` wildcard.
+    pub fn has_wildcard(&self) -> bool {
+        [&self.admin, &self.developer, &self.viewer]
+            .iter()
+            .any(|patterns| patterns.iter().any(|p| p == "*"))
+    }
+
     /// Highest role whose mapping matches a group (or `"*"`).
     pub fn resolve(&self, groups: &[String]) -> Option<Role> {
         let matches = |patterns: &[String]| {
@@ -317,6 +384,22 @@ mod tests {
             Some(Role::Viewer),
             "wildcard matches no-groups"
         );
+    }
+
+    #[test]
+    fn wildcard_detection() {
+        assert!(mappings().has_wildcard());
+        assert!(!RoleMappings {
+            developer: vec!["/ml-eng".into()],
+            ..RoleMappings::default()
+        }
+        .has_wildcard());
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars() {
+        assert_eq!(sanitize_claim("normal-sub"), "normal-sub");
+        assert_eq!(sanitize_claim("evil\nsub\r\tx"), "evil?sub??x");
     }
 
     #[test]

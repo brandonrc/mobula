@@ -66,13 +66,25 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
         return next.run(req).await;
     }
 
+    let path = req.uri().path().to_string();
     let Some(token) = bearer(&req) else {
+        // Audit 401s at INFO so credential-stuffing / token-guessing is
+        // visible in the audit stream, not just debug logs (#23).
+        tracing::info!(
+            target: "mobula::audit",
+            decision = "deny", reason = "missing_token",
+            path = %path, "authentication failed"
+        );
         return unauthorized("missing bearer token");
     };
     let identity = match validator.validate(token).await {
         Ok(i) => i,
         Err(e) => {
-            tracing::debug!(error = %e, "token rejected");
+            tracing::info!(
+                target: "mobula::audit",
+                decision = "deny", reason = "invalid_token",
+                error = %e, path = %path, "authentication failed"
+            );
             return unauthorized("invalid token");
         }
     };
@@ -105,22 +117,64 @@ pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response 
     let Some(validator) = &st.validator else {
         return (StatusCode::NOT_IMPLEMENTED, "authn not configured").into_response();
     };
+    // Envoy forwards the original method/path via x-forwarded-*; fall back
+    // to the check request's own for direct callers.
+    let method = req
+        .headers()
+        .get("x-forwarded-method")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|m| Method::from_bytes(m.as_bytes()).ok())
+        .unwrap_or_else(|| req.method().clone());
+    let path = req
+        .headers()
+        .get("x-forwarded-uri")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .unwrap_or_else(|| req.uri().path().to_string());
+
     let Some(token) = bearer(&req) else {
+        tracing::info!(
+            target: "mobula::audit",
+            decision = "deny", reason = "missing_token",
+            path = %path, "ext_authz"
+        );
         return unauthorized("missing bearer token");
     };
     let identity: Identity = match validator.validate(token).await {
         Ok(i) => i,
-        Err(_) => return unauthorized("invalid token"),
+        Err(e) => {
+            tracing::info!(
+                target: "mobula::audit",
+                decision = "deny", reason = "invalid_token",
+                error = %e, path = %path, "ext_authz"
+            );
+            return unauthorized("invalid token");
+        }
     };
-    let required = required_role(req.method());
+    let required = required_role(&method);
     match identity.role {
-        Some(role) if role.permits(required) => (
-            StatusCode::OK,
-            [("x-mobula-subject", identity.subject.clone())],
-            "allowed",
-        )
-            .into_response(),
-        _ => (StatusCode::FORBIDDEN, "insufficient role").into_response(),
+        Some(role) if role.permits(required) => {
+            tracing::info!(
+                target: "mobula::audit",
+                decision = "allow", subject = %identity.subject,
+                %method, path = %path, "ext_authz"
+            );
+            (
+                StatusCode::OK,
+                [("x-mobula-subject", identity.subject.clone())],
+                "allowed",
+            )
+                .into_response()
+        }
+        _ => {
+            tracing::info!(
+                target: "mobula::audit",
+                decision = "deny", reason = "insufficient_role",
+                subject = %identity.subject, required = ?required,
+                granted = ?identity.role, %method, path = %path, "ext_authz"
+            );
+            (StatusCode::FORBIDDEN, "insufficient role").into_response()
+        }
     }
 }
 

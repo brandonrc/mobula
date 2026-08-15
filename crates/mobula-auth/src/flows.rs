@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::AuthError;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DeviceAuthorization {
     pub device_code: String,
     pub user_code: String,
@@ -27,7 +27,21 @@ fn default_interval() -> u64 {
     5
 }
 
-#[derive(Debug, Clone, Deserialize)]
+// Redacting Debug: device_code is a bearer-equivalent secret while the
+// grant is pending (#33).
+impl std::fmt::Debug for DeviceAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceAuthorization")
+            .field("device_code", &"[REDACTED]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     #[serde(default)]
@@ -36,6 +50,21 @@ pub struct TokenResponse {
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub token_type: Option<String>,
+}
+
+// Redacting Debug: access_token and refresh_token are secrets (#33).
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("expires_in", &self.expires_in)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("token_type", &self.token_type)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,4 +179,35 @@ pub async fn client_credentials(
     res.json()
         .await
         .map_err(|e| AuthError::Flow(e.without_url().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let t = TokenResponse {
+            access_token: "super-secret-token".into(),
+            expires_in: Some(300),
+            refresh_token: Some("refresh-secret".into()),
+            token_type: Some("Bearer".into()),
+        };
+        let s = format!("{t:?}");
+        assert!(!s.contains("super-secret-token"), "{s}");
+        assert!(!s.contains("refresh-secret"), "{s}");
+        assert!(s.contains("[REDACTED]"));
+
+        let d = DeviceAuthorization {
+            device_code: "device-secret".into(),
+            user_code: "WDJB-MJHT".into(),
+            verification_uri: "https://idp/device".into(),
+            verification_uri_complete: None,
+            expires_in: 600,
+            interval: 5,
+        };
+        let s = format!("{d:?}");
+        assert!(!s.contains("device-secret"), "{s}");
+        assert!(s.contains("WDJB-MJHT"), "user_code is not secret");
+    }
 }
