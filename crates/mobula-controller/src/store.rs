@@ -45,6 +45,29 @@ impl StoredCluster {
     }
 }
 
+/// Whether two specs differ in a way that should bump `generation`.
+/// `ClusterSpec` isn't `PartialEq`, so compare the fields that drive
+/// actuation. Shared by every `Store` implementation.
+pub(crate) fn spec_changed(a: &ClusterSpec, b: &ClusterSpec) -> bool {
+    a.name != b.name
+        || a.project != b.project
+        || a.ray_version != b.ray_version
+        || a.image != b.image
+        || a.head_cpu != b.head_cpu
+        || a.head_memory != b.head_memory
+        || a.ttl_seconds != b.ttl_seconds
+        || a.worker_groups.len() != b.worker_groups.len()
+        || a.worker_groups.iter().zip(&b.worker_groups).any(|(x, y)| {
+            x.name != y.name
+                || x.cpu != y.cpu
+                || x.memory != y.memory
+                || x.gpu != y.gpu
+                || x.min_replicas != y.min_replicas
+                || x.max_replicas != y.max_replicas
+                || x.replicas != y.replicas
+        })
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     /// Create or update desired spec. Returns the (possibly bumped)
@@ -90,23 +113,7 @@ pub mod memory {
         }
     }
 
-    // Compare specs by value to decide whether to bump generation. Spec
-    // isn't PartialEq, so serialize-free: compare the fields that matter.
-    fn spec_changed(a: &ClusterSpec, b: &ClusterSpec) -> bool {
-        a.name != b.name
-            || a.project != b.project
-            || a.ray_version != b.ray_version
-            || a.image != b.image
-            || a.ttl_seconds != b.ttl_seconds
-            || a.worker_groups.len() != b.worker_groups.len()
-            || a.worker_groups.iter().zip(&b.worker_groups).any(|(x, y)| {
-                x.name != y.name
-                    || x.min_replicas != y.min_replicas
-                    || x.max_replicas != y.max_replicas
-                    || x.replicas != y.replicas
-                    || x.gpu != y.gpu
-            })
-    }
+    use super::spec_changed;
 
     #[async_trait]
     impl Store for InMemoryStore {

@@ -121,10 +121,16 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 > idempotency key derived as `{id}/{generation}` (stable across passes for
 > the same desired state, new key on spec change). 6 reconcile scenarios
 > green against a recording mock provisioner (create→noop, drift repair,
-> spec-change re-key, stable-key-on-flap, terminate→noop). Next slices:
-> (2) sqlx-SQLite/Postgres `Store` impl behind the same trait; (3) KubeRay
-> `Provisioner` backend (kube-rs) + cluster CRUD API routes with explicit
-> per-route permissions (#26); (4) resync loop + TTL reaping + suspend.
+> spec-change re-key, stable-key-on-flap, terminate→noop).
+>
+> Slice 2 (2026-08-15): `SqliteStore` — sqlx runtime queries (no
+> compile-time DATABASE_URL), embedded schema, spec/enums as JSON text so
+> the SQL ports to Postgres unchanged. A store-conformance suite runs the
+> same scenarios against BOTH impls (behaviourally identical), plus a
+> reopen-durability test and the engine reconciling over a real SQLite DB.
+> 71 tests, 91.8%. Next: (3) KubeRay `Provisioner` backend (kube-rs) +
+> cluster CRUD API routes with explicit per-route permissions (#26);
+> (4) resync loop + TTL reaping + suspend; Postgres `Store` (same SQL).
 - Reconciler over KubeRay CRs: declarative cluster specs, state machine,
   suspend/resume, TTL reaping, per-project quotas (Kueue delegation where
   present).

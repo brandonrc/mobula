@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use mobula_controller::{Action, DesiredState, InMemoryStore, Reconciler, Store};
+use mobula_controller::{Action, DesiredState, InMemoryStore, Reconciler, SqliteStore, Store};
 use mobula_core::{ClusterId, ClusterSpec, ClusterState, WorkerGroup};
 use mobula_provision::{ObservedCluster, ProvisionError, Provisioner};
 
@@ -193,6 +193,27 @@ async fn idempotent_apply_uses_stable_key_across_passes() {
         1,
         "same desired generation → one stable idempotency key (ADR-0007)"
     );
+}
+
+#[tokio::test]
+async fn reconciles_over_a_real_sqlite_store() {
+    // The full engine driving the sqlx-backed store end to end.
+    let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+    let prov = Arc::new(MockProvisioner::default());
+    let rec = Reconciler::new(store.clone(), prov.clone());
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 2)).await.unwrap();
+
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Applied);
+    let stored = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.observed_state, Some(ClusterState::Running));
+    assert_eq!(stored.observed_generation, 1);
+
+    // Idempotent second pass.
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::NoOp);
+    assert_eq!(prov.apply_count(), 1);
 }
 
 #[tokio::test]
