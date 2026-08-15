@@ -23,11 +23,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - name: OpenAPI contract is in sync
-        run: |
-          cargo test -p mobula-api export_openapi
-          git diff --exit-code openapi.json \
-            || (echo "::error::openapi.json is stale — run 'cargo test -p mobula-api export_openapi' and commit"; exit 1)
 
   coverage:
     runs-on: ubuntu-latest

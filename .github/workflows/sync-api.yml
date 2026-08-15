@@ -1,0 +1,51 @@
+name: Sync API spec
+
+# The Rust code is the source of truth for the API. On any change to the API
+# surface, generate openapi.json and push it to the generated mobula-api repo,
+# whose own pipeline then regenerates and publishes the client packages.
+#
+# Requires a repo secret MOBULA_API_PUSH_TOKEN — a token with write access to
+# brandonrc/mobula-api (GITHUB_TOKEN can't push cross-repo). If the secret is
+# absent, the job no-ops with a notice rather than failing.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/mobula-api/**"
+      - "crates/mobula-core/**"
+      - ".github/workflows/sync-api.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate openapi.json from the code
+        run: cargo test -p mobula-api export_openapi
+
+      - name: Push spec to mobula-api (if it changed)
+        env:
+          TOKEN: ${{ secrets.MOBULA_API_PUSH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::MOBULA_API_PUSH_TOKEN not set — skipping spec sync."
+            exit 0
+          fi
+          git clone "https://x-access-token:${TOKEN}@github.com/brandonrc/mobula-api.git" out
+          cp openapi.json out/openapi.json
+          cd out
+          if git diff --quiet; then
+            echo "spec unchanged; nothing to push"
+            exit 0
+          fi
+          git config user.name "mobula-ci"
+          git config user.email "ci@mobula.invalid"
+          git add openapi.json
+          git commit -m "chore: sync openapi.json from mobula@${GITHUB_SHA::7}"
+          git push
