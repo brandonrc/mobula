@@ -43,9 +43,15 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 
 ### Phase 1 — Multi-cluster job gateway (first drop-in artifact)
 
-> Progress 2026-08-15: static registry + host-routed proxy with token
-> injection landed, with mock-Ray-head integration tests. Outstanding:
-> websocket log tail, durable log capture, Python-client contract tests.
+> Progress 2026-08-15: static registry, host-routed proxy with token
+> injection, and websocket log-tail bridging landed. **Exit criterion met:**
+> the contract workflow replays the real Python `JobSubmissionClient`
+> (Ray 2.57.0) through the gateway against a live `ray start --head` —
+> package upload, submit, status, logs, websocket tail, stop/delete all
+> pass (weekly cron = drift alarm). Coverage gated at 90% lines in CI
+> (currently 92.7%). Outstanding: durable log capture to object store;
+> pin the two-minor Ray version matrix in contract.yml; Nebari pack
+> integration lives in the decoupled brandonrc/mobula-pack repo.
 - Serve the Ray Job Submission REST surface in Rust as a **gateway in front of
   each cluster's native job API** — never a reimplementation of the dashboard
   head (its endpoints write GCS KV and spawn JobSupervisor actors internally;
