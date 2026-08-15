@@ -12,7 +12,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use mobula_auth::{Identity, Role, Validator};
+use mobula_auth::{Identity, PermissionType, Validator};
 use mobula_core::ClusterRegistry;
 
 #[derive(Clone)]
@@ -31,14 +31,17 @@ fn is_public(path: &str) -> bool {
         || path.starts_with("/docs/")
 }
 
-fn required_role(method: &Method) -> Role {
-    // v0 matrix: reads (and the websocket log tail, which arrives as a
-    // GET upgrade) need Viewer; anything mutating needs Developer.
-    // Admin-only surfaces arrive with the lifecycle API in Phase 3.
+/// The permission a proxied gateway request requires. Reads (and the
+/// websocket log tail, a GET upgrade) need `Read`; mutations need `Write`.
+/// DELETE on the proxied Ray surface is job deletion — a Developer action,
+/// not cluster lifecycle — so it maps to `Write`, not `Delete`. Mobula's
+/// own lifecycle/admin routes (Phase 3) will require permissions per route
+/// against a cluster/project target, not by HTTP method.
+fn required_permission(method: &Method) -> PermissionType {
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
-        Role::Viewer
+        PermissionType::Read
     } else {
-        Role::Developer
+        PermissionType::Write
     }
 }
 
@@ -89,23 +92,21 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
         }
     };
 
-    let required = required_role(req.method());
-    match identity.role {
-        Some(role) if role.permits(required) => {
-            let mut req = req;
-            req.extensions_mut().insert(identity);
-            next.run(req).await
-        }
-        _ => {
-            tracing::info!(
-                target: "mobula::audit",
-                subject = %identity.subject,
-                required = ?required,
-                granted = ?identity.role,
-                "authorization denied"
-            );
-            (StatusCode::FORBIDDEN, "insufficient role").into_response()
-        }
+    let required = required_permission(req.method());
+    if identity.permits(required) {
+        let mut req = req;
+        req.extensions_mut().insert(identity);
+        next.run(req).await
+    } else {
+        tracing::info!(
+            target: "mobula::audit",
+            decision = "deny", reason = "insufficient_permission",
+            subject = %identity.subject,
+            required = ?required,
+            granted = ?identity.roles,
+            "authorization denied"
+        );
+        (StatusCode::FORBIDDEN, "insufficient permission").into_response()
     }
 }
 
@@ -151,30 +152,27 @@ pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response 
             return unauthorized("invalid token");
         }
     };
-    let required = required_role(&method);
-    match identity.role {
-        Some(role) if role.permits(required) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "allow", subject = %identity.subject,
-                %method, path = %path, "ext_authz"
-            );
-            (
-                StatusCode::OK,
-                [("x-mobula-subject", identity.subject.clone())],
-                "allowed",
-            )
-                .into_response()
-        }
-        _ => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "deny", reason = "insufficient_role",
-                subject = %identity.subject, required = ?required,
-                granted = ?identity.role, %method, path = %path, "ext_authz"
-            );
-            (StatusCode::FORBIDDEN, "insufficient role").into_response()
-        }
+    let required = required_permission(&method);
+    if identity.permits(required) {
+        tracing::info!(
+            target: "mobula::audit",
+            decision = "allow", subject = %identity.subject,
+            %method, path = %path, "ext_authz"
+        );
+        (
+            StatusCode::OK,
+            [("x-mobula-subject", identity.subject.clone())],
+            "allowed",
+        )
+            .into_response()
+    } else {
+        tracing::info!(
+            target: "mobula::audit",
+            decision = "deny", reason = "insufficient_permission",
+            subject = %identity.subject, required = ?required,
+            granted = ?identity.roles, %method, path = %path, "ext_authz"
+        );
+        (StatusCode::FORBIDDEN, "insufficient permission").into_response()
     }
 }
 
@@ -208,11 +206,11 @@ mod tests {
     }
 
     #[test]
-    fn role_matrix_maps_reads_to_viewer_and_writes_to_developer() {
-        assert_eq!(required_role(&Method::GET), Role::Viewer);
-        assert_eq!(required_role(&Method::HEAD), Role::Viewer);
-        assert_eq!(required_role(&Method::POST), Role::Developer);
-        assert_eq!(required_role(&Method::PUT), Role::Developer);
-        assert_eq!(required_role(&Method::DELETE), Role::Developer);
+    fn permission_matrix_maps_reads_to_read_and_writes_to_write() {
+        assert_eq!(required_permission(&Method::GET), PermissionType::Read);
+        assert_eq!(required_permission(&Method::HEAD), PermissionType::Read);
+        assert_eq!(required_permission(&Method::POST), PermissionType::Write);
+        assert_eq!(required_permission(&Method::PUT), PermissionType::Write);
+        assert_eq!(required_permission(&Method::DELETE), PermissionType::Write);
     }
 }

@@ -269,8 +269,8 @@ Independent auth/RBAC/plan-vs-reality passes. **Fixed + closed (9):**
 
 | # | Item | Where it lands |
 |---|---|---|
-| #24 | No org/project RBAC scoping — any Developer token reaches every cluster. PLAN §Phase-2 bullet overstated "org→project→resource"; the flat-3-role v0 cut is what shipped. | **Decision:** implement project scoping (identity.project vs cluster.project) OR amend REQUIREMENTS/PLAN to declare flat-v0 explicit. Recommend the latter for v0, former early in Phase 3. |
-| #25 | Ordinal role enum can't express `operator`/`project-admin` or per-user/SA bindings (§3.7). | Phase 3 — replace with permission-set model (cedar per REQUIREMENTS §6) **before** admin-only lifecycle routes exist. |
+| #24 | No org/project RBAC scoping — any Developer token reaches every cluster. | **Decided (see ADR-0009):** adopt artifact-keeper's RBAC model — permission-sets + principal(user/SA/group) + target(cluster/project) scoping — but the scoped/DB parts are inherently Postgres-backed, so they land with the Phase 3 storage layer. v0 ships the type vocabulary + flat group→role mapping (NIC itself does flat group authz; no project taxonomy exists to scope against yet). |
+| #25 | Ordinal role enum can't express `operator`. | **Fixed:** replaced with named-role permission-sets mirroring artifact-keeper's `PermissionType {Read,Write,Delete,Admin}`. `Operator` now expressible (Read-only on the proxied job surface — lifecycle-not-code); tested. Custom roles + per-user/SA bindings = Phase 3 DB tables. |
 | #26 | Method-only role matrix: Admin is a no-op, GET=Viewer is an assumption, CORS preflight breaks. | Phase 3 — explicit per-route required roles + a "developer can't delete cluster" tripwire test when lifecycle routes land. |
 | #17 | `mobula-proxy` is an empty stub vs ADR-0003 standalone inline proxy. | **Decision:** implement thin ext_authz path OR scope §3.7 enforcement to gateway+Envoy in docs. |
 | #18 | No session mgmt: refresh token stored-but-unused, no expires_at, no revocation. | Phase 3 (revocation needs Postgres). Quick interim: track expires_at / delete the dead refresh token. |

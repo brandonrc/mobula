@@ -174,6 +174,11 @@ cannot serve bearer-token clients.
 
 ### 3.7 RBAC
 - Model: `Org → Project → Resource (cluster | job | service | workspace)`.
+  **v0 status (ADR-0009):** permission-set roles mirroring artifact-keeper
+  (`Read/Write/Delete/Admin`); enforced flat (role applies globally) because
+  NIC provides no project taxonomy and the storage layer is Phase 3. The
+  scoped principal/target bindings (users/SAs/groups × cluster/project) land
+  with Phase 3's Postgres tables.
 - Built-in roles: `org-admin`, `project-admin`, `developer` (submit/attach),
   `operator` (lifecycle but not code), `viewer`. Custom roles = permission sets.
 - Bindings assignable to users, IdP groups, and service accounts.

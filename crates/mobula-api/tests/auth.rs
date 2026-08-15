@@ -131,6 +131,7 @@ async fn validator_for(idp: &Idp) -> Arc<Validator> {
         groups_claim: "groups".into(),
         roles: RoleMappings {
             admin: vec!["/platform-admins".into()],
+            operator: vec!["/sre".into()],
             developer: vec!["/ml-eng".into()],
             viewer: vec!["/observers".into()],
         },
@@ -326,6 +327,33 @@ async fn viewer_reads_but_cannot_submit() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN, "viewer POST denied");
+}
+
+#[tokio::test]
+async fn operator_reads_but_cannot_submit_jobs() {
+    // The capability the ordinal-role model couldn't express (#25):
+    // operator = lifecycle but not code. On the proxied Ray surface,
+    // submitting a job is a Write, which Operator lacks.
+    let idp = spawn_idp().await;
+    let (app, _) = authed_app(&idp).await;
+    let operator = idp.token(&["/sre"], "mobula", 300);
+
+    let res = app
+        .clone()
+        .oneshot(get("/api/jobs/", "demo.ray.test", Some(&operator)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "operator can read");
+
+    let res = app
+        .oneshot(post("/api/jobs/", "demo.ray.test", Some(&operator)))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "operator must not submit jobs"
+    );
 }
 
 #[tokio::test]

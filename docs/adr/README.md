@@ -13,3 +13,4 @@ for the full review log with evidence and dispositions).
 | [0006](0006-observation-first-reconciliation.md) | Observation-first reconciliation; state machine is vocabulary, not law |
 | [0007](0007-capacity-field-ownership-and-fencing.md) | One writer per capacity field; fenced side effects |
 | [0008](0008-ubi-stig-containers.md) | UBI-only, STIG-postured container images |
+| [0009](0009-rbac-model.md) | RBAC follows artifact-keeper: permission-sets + scoped bindings |

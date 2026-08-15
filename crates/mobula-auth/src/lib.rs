@@ -13,27 +13,74 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
-/// Fixed v0 roles, ordered by privilege (ADR-0003; custom roles later).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// A permission verb, mirroring artifact-keeper's `PermissionType`
+/// (Read/Write/Delete/Admin) so Mobula's RBAC vocabulary matches the
+/// rest of the ecosystem. `Admin` always wins. The *target* (which
+/// cluster/project) is the scoping dimension — modelled config-side in
+/// v0, DB-backed with the Phase 3 storage layer (roles/permissions/
+/// role_assignments tables, per artifact-keeper).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionType {
+    Read,
+    Write,
+    Delete,
+    Admin,
+}
+
+/// Built-in v0 roles (ADR-0003). Roles are permission-sets, not an
+/// ordinal rank — `Operator` (lifecycle but not code) overlaps
+/// `Developer` without containing it, which a total order can't express
+/// (review #25). In Phase 3 these become `is_system` rows alongside
+/// custom roles, matching artifact-keeper's named-role model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Viewer,
     Developer,
+    Operator,
     Admin,
 }
 
 impl Role {
-    pub fn permits(self, required: Role) -> bool {
-        self >= required
+    /// The permission verbs this role grants on the resources it is bound
+    /// to. `Operator` gets Write/Delete for *lifecycle* but not the
+    /// job-submission surface (enforced by target in Phase 3; on the v0
+    /// proxied gateway, mutating a cluster's Ray API needs Write, which
+    /// Operator lacks — so it is read-only there).
+    pub fn permissions(self) -> &'static [PermissionType] {
+        use PermissionType::*;
+        match self {
+            Role::Viewer => &[Read],
+            Role::Developer => &[Read, Write, Delete],
+            Role::Operator => &[Read],
+            Role::Admin => &[Read, Write, Delete, Admin],
+        }
+    }
+
+    pub fn grants(self, permission: PermissionType) -> bool {
+        self.permissions().contains(&permission)
     }
 }
 
-/// Authenticated caller, attached to requests after validation.
+/// Authenticated caller, attached to requests after validation. A caller
+/// may hold several roles (their union of permissions applies).
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub subject: String,
     pub email: Option<String>,
     pub groups: Vec<String>,
-    pub role: Option<Role>,
+    pub roles: Vec<Role>,
+}
+
+impl Identity {
+    /// Whether any held role grants `permission` (deny-by-default: an
+    /// empty role set grants nothing).
+    pub fn permits(&self, permission: PermissionType) -> bool {
+        self.roles.iter().any(|r| r.grants(permission))
+    }
+
+    pub fn is_authorized(&self) -> bool {
+        !self.roles.is_empty()
+    }
 }
 
 /// Mapping from IdP group names to Mobula roles. `"*"` matches any
@@ -42,6 +89,8 @@ pub struct Identity {
 pub struct RoleMappings {
     #[serde(default)]
     pub admin: Vec<String>,
+    #[serde(default)]
+    pub operator: Vec<String>,
     #[serde(default)]
     pub developer: Vec<String>,
     #[serde(default)]
@@ -303,7 +352,7 @@ impl Validator {
             Some(serde_json::Value::String(s)) => s.split_whitespace().map(String::from).collect(),
             _ => Vec::new(),
         };
-        let role = self.config.roles.resolve(&groups);
+        let roles = self.config.roles.resolve(&groups);
         Identity {
             // Sanitize: sub reaches the plain-text log layer, and a `sub`
             // containing newlines/control chars could forge audit lines
@@ -314,7 +363,7 @@ impl Validator {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             groups,
-            role,
+            roles,
         }
     }
 }
@@ -322,27 +371,34 @@ impl Validator {
 impl RoleMappings {
     /// Whether any role maps a `"*"` wildcard.
     pub fn has_wildcard(&self) -> bool {
-        [&self.admin, &self.developer, &self.viewer]
+        [&self.admin, &self.operator, &self.developer, &self.viewer]
             .iter()
             .any(|patterns| patterns.iter().any(|p| p == "*"))
     }
 
-    /// Highest role whose mapping matches a group (or `"*"`).
-    pub fn resolve(&self, groups: &[String]) -> Option<Role> {
+    /// Every role whose group mapping matches (a caller holds the union of
+    /// their permissions). A `"*"` pattern matches any authenticated
+    /// caller. Empty result = deny by default.
+    pub fn resolve(&self, groups: &[String]) -> Vec<Role> {
         let matches = |patterns: &[String]| {
             patterns
                 .iter()
                 .any(|p| p == "*" || groups.iter().any(|g| g == p))
         };
+        let mut roles = Vec::new();
         if matches(&self.admin) {
-            Some(Role::Admin)
-        } else if matches(&self.developer) {
-            Some(Role::Developer)
-        } else if matches(&self.viewer) {
-            Some(Role::Viewer)
-        } else {
-            None
+            roles.push(Role::Admin);
         }
+        if matches(&self.operator) {
+            roles.push(Role::Operator);
+        }
+        if matches(&self.developer) {
+            roles.push(Role::Developer);
+        }
+        if matches(&self.viewer) {
+            roles.push(Role::Viewer);
+        }
+        roles
     }
 }
 
@@ -353,37 +409,60 @@ mod tests {
     fn mappings() -> RoleMappings {
         RoleMappings {
             admin: vec!["/platform-admins".into()],
+            operator: vec!["/sre".into()],
             developer: vec!["/ml-eng".into(), "/data-sci".into()],
             viewer: vec!["*".into()],
         }
     }
 
     #[test]
-    fn role_ordering_and_permits() {
-        assert!(Role::Admin.permits(Role::Viewer));
-        assert!(Role::Developer.permits(Role::Developer));
-        assert!(!Role::Viewer.permits(Role::Developer));
-        assert!(!Role::Developer.permits(Role::Admin));
+    fn role_permission_sets() {
+        use PermissionType::*;
+        assert!(Role::Admin.grants(Admin));
+        assert!(Role::Developer.grants(Write) && Role::Developer.grants(Read));
+        assert!(!Role::Developer.grants(Admin));
+        // Operator: lifecycle but not code — read-only on the proxied
+        // job surface (Write is what job submission needs).
+        assert!(Role::Operator.grants(Read));
+        assert!(!Role::Operator.grants(Write));
+        assert!(!Role::Viewer.grants(Write));
     }
 
     #[test]
-    fn highest_matching_role_wins() {
+    fn identity_permits_is_union_of_roles() {
+        let id = Identity {
+            subject: "u".into(),
+            email: None,
+            groups: vec![],
+            roles: vec![Role::Viewer, Role::Operator],
+        };
+        assert!(id.permits(PermissionType::Read));
+        assert!(!id.permits(PermissionType::Write));
+        assert!(id.is_authorized());
+
+        let none = Identity {
+            subject: "u".into(),
+            email: None,
+            groups: vec![],
+            roles: vec![],
+        };
+        assert!(!none.is_authorized());
+        assert!(!none.permits(PermissionType::Read));
+    }
+
+    #[test]
+    fn resolve_returns_all_matching_roles() {
         let m = mappings();
-        assert_eq!(
-            m.resolve(&["/ml-eng".into(), "/platform-admins".into()]),
-            Some(Role::Admin)
+        let mut r = m.resolve(&["/ml-eng".into(), "/platform-admins".into()]);
+        r.sort_by_key(|x| format!("{x:?}"));
+        assert!(r.contains(&Role::Admin) && r.contains(&Role::Developer));
+        // Wildcard viewer means everyone gets at least Viewer.
+        assert!(m.resolve(&["/random".into()]).contains(&Role::Viewer));
+        assert!(
+            m.resolve(&[]).contains(&Role::Viewer),
+            "wildcard, no groups"
         );
-        assert_eq!(m.resolve(&["/ml-eng".into()]), Some(Role::Developer));
-        assert_eq!(
-            m.resolve(&["/random".into()]),
-            Some(Role::Viewer),
-            "wildcard"
-        );
-        assert_eq!(
-            m.resolve(&[]),
-            Some(Role::Viewer),
-            "wildcard matches no-groups"
-        );
+        assert!(m.resolve(&["/sre".into()]).contains(&Role::Operator));
     }
 
     #[test]
@@ -408,7 +487,7 @@ mod tests {
             viewer: vec!["/readers".into()],
             ..RoleMappings::default()
         };
-        assert_eq!(m.resolve(&["/unrelated".into()]), None);
+        assert!(m.resolve(&["/unrelated".into()]).is_empty());
     }
 
     #[test]
