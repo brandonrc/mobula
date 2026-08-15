@@ -14,6 +14,14 @@ allow = [
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # Marvin Attack timing sidechannel in the `rsa` crate (no fixed
+    # version upstream). rsa is a dev-dependency only — tests use it to
+    # mint RSA keys for mock-OIDC JWT signing. It is not compiled into
+    # any shipped binary; runtime JWT verification uses jsonwebtoken's
+    # verify path, not `rsa`.
+    { id = "RUSTSEC-2023-0071", reason = "dev-dependency only (test JWT signing), not in shipped binaries" },
+]
 
 [bans]
 multiple-versions = "warn"
