@@ -362,6 +362,31 @@ Independent auth/RBAC/plan-vs-reality passes. **Fixed + closed (9):**
 | #22 | Device-flow poll aborts on transient IdP errors instead of retrying to deadline. | Quick fix — treat 5xx/transport as Pending. |
 | #19/#20/#21 | Contract-gate gaps (KubeRay vs bare head, version matrix), PLAN bookkeeping (Postgres schema/queueing), stale docs. | Bookkeeping/CI — fold into Phase 3 kickoff. |
 
+### Review 8 — adversarial review of the Phase 3+4 surface (2026-08-15)
+
+Three reviewers (reconcile/store, KubeRay/policy, API/RBAC/contract).
+The RBAC matrix, header hygiene, and JWT validation were verified correct.
+
+**Fixed in-line (this commit):**
+- **R2#1 (critical bug):** worker pods had no container image → any cluster
+  with `replicas>0` was rejected by the API server, masked by a zero-worker
+  e2e. Workers now carry the cluster image; e2e bumped to 1 worker.
+- #30/#31 DoS: gateway concurrency semaphore + 64MiB body cap + ws connect
+  timeout. #22: device-flow retries transient IdP errors to the deadline.
+- R2#4: quantities reject NaN/inf/negative; worker min>max rejected.
+- R2#2: unparseable stored spec fails quota accounting closed (500), never
+  contributes zero. R3#6: delete_cluster distinguishes 404 from store error.
+- R3#5/#7: OpenAPI documents the real 4xx/5xx across cluster+service routes.
+
+**Filed as issues (design gaps, need real work):** #39 outbox fencing is
+write-only, #40 observed_generation self-certified, #41 no drift detection/
+restore-quarantine, #42 non-atomic generation bump (concurrency), #43 no
+reconcile backoff, #44 quota TOCTOU, #45 fail-closed guard only in serve(),
+#46 authz_check hardcodes Target::Job, #47 Suspended/Degraded not repaired.
+These are the honest gap between "works in the tested happy path" and
+"production-safe"; none block the tested feature set but several gate a real
+multi-tenant deployment.
+
 ## v0 cut line (one quarter, 1–3 people)
 
 **In:** KubeRay backend only; single binary; SQLite/Postgres, no HA. Cluster
