@@ -144,6 +144,9 @@ pub struct ServeOptions {
     pub allow_unauthenticated: bool,
     /// Permit cluster tokens over cleartext http:// (registry validation).
     pub allow_insecure_transport: bool,
+    /// Desired-state store; when present, the cluster lifecycle routes
+    /// (`/api/v1/clusters`) are mounted. The caller owns the reconcile loop.
+    pub store: Option<Arc<dyn mobula_controller::Store>>,
 }
 
 /// Serve the API until ctrl-c.
@@ -177,9 +180,12 @@ pub async fn serve_with_shutdown(
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "mobula-api listening");
-    axum::serve(listener, build_app(opts.registry, opts.validator))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        build_app_full(opts.registry, opts.validator, opts.store),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 #[cfg(test)]
@@ -213,6 +219,7 @@ mod tests {
                 validator: None,
                 allow_unauthenticated: true,
                 allow_insecure_transport: true,
+                store: None,
             },
             async {
                 let _ = rx.await;

@@ -9,7 +9,7 @@ use mobula_core::{ClusterId, ClusterSpec, ClusterState};
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
-use crate::store::{spec_changed, DesiredState, Store, StoreError, StoredCluster};
+use crate::store::{now_unix, spec_changed, DesiredState, Store, StoreError, StoredCluster};
 
 impl From<sqlx::Error> for StoreError {
     fn from(e: sqlx::Error) -> Self {
@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS clusters (
     generation            INTEGER NOT NULL,
     desired               TEXT NOT NULL,
     observed_state        TEXT,
-    observed_generation   INTEGER NOT NULL DEFAULT 0
+    observed_generation   INTEGER NOT NULL DEFAULT 0,
+    created_at            INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS intents (
     intent_key TEXT PRIMARY KEY
@@ -89,6 +90,7 @@ fn row_to_cluster(row: SqliteRow) -> Result<StoredCluster, StoreError> {
         desired: desired_from_str(&row.try_get::<String, _>("desired")?)?,
         observed_state,
         observed_generation: row.try_get::<i64, _>("observed_generation")? as u64,
+        created_at: row.try_get::<i64, _>("created_at")? as u64,
     })
 }
 
@@ -120,8 +122,8 @@ impl Store for SqliteStore {
         // Keep desired/observed on update; default desired=running on insert.
         sqlx::query(
             r#"
-            INSERT INTO clusters (id, spec_json, generation, desired, observed_generation)
-            VALUES (?, ?, ?, 'running', 0)
+            INSERT INTO clusters (id, spec_json, generation, desired, observed_generation, created_at)
+            VALUES (?, ?, ?, 'running', 0, ?)
             ON CONFLICT(id) DO UPDATE SET
                 spec_json = excluded.spec_json,
                 generation = excluded.generation
@@ -130,6 +132,7 @@ impl Store for SqliteStore {
         .bind(&id.0)
         .bind(&spec_json)
         .bind(generation as i64)
+        .bind(now_unix() as i64)
         .execute(&mut *tx)
         .await?;
 

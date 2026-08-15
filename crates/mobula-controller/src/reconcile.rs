@@ -8,11 +8,12 @@
 //! no-op at the provider.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use mobula_core::ClusterState;
 use mobula_provision::{ProvisionError, Provisioner};
 
-use crate::store::{DesiredState, Store, StoreError, StoredCluster};
+use crate::store::{now_unix, DesiredState, Store, StoreError, StoredCluster};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -107,6 +108,70 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
     }
 }
 
+impl<S: Store, P: Provisioner> Reconciler<S, P> {
+    /// TTL reaping: a running cluster with `ttl_seconds` set whose age
+    /// exceeds it is flipped to desired=Terminated; the next reconcile
+    /// pass tears it down. This is a **max-age** reaper, not idle-based —
+    /// idle detection needs job-activity tracking (deferred; documented in
+    /// REQUIREMENTS §3.1). Returns the ids reaped.
+    pub async fn reap_expired(&self, now: u64) -> Result<Vec<String>, ReconcileError> {
+        let clusters = self.store.list().await?;
+        let mut reaped = Vec::new();
+        for c in clusters {
+            if is_expired(&c, now) {
+                self.store
+                    .set_desired(&c.id, DesiredState::Terminated)
+                    .await?;
+                tracing::info!(
+                    target: "mobula::audit",
+                    cluster = %c.id, ttl = c.spec.ttl_seconds, age = now.saturating_sub(c.created_at),
+                    "cluster reaped (max-age TTL)"
+                );
+                reaped.push(c.id.0);
+            }
+        }
+        Ok(reaped)
+    }
+
+    /// Run the control loop until `shutdown` resolves: each tick reaps
+    /// expired clusters then reconciles all. Level-triggered with a fixed
+    /// resync interval (ADR-0006) — an edge-trigger/watch is only an
+    /// optimization we can add later. Errors are logged per pass, never
+    /// fatal, so one bad tick doesn't stop the loop.
+    pub async fn run(&self, interval: Duration, shutdown: impl std::future::Future<Output = ()>) {
+        tracing::info!(interval_secs = interval.as_secs(), "reconcile loop started");
+        let mut ticker = tokio::time::interval(interval);
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = self.reap_expired(now_unix()).await {
+                        tracing::warn!(error = %e, "reap pass failed");
+                    }
+                    for (id, res) in self.reconcile_all().await {
+                        if let Err(e) = res {
+                            tracing::warn!(cluster = %id, error = %e, "reconcile failed");
+                        }
+                    }
+                }
+                _ = &mut shutdown => {
+                    tracing::info!("reconcile loop shutting down");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// A running cluster is expired when it has a TTL and its age exceeds it.
+fn is_expired(c: &StoredCluster, now: u64) -> bool {
+    matches!(c.desired, DesiredState::Running)
+        && c.observed_state == Some(ClusterState::Running)
+        && c.spec
+            .ttl_seconds
+            .is_some_and(|ttl| now.saturating_sub(c.created_at) >= ttl)
+}
+
 /// Apply is needed when nothing is provisioned, when the backing cluster is
 /// gone/terminated but we still want it, or when the desired generation is
 /// ahead of what we last reconciled (spec changed).
@@ -121,6 +186,54 @@ fn needs_apply(observed: Option<ClusterState>, generation: u64, observed_generat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::store::DesiredState;
+    use mobula_core::{ClusterId, ClusterSpec};
+
+    fn stored(ttl: Option<u64>, created_at: u64, observed: Option<ClusterState>) -> StoredCluster {
+        StoredCluster {
+            id: ClusterId("c".into()),
+            spec: ClusterSpec {
+                name: "c".into(),
+                project: "p".into(),
+                ray_version: "2.57.0".into(),
+                image: "img".into(),
+                head_cpu: "1".into(),
+                head_memory: "2Gi".into(),
+                worker_groups: vec![],
+                ttl_seconds: ttl,
+            },
+            generation: 1,
+            desired: DesiredState::Running,
+            observed_state: observed,
+            observed_generation: 1,
+            created_at,
+        }
+    }
+
+    #[test]
+    fn is_expired_matrix() {
+        // Running past TTL → expired.
+        assert!(is_expired(
+            &stored(Some(60), 100, Some(ClusterState::Running)),
+            200
+        ));
+        // Within TTL → not.
+        assert!(!is_expired(
+            &stored(Some(60), 100, Some(ClusterState::Running)),
+            130
+        ));
+        // No TTL → never.
+        assert!(!is_expired(
+            &stored(None, 0, Some(ClusterState::Running)),
+            999_999
+        ));
+        // Not observed Running yet → don't reap mid-provision.
+        assert!(!is_expired(
+            &stored(Some(1), 0, Some(ClusterState::Provisioning)),
+            999
+        ));
+    }
 
     #[test]
     fn needs_apply_matrix() {

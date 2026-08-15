@@ -159,6 +159,23 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
   present).
 - Per-surface NebariApp stamping for authenticated external access.
 
+### Phase 3 slice 4 — resync loop + TTL reaping (2026-08-15)
+
+Completes the control loop. `Reconciler::run(interval, shutdown)` is a
+level-triggered background task (ADR-0006): each tick reaps expired
+clusters then reconciles all, errors logged per-pass never fatal, stops
+promptly on shutdown. TTL reaping is **max-age** (a Running cluster past
+`ttl_seconds` → desired=Terminated); idle-based reaping needs job-activity
+tracking and is deferred (noted in REQUIREMENTS §3.1). Store gained a
+`created_at` timestamp (both impls; SQLite column). Wired into the CLI:
+`mobula serve --kuberay-namespace NS [--db PATH] [--reconcile-interval-secs N]`
+stands up the SqliteStore + KubeRayProvisioner, spawns the loop, and mounts
+the cluster routes — a deployed Mobula is now a live controller. Tests:
+`is_expired` matrix, reaper-terminates-expired, and a background-loop test
+that converges a cluster with no manual reconcile then stops on shutdown.
+82 tests, 92.3%. **Phase 3 complete.** Remaining Phase-3-adjacent: Postgres
+`Store` (same SQL), suspend/resume (KubeRay `.spec.suspend`).
+
 ### Phase 4 — Dynamic allocation + services
 - Autoscaler policy engine (spot strategy, fair share, cost model), ephemeral
   per-job clusters, Ray Serve service management (canary/rollback).

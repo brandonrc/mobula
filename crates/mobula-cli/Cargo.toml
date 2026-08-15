@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 mobula-api.workspace = true
+mobula-controller.workspace = true
+mobula-provision.workspace = true
 mobula-core.workspace = true
 mobula-auth.workspace = true
 reqwest.workspace = true

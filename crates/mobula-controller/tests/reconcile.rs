@@ -217,6 +217,65 @@ async fn reconciles_over_a_real_sqlite_store() {
 }
 
 #[tokio::test]
+async fn reaper_terminates_expired_cluster() {
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    // ttl_seconds = 0 → expires as soon as it is observed Running.
+    let mut s = spec("demo", 1);
+    s.ttl_seconds = Some(0);
+    store.upsert_desired(&id, s).await.unwrap();
+
+    // First reconcile brings it to Running.
+    rec.reconcile_all().await;
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().observed_state,
+        Some(ClusterState::Running)
+    );
+
+    // Reap flips desired → Terminated; next reconcile tears it down.
+    let reaped = rec.reap_expired(1).await.unwrap();
+    assert_eq!(reaped, vec!["demo".to_string()]);
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Terminated);
+    let _ = prov;
+}
+
+#[tokio::test]
+async fn run_loop_converges_then_stops_on_shutdown() {
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+
+    // Run the loop with a short interval; shut it down after a beat.
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        rec.run(std::time::Duration::from_millis(10), async {
+            let _ = rx.await;
+        })
+        .await;
+    });
+
+    // Give it a few ticks to converge without any manual reconcile call.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().observed_state,
+        Some(ClusterState::Running),
+        "the background loop should have provisioned the cluster"
+    );
+    assert_eq!(
+        prov.apply_count(),
+        1,
+        "steady state: applied once, no churn"
+    );
+
+    tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("loop should stop promptly on shutdown")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn terminate_desired_tears_down_then_noop() {
     let (store, _prov, rec) = setup();
     let id = ClusterId("demo".into());

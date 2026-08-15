@@ -33,6 +33,16 @@ pub struct StoredCluster {
     pub desired: DesiredState,
     pub observed_state: Option<ClusterState>,
     pub observed_generation: u64,
+    /// Unix seconds when the cluster was first created (for TTL reaping).
+    pub created_at: u64,
+}
+
+/// Current unix time in whole seconds.
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl StoredCluster {
@@ -136,6 +146,7 @@ pub mod memory {
                 desired: observed.map(|c| c.desired).unwrap_or(DesiredState::Running),
                 observed_state: observed.and_then(|c| c.observed_state),
                 observed_generation: observed.map(|c| c.observed_generation).unwrap_or(0),
+                created_at: observed.map(|c| c.created_at).unwrap_or_else(now_unix),
             };
             map.insert(id.0.clone(), record);
             Ok(generation)

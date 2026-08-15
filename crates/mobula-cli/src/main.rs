@@ -46,6 +46,20 @@ enum Command {
         /// (local dev only; security issue #2).
         #[arg(long)]
         allow_insecure_transport: bool,
+        /// Enable the cluster lifecycle controller: reconcile RayClusters
+        /// in this Kubernetes namespace via KubeRay. Requires cluster
+        /// access; mounts the /api/v1/clusters routes and runs the resync
+        /// loop (Phase 3, ADR-0006).
+        #[arg(long)]
+        kuberay_namespace: Option<String>,
+        /// SQLite database for desired cluster state (used with
+        /// --kuberay-namespace). Defaults to in-memory (state lost on
+        /// restart) if unset.
+        #[arg(long)]
+        db: Option<std::path::PathBuf>,
+        /// Reconcile resync interval, seconds (with --kuberay-namespace).
+        #[arg(long, default_value = "30")]
+        reconcile_interval_secs: u64,
     },
     /// Sign in via the OIDC device-code flow and store the token.
     Login {
@@ -95,6 +109,9 @@ async fn main() -> std::io::Result<()> {
             audit_log: _,
             dev_allow_unauthenticated,
             allow_insecure_transport,
+            kuberay_namespace,
+            db,
+            reconcile_interval_secs,
         } => {
             let validator = match auth_config {
                 Some(path) => {
@@ -125,6 +142,54 @@ async fn main() -> std::io::Result<()> {
                 tracing::info!(id = %c.id, hostname = %c.hostname, "cluster registered");
             }
             tracing::info!(clusters = registry.clusters.len(), "registry loaded");
+
+            // Lifecycle controller: when a KubeRay namespace is configured,
+            // stand up the desired-state store + KubeRay provisioner, spawn
+            // the resync loop, and mount the cluster routes on that store
+            // (Phase 3, ADR-0006). Without it, serve is gateway-only.
+            let store: Option<std::sync::Arc<dyn mobula_controller::Store>> =
+                match &kuberay_namespace {
+                    Some(ns) => {
+                        // Concrete Arc for the reconciler (it is generic over
+                        // the store type); a clone coerces to Arc<dyn Store>
+                        // for the API routes.
+                        let concrete = std::sync::Arc::new(match &db {
+                            Some(path) => mobula_controller::SqliteStore::connect(&format!(
+                                "sqlite://{}?mode=rwc",
+                                path.display()
+                            ))
+                            .await
+                            .map_err(|e| std::io::Error::other(e.to_string()))?,
+                            None => {
+                                tracing::warn!(
+                                    "no --db: cluster state is in-memory and lost on restart"
+                                );
+                                mobula_controller::SqliteStore::in_memory()
+                                    .await
+                                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                            }
+                        });
+                        let provisioner = std::sync::Arc::new(
+                            mobula_provision::KubeRayProvisioner::connect(ns.clone(), false)
+                                .await
+                                .map_err(|e| std::io::Error::other(e.to_string()))?,
+                        );
+                        let reconciler =
+                            mobula_controller::Reconciler::new(concrete.clone(), provisioner);
+                        let interval = std::time::Duration::from_secs(reconcile_interval_secs);
+                        tokio::spawn(async move {
+                            reconciler
+                                .run(interval, async {
+                                    let _ = tokio::signal::ctrl_c().await;
+                                })
+                                .await;
+                        });
+                        tracing::info!(namespace = %ns, "cluster lifecycle controller enabled");
+                        Some(concrete)
+                    }
+                    None => None,
+                };
+
             // Fail-closed invariants (non-loopback needs auth, registry
             // validation) are enforced inside serve() so they can't be
             // bypassed by library embedders (#36).
@@ -135,6 +200,7 @@ async fn main() -> std::io::Result<()> {
                     validator,
                     allow_unauthenticated: dev_allow_unauthenticated,
                     allow_insecure_transport,
+                    store,
                 },
             )
             .await
