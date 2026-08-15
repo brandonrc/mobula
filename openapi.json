@@ -265,6 +265,22 @@
             "type": "string",
             "description": "\"running\" | \"terminated\" — the operator's intent."
           },
+          "est_max_hourly": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Estimated $/hr at max (fully scaled) size."
+          },
+          "est_min_hourly": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Estimated $/hr at min size, if a price sheet is configured."
+          },
           "generation": {
             "type": "integer",
             "format": "int64",

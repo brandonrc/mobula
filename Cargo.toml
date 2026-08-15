@@ -4,6 +4,7 @@ members = [
     "crates/mobula-core",
     "crates/mobula-provision",
     "crates/mobula-controller",
+    "crates/mobula-policy",
     "crates/mobula-auth",
     "crates/mobula-api",
     "crates/mobula-proxy",
@@ -21,6 +22,7 @@ rust-version = "1.85"
 mobula-core = { path = "crates/mobula-core" }
 mobula-provision = { path = "crates/mobula-provision" }
 mobula-controller = { path = "crates/mobula-controller" }
+mobula-policy = { path = "crates/mobula-policy" }
 mobula-api = { path = "crates/mobula-api" }
 mobula-auth = { path = "crates/mobula-auth" }
 mobula-proxy = { path = "crates/mobula-proxy" }

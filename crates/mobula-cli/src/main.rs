@@ -201,6 +201,7 @@ async fn main() -> std::io::Result<()> {
                     allow_unauthenticated: dev_allow_unauthenticated,
                     allow_insecure_transport,
                     store,
+                    policy: Default::default(),
                 },
             )
             .await

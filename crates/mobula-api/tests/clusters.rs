@@ -3,7 +3,7 @@
 //! vice-versa on the job surface.
 
 mod common;
-use common::{authed_app_with_store, get, idp_token, post_json, spawn_idp};
+use common::{authed_app_with_policy, authed_app_with_store, get, idp_token, post_json, spawn_idp};
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -27,6 +27,75 @@ fn create_body(id: &str) -> serde_json::Value {
             "ttl_seconds": null
         }
     })
+}
+
+fn create_body_sized(id: &str, cpu: &str, replicas: u32) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "spec": {
+            "name": id, "project": "demo", "ray_version": "2.57.0",
+            "image": "rayproject/ray:2.57.0", "head_cpu": "1", "head_memory": "2Gi",
+            "worker_groups": [{
+                "name": "w", "cpu": cpu, "memory": "1Gi", "gpu": null,
+                "min_replicas": replicas, "max_replicas": replicas, "replicas": replicas
+            }],
+            "ttl_seconds": null
+        }
+    })
+}
+
+#[tokio::test]
+async fn quota_admission_rejects_over_limit_with_409() {
+    use mobula_api::clusters::PolicyConfig;
+    use mobula_policy::ResourceVector;
+
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let mut quotas = std::collections::HashMap::new();
+    // demo project capped at 5 CPU.
+    quotas.insert(
+        "demo".to_string(),
+        ResourceVector {
+            cpu: 5.0,
+            gpu: 0.0,
+            mem_gib: 100.0,
+        },
+    );
+    let policy = PolicyConfig {
+        prices: None,
+        quotas,
+    };
+    let app = authed_app_with_policy(&idp, store, policy).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    // First cluster: head 1 + 3×1cpu workers = 4 CPU → fits under 5.
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_sized("a", "1", 3),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // Second cluster would add head 1 + 3 = 4 → 4+4=8 > 5 → 409.
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_sized("b", "1", 3),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "over-quota create must 409"
+    );
 }
 
 #[tokio::test]

@@ -131,7 +131,7 @@ pub fn build_router() -> Router {
 ///    hostname can't be shadowed by a control-plane path,
 /// 3. routes + fallback.
 pub fn build_app(registry: ClusterRegistry, validator: Option<Arc<Validator>>) -> Router {
-    build_app_full(registry, validator, None)
+    build_app_full(registry, validator, None, Default::default())
 }
 
 /// Build the full app. When a `store` is provided, the cluster lifecycle
@@ -145,6 +145,7 @@ pub fn build_app_full(
     registry: ClusterRegistry,
     validator: Option<Arc<Validator>>,
     store: Option<Arc<dyn mobula_controller::Store>>,
+    policy: clusters::PolicyConfig,
 ) -> Router {
     let registry = Arc::new(registry);
     let gw = gateway::GatewayState::new(registry.clone());
@@ -162,7 +163,7 @@ pub fn build_app_full(
         .route("/api/v1/authz/check", any(auth_layer::authz_check))
         .with_state(auth.clone());
     if let Some(store) = store {
-        app = app.merge(clusters::router(store));
+        app = app.merge(clusters::router(store, Arc::new(policy)));
     }
     app
         // Fallback is registered before the layers so gateway dispatch
@@ -193,6 +194,9 @@ pub struct ServeOptions {
     /// Desired-state store; when present, the cluster lifecycle routes
     /// (`/api/v1/clusters`) are mounted. The caller owns the reconcile loop.
     pub store: Option<Arc<dyn mobula_controller::Store>>,
+    /// Cost/quota governance for the cluster routes (Phase 4). Default =
+    /// no cost shown, no quota enforced.
+    pub policy: clusters::PolicyConfig,
 }
 
 /// Serve the API until ctrl-c.
@@ -228,7 +232,7 @@ pub async fn serve_with_shutdown(
     tracing::info!(%addr, "mobula-api listening");
     axum::serve(
         listener,
-        build_app_full(opts.registry, opts.validator, opts.store),
+        build_app_full(opts.registry, opts.validator, opts.store, opts.policy),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -266,6 +270,7 @@ mod tests {
                 allow_unauthenticated: true,
                 allow_insecure_transport: true,
                 store: None,
+                policy: Default::default(),
             },
             async {
                 let _ = rx.await;

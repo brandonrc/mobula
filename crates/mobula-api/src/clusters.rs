@@ -19,11 +19,24 @@ use mobula_core::{ClusterId, ClusterSpec};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use mobula_policy::{admit, cluster_demand, PriceSheet, ResourceVector};
+use std::collections::HashMap;
+
 use crate::auth_layer::authorize;
+
+/// Governance config for the cluster API (Phase 4): an optional price
+/// sheet for cost estimates, and per-project quota limits for admission.
+/// Empty = no cost shown, no quota enforced (unlimited).
+#[derive(Clone, Default)]
+pub struct PolicyConfig {
+    pub prices: Option<PriceSheet>,
+    pub quotas: HashMap<String, ResourceVector>,
+}
 
 #[derive(Clone)]
 pub struct ClusterApiState {
     pub store: Arc<dyn Store>,
+    pub policy: Arc<PolicyConfig>,
 }
 
 /// Request body for creating/updating a managed cluster.
@@ -48,10 +61,15 @@ pub struct ClusterView {
     pub observed_generation: u64,
     pub project: String,
     pub ray_version: String,
+    /// Estimated $/hr at min size, if a price sheet is configured.
+    pub est_min_hourly: Option<f64>,
+    /// Estimated $/hr at max (fully scaled) size.
+    pub est_max_hourly: Option<f64>,
 }
 
 impl ClusterView {
-    fn from_stored(c: mobula_controller::StoredCluster) -> Self {
+    fn from_stored(c: mobula_controller::StoredCluster, prices: Option<&PriceSheet>) -> Self {
+        let cost = prices.and_then(|p| p.estimate(&c.spec).ok());
         Self {
             id: c.id.to_string(),
             generation: c.generation,
@@ -66,6 +84,8 @@ impl ClusterView {
             observed_generation: c.observed_generation,
             project: c.spec.project.clone(),
             ray_version: c.spec.ray_version.clone(),
+            est_min_hourly: cost.map(|c| c.min_hourly),
+            est_max_hourly: cost.map(|c| c.max_hourly),
         }
     }
 }
@@ -95,7 +115,11 @@ async fn list_clusters(
     }
     match st.store.list().await {
         Ok(clusters) => {
-            let views: Vec<_> = clusters.into_iter().map(ClusterView::from_stored).collect();
+            let prices = st.policy.prices.as_ref();
+            let views: Vec<_> = clusters
+                .into_iter()
+                .map(|c| ClusterView::from_stored(c, prices))
+                .collect();
             Json(views).into_response()
         }
         Err(e) => store_err(e),
@@ -118,7 +142,7 @@ async fn get_cluster(
         return deny;
     }
     match st.store.get(&ClusterId(id)).await {
-        Ok(Some(c)) => Json(ClusterView::from_stored(c)).into_response(),
+        Ok(Some(c)) => Json(ClusterView::from_stored(c, st.policy.prices.as_ref())).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such cluster").into_response(),
         Err(e) => store_err(e),
     }
@@ -140,6 +164,41 @@ async fn create_cluster(
         return deny;
     }
     let id = ClusterId(body.id);
+
+    // Quota admission (Borg: quota is admission control). Only enforced for
+    // projects with a configured limit; unconfigured projects are
+    // unlimited in v0. Checked against max-demand of the project's other
+    // live clusters plus this request.
+    let project = body.spec.project.clone();
+    if let Some(limit) = st.policy.quotas.get(&project).copied() {
+        let requested = match cluster_demand(&body.spec) {
+            Ok((_, max)) => max,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("invalid spec: {e}")).into_response()
+            }
+        };
+        let in_use = match st.store.list().await {
+            Ok(clusters) => clusters
+                .iter()
+                .filter(|c| {
+                    c.spec.project == project && c.id != id && c.desired == DesiredState::Running
+                })
+                .fold(ResourceVector::default(), |acc, c| {
+                    acc + cluster_demand(&c.spec).map(|(_, m)| m).unwrap_or_default()
+                }),
+            Err(e) => return store_err(e),
+        };
+        if let Err(exceeded) = admit(&project, limit, in_use, requested) {
+            tracing::info!(
+                target: "mobula::audit",
+                decision = "deny", reason = "quota_exceeded",
+                subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
+                cluster = %id, project = %project, "cluster create denied"
+            );
+            return (StatusCode::CONFLICT, exceeded.to_string()).into_response();
+        }
+    }
+
     match st.store.upsert_desired(&id, body.spec).await {
         Ok(generation) => {
             tracing::info!(
@@ -191,12 +250,12 @@ async fn delete_cluster(
     }
 }
 
-pub fn router(store: Arc<dyn Store>) -> Router {
+pub fn router(store: Arc<dyn Store>, policy: Arc<PolicyConfig>) -> Router {
     Router::new()
         .route("/api/v1/clusters", get(list_clusters).post(create_cluster))
         .route(
             "/api/v1/clusters/{id}",
             get(get_cluster).delete(delete_cluster),
         )
-        .with_state(ClusterApiState { store })
+        .with_state(ClusterApiState { store, policy })
 }

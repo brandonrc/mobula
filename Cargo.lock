@@ -1304,6 +1304,7 @@ dependencies = [
  "mobula-auth",
  "mobula-controller",
  "mobula-core",
+ "mobula-policy",
  "rand 0.8.7",
  "reqwest",
  "rsa",
@@ -1375,6 +1376,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "utoipa",
+]
+
+[[package]]
+name = "mobula-policy"
+version = "0.0.1"
+dependencies = [
+ "mobula-core",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

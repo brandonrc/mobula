@@ -136,6 +136,21 @@ pub async fn authed_app_with_store(idp: &Idp, store: Arc<dyn Store>) -> Router {
         ClusterRegistry::default(),
         Some(validator_for(idp).await),
         Some(store),
+        Default::default(),
+    )
+}
+
+/// Same, but with a governance policy (quotas/prices) for Phase 4 tests.
+pub async fn authed_app_with_policy(
+    idp: &Idp,
+    store: Arc<dyn Store>,
+    policy: mobula_api::clusters::PolicyConfig,
+) -> Router {
+    mobula_api::build_app_full(
+        ClusterRegistry::default(),
+        Some(validator_for(idp).await),
+        Some(store),
+        policy,
     )
 }
 

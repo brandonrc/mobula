@@ -177,6 +177,20 @@ that converges a cluster with no manual reconcile then stops on shutdown.
 `Store` (same SQL), suspend/resume (KubeRay `.spec.suspend`).
 
 ### Phase 4 — Dynamic allocation + services
+
+> Slice 1 (2026-08-15): **governance — cost + quota**. New `mobula-policy`
+> crate (pure, tested): k8s quantity parsing (CPU/mem/GPU), multi-resource
+> `cluster_demand` (min/max), `PriceSheet` $/hr estimation, and `admit()`
+> quota admission (Borg: quota is admission control, checked against
+> max-demand). Wired into the cluster API: `create_cluster` enforces
+> per-project quota (409 CONFLICT when the project's live max-demand + the
+> request exceeds its limit; unconfigured projects unlimited in v0), and
+> `ClusterView` carries `est_min_hourly`/`est_max_hourly`. `PolicyConfig`
+> (prices + quotas) threads through `build_app_full`/`ServeOptions`. Note:
+> per ADR-0007 this is governance/accounting, NOT a live autoscaler (Ray
+> owns scaling; Mobula shapes bounds and admits). 93 tests, 92.8%. Next:
+> Ray Serve service management; spot-strategy annotations; the Autopilot
+> asymmetric cost function as the scale-policy baseline.
 - Autoscaler policy engine (spot strategy, fair share, cost model), ephemeral
   per-job clusters, Ray Serve service management (canary/rollback).
 
