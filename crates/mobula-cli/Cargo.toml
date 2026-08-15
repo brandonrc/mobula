@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 mobula-api.workspace = true
 mobula-core.workspace = true
+mobula-auth.workspace = true
+reqwest.workspace = true
 clap.workspace = true
 tokio.workspace = true
 toml.workspace = true

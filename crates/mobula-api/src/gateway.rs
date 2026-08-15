@@ -33,9 +33,9 @@ pub struct GatewayState {
 }
 
 impl GatewayState {
-    pub fn new(registry: ClusterRegistry) -> Self {
+    pub fn new(registry: Arc<ClusterRegistry>) -> Self {
         Self {
-            registry: Arc::new(registry),
+            registry,
             // Reverse-proxy client posture (security issues #3/#5):
             // never follow redirects southbound (SSRF amplifier — 3xx
             // passes through to the caller untouched), and bound how long

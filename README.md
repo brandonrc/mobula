@@ -43,6 +43,31 @@ cargo run -p mobula-cli -- serve --registry clusters.toml
 ray job submit --address http://demo.ray.example.com:8484 -- python -c "print('hi')"
 ```
 
+With identity (any OIDC IdP — Keycloak, Okta, Dex, …):
+
+```toml
+# auth.toml
+issuer = "https://keycloak.example.com/realms/nebari"
+audience = "mobula"
+groups_claim = "groups"
+[roles]
+admin = ["/platform-admins"]
+developer = ["/ml-eng"]
+viewer = ["*"]          # any authenticated user can read
+```
+
+```bash
+mobula serve --registry clusters.toml --auth-config auth.toml --bind 0.0.0.0:8484
+# clients attach their JWT; it never reaches the cluster (swapped for the
+# cluster's Ray token at the gateway):
+export RAY_JOB_HEADERS='{"Authorization": "Bearer <user-jwt>"}'
+ray job submit --address http://demo.ray.example.com:8484 -- python train.py
+```
+
+Without `--auth-config`, non-loopback binds require
+`--dev-allow-unauthenticated` (the gateway would otherwise expose
+registered clusters to anyone who can reach the port).
+
 Workspace layout: `mobula-core` (domain model, no cloud/K8s deps) ·
 `mobula-provision` (Provisioner trait; KubeRay backend first) · `mobula-api`
 (HTTP surface + future Jobs gateway) · `mobula-proxy` (standalone-mode

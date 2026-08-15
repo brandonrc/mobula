@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use mobula_auth::{AuthConfig, Validator};
 use mobula_core::ClusterRegistry;
 
 #[derive(Parser)]
@@ -23,6 +24,11 @@ enum Command {
         /// registry; the lifecycle controller replaces this in Phase 3).
         #[arg(long)]
         registry: Option<std::path::PathBuf>,
+        /// TOML auth config (OIDC issuer, audience, role mappings).
+        /// When set, every request needs a valid Bearer JWT and
+        /// non-loopback binds are permitted (Phase 2, ADR-0003).
+        #[arg(long)]
+        auth_config: Option<std::path::PathBuf>,
         /// DANGER: serve without authentication on a non-loopback
         /// address. Until Phase 2 identity lands, anyone who can reach
         /// the port can run code on every registered cluster. Refused by
@@ -48,10 +54,28 @@ async fn main() -> std::io::Result<()> {
         Command::Serve {
             bind,
             registry,
+            auth_config,
             dev_allow_unauthenticated,
             allow_insecure_transport,
         } => {
-            if !bind.ip().is_loopback() && !dev_allow_unauthenticated {
+            let validator = match auth_config {
+                Some(path) => {
+                    let raw = std::fs::read_to_string(&path)?;
+                    let cfg: AuthConfig = toml::from_str(&raw).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid auth config {}: {e}", path.display()),
+                        )
+                    })?;
+                    tracing::info!(issuer = %cfg.issuer, audience = %cfg.audience, "OIDC discovery");
+                    let v = Validator::discover(cfg, reqwest::Client::new())
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    Some(std::sync::Arc::new(v))
+                }
+                None => None,
+            };
+            if validator.is_none() && !bind.ip().is_loopback() && !dev_allow_unauthenticated {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
@@ -73,7 +97,7 @@ async fn main() -> std::io::Result<()> {
                 tracing::info!(id = %c.id, hostname = %c.hostname, "cluster registered");
             }
             tracing::info!(clusters = registry.clusters.len(), "registry loaded");
-            mobula_api::serve(bind, registry).await
+            mobula_api::serve(bind, registry, validator).await
         }
     }
 }

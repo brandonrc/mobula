@@ -63,14 +63,17 @@ async fn spawn_mock_ray_head() -> (SocketAddr, SeenLog) {
 }
 
 fn app_with_cluster(addr: SocketAddr, token: Option<&str>) -> Router {
-    mobula_api::build_app(ClusterRegistry {
-        clusters: vec![ClusterEndpoint {
-            id: ClusterId("demo".into()),
-            hostname: "demo.ray.test".into(),
-            api_base_url: format!("http://{addr}"),
-            auth_token: token.map(String::from),
-        }],
-    })
+    mobula_api::build_app(
+        ClusterRegistry {
+            clusters: vec![ClusterEndpoint {
+                id: ClusterId("demo".into()),
+                hostname: "demo.ray.test".into(),
+                api_base_url: format!("http://{addr}"),
+                auth_token: token.map(String::from),
+            }],
+        },
+        None,
+    )
 }
 
 #[tokio::test]
@@ -261,14 +264,17 @@ mod websocket {
     /// `oneshot`. Registry hostname "127.0.0.1" matches the loopback Host
     /// header the ws client sends.
     async fn spawn_gateway(head: SocketAddr, token: Option<&str>) -> SocketAddr {
-        let app = mobula_api::build_app(ClusterRegistry {
-            clusters: vec![ClusterEndpoint {
-                id: ClusterId("demo".into()),
-                hostname: "127.0.0.1".into(),
-                api_base_url: format!("http://{head}"),
-                auth_token: token.map(String::from),
-            }],
-        });
+        let app = mobula_api::build_app(
+            ClusterRegistry {
+                clusters: vec![ClusterEndpoint {
+                    id: ClusterId("demo".into()),
+                    hostname: "127.0.0.1".into(),
+                    api_base_url: format!("http://{head}"),
+                    auth_token: token.map(String::from),
+                }],
+            },
+            None,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

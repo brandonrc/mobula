@@ -4,9 +4,13 @@
 //! admin paths. The Ray Jobs gateway (Phase 1) mounts here as well, one base
 //! path per cluster.
 
+pub mod auth_layer;
 pub mod gateway;
 
-use axum::{routing::get, Json, Router};
+use std::sync::Arc;
+
+use axum::{routing::any, routing::get, Json, Router};
+use mobula_auth::Validator;
 use mobula_core::ClusterRegistry;
 use serde::Serialize;
 use utoipa::{OpenApi, ToSchema};
@@ -66,34 +70,53 @@ async fn version() -> Json<VersionInfo> {
     })
 }
 
-/// Build the control-plane router with no gateway clusters registered.
+/// Build the control-plane router with no gateway clusters and no authn
+/// (dev/test convenience).
 pub fn build_router() -> Router {
-    build_app(ClusterRegistry::default())
+    build_app(ClusterRegistry::default(), None)
 }
 
 /// Build the full app: control-plane routes plus the federating job
-/// gateway. Host-based dispatch runs before route matching, so requests
-/// addressed to a registered cluster hostname are proxied even if their
-/// path collides with a control-plane route.
-pub fn build_app(registry: ClusterRegistry) -> Router {
-    let gw = gateway::GatewayState::new(registry);
+/// gateway. Layer order matters and is enforced here:
+/// 1. auth middleware (outermost) — deny-by-default when a validator is
+///    configured; cluster hosts are never public (ADR-0003),
+/// 2. gateway host dispatch — runs before route matching so a cluster
+///    hostname can't be shadowed by a control-plane path,
+/// 3. routes + fallback.
+pub fn build_app(registry: ClusterRegistry, validator: Option<Arc<Validator>>) -> Router {
+    let registry = Arc::new(registry);
+    let gw = gateway::GatewayState::new(registry.clone());
+    let auth = auth_layer::AuthState {
+        validator,
+        registry,
+    };
     Router::new()
         .merge(SwaggerUi::new("/docs").url("/api/v1/openapi.json", ApiDoc::openapi()))
         .route("/healthz", get(healthz))
         .route("/api/v1/version", get(version))
-        // Fallback is registered before the layer so gateway dispatch also
-        // wraps unmatched paths — cluster traffic like /api/jobs/ has no
-        // control-plane route and must still hit the middleware.
+        .route("/api/v1/authz/check", any(auth_layer::authz_check))
+        // Fallback is registered before the layers so gateway dispatch
+        // also wraps unmatched paths — cluster traffic like /api/jobs/
+        // has no control-plane route and must still hit the middleware.
         .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "not found") })
         .layer(axum::middleware::from_fn_with_state(
             gw,
             gateway::host_gateway,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            auth_layer::require_auth,
+        ))
+        .with_state(auth)
 }
 
 /// Serve the API until ctrl-c.
-pub async fn serve(addr: std::net::SocketAddr, registry: ClusterRegistry) -> std::io::Result<()> {
-    serve_with_shutdown(addr, registry, async {
+pub async fn serve(
+    addr: std::net::SocketAddr,
+    registry: ClusterRegistry,
+    validator: Option<Arc<Validator>>,
+) -> std::io::Result<()> {
+    serve_with_shutdown(addr, registry, validator, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
@@ -104,11 +127,12 @@ pub async fn serve(addr: std::net::SocketAddr, registry: ClusterRegistry) -> std
 pub async fn serve_with_shutdown(
     addr: std::net::SocketAddr,
     registry: ClusterRegistry,
+    validator: Option<Arc<Validator>>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "mobula-api listening");
-    axum::serve(listener, build_app(registry))
+    axum::serve(listener, build_app(registry, validator))
         .with_graceful_shutdown(shutdown)
         .await
 }
@@ -140,6 +164,7 @@ mod tests {
         let server = tokio::spawn(super::serve_with_shutdown(
             addr,
             ClusterRegistry::default(),
+            None,
             async {
                 let _ = rx.await;
             },

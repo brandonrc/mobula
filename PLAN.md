@@ -74,6 +74,18 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 - P1 ships unauthenticated — multi-tenant deployment is gated on Phase 2.
 
 ### Phase 2 — Identity + RBAC
+
+> Progress 2026-08-15: core landed — `mobula-auth` crate (OIDC discovery →
+> JWKS with rotation-aware refresh → RS256 JWT validation, iss/aud/exp),
+> deny-by-default middleware on control plane AND gateway (cluster hosts
+> are never public), three-role matrix (GET/WS→Viewer, mutating→Developer),
+> Envoy `ext_authz` check endpoint at /api/v1/authz/check, `serve
+> --auth-config` (fail-fast discovery; enables non-loopback binds without
+> the dev flag). Six e2e tests against a mock OIDC issuer with real
+> RSA-signed tokens: 401 (missing/garbage/expired/wrong-aud), 403
+> (viewer-write, unmapped groups), 200 (developer submit), public-path
+> narrowing, ext_authz matrix. Outstanding: device-code flow for CLI,
+> service-account tokens, durable audit records, FIPS crypto provider.
 - Mobula owns JWT validation, device-code flow for CLI, and service-account
   tokens **in both modes** — NebariApp/SecurityPolicy auth is browser-only
   (redirect OIDC + cookies) and would break bearer clients. Nebari mode
