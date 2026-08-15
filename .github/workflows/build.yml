@@ -1,0 +1,87 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/mobula
+
+jobs:
+  # Release binaries build cleanly on every platform we claim to support.
+  binary:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: mobula-linux-amd64
+          - os: ubuntu-24.04-arm
+            artifact: mobula-linux-arm64
+          - os: macos-latest
+            artifact: mobula-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Release build
+        run: cargo build --release -p mobula-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/mobula
+
+  # Native per-arch image builds (no QEMU), stitched into one multi-arch
+  # manifest below. Push-only: PRs get build verification from `binary`.
+  image:
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push arch image
+        run: |
+          docker build -t "$IMAGE:${GITHUB_SHA}-${{ matrix.arch }}" .
+          docker push "$IMAGE:${GITHUB_SHA}-${{ matrix.arch }}"
+
+  manifest:
+    if: github.event_name == 'push'
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create multi-arch manifest
+        run: |
+          TAGS="-t $IMAGE:sha-${GITHUB_SHA::7}"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            TAGS="$TAGS -t $IMAGE:latest"
+          fi
+          case "$GITHUB_REF" in
+            refs/tags/v*) TAGS="$TAGS -t $IMAGE:${GITHUB_REF_NAME#v}" ;;
+          esac
+          docker buildx imagetools create $TAGS \
+            "$IMAGE:${GITHUB_SHA}-amd64" \
+            "$IMAGE:${GITHUB_SHA}-arm64"
+          docker buildx imagetools inspect "$IMAGE:sha-${GITHUB_SHA::7}"

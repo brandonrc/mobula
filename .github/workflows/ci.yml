@@ -44,3 +44,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pre-commit/action@v3.0.1
+        env:
+          # fmt/clippy run as dedicated jobs above; here we want the
+          # hygiene + secret-scanning hooks.
+          SKIP: cargo-fmt,cargo-clippy
