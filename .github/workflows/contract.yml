@@ -59,7 +59,7 @@ jobs:
           api_base_url = "http://127.0.0.1:8265"
           EOF
           cargo build -p mobula-cli
-          nohup ./target/debug/mobula serve --bind 0.0.0.0:8484 --registry clusters.toml \
+          nohup ./target/debug/mobula serve --bind 0.0.0.0:8484 --registry clusters.toml --dev-allow-unauthenticated \
             > mobula.log 2>&1 &
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8484/healthz && break || sleep 1

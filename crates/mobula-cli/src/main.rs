@@ -23,6 +23,16 @@ enum Command {
         /// registry; the lifecycle controller replaces this in Phase 3).
         #[arg(long)]
         registry: Option<std::path::PathBuf>,
+        /// DANGER: serve without authentication on a non-loopback
+        /// address. Until Phase 2 identity lands, anyone who can reach
+        /// the port can run code on every registered cluster. Refused by
+        /// default (security issue #1).
+        #[arg(long)]
+        dev_allow_unauthenticated: bool,
+        /// DANGER: permit auth tokens over cleartext http:// southbound
+        /// (local dev only; security issue #2).
+        #[arg(long)]
+        allow_insecure_transport: bool,
     },
 }
 
@@ -35,11 +45,33 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Serve { bind, registry } => {
+        Command::Serve {
+            bind,
+            registry,
+            dev_allow_unauthenticated,
+            allow_insecure_transport,
+        } => {
+            if !bind.ip().is_loopback() && !dev_allow_unauthenticated {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to bind {bind}: no authentication is implemented yet \
+                         (Phase 2), so a non-loopback bind exposes every registered \
+                         cluster to unauthenticated code execution. Pass \
+                         --dev-allow-unauthenticated only on trusted networks."
+                    ),
+                ));
+            }
             let registry = match registry {
                 Some(path) => load_registry(&path)?,
                 None => ClusterRegistry::default(),
             };
+            registry
+                .validate(allow_insecure_transport)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            for c in &registry.clusters {
+                tracing::info!(id = %c.id, hostname = %c.hostname, "cluster registered");
+            }
             tracing::info!(clusters = registry.clusters.len(), "registry loaded");
             mobula_api::serve(bind, registry).await
         }

@@ -196,6 +196,24 @@ Full reading list: [docs/READING.md](docs/READING.md).
 | L7 | Cluster-as-only-grouping repeats Borg's §8.1 regret (job-name topology encoding); add labels/selectors early. | **Accepted.** Labels + label queries on clusters/jobs pulled into the v0 domain model. |
 | L8 | Autoscaling cost function must be explicit and asymmetric (Autopilot): under-provision ≫ waste, churn priced, fast-up/slow-down with deadband; warm pools via balloon pods ≥ priority −10. | **Accepted.** Recorded as the Phase 4 policy-engine spec baseline. |
 
+### Review 5 — red-team security review (issues #1–#8, triaged 2026-08-15)
+
+Converges with Review 4 on one redesign theme: **fail closed, treat config
+as security input, and make auditability a first-class output.** The
+registry is not "just config" — it is the credential-routing table, and in
+Phase 3 it becomes a dynamically written one (SSRF surface).
+
+| Issue | Disposition |
+|---|---|
+| #1 unauthenticated gateway = RCE | **Gated + guarded now.** `serve` refuses non-loopback binds without `--dev-allow-unauthenticated`; Phase 2 authn is the release gate for any networked deployment; negative tests (401/403) land with it. Issue stays open as the P2 gate tracker. |
+| #2 no southbound TLS / unvalidated api_base_url | **Fixed (partial).** Registry validation at startup: scheme allowlist, no userinfo/fragment, token+http refused without `--allow-insecure-transport`. Remaining (open): CA bundle knob, mTLS, link-local denylist for the Phase 3 dynamic registry. |
+| #3 DoS: 256MiB buffering, no timeouts | **Fixed (partial).** Southbound connect (10s) + read (120s) timeouts, redirects off. Remaining (open): streaming upload passthrough, concurrency caps, ws idle/message limits — scheduled with the Envoy `ext_authz` split (rate limiting is Envoy's in Nebari mode; standalone needs tower limits). |
+| #4 token leaks via Debug; file perms | **Fixed.** Manual `Debug` redacts `auth_token` (tested); registry validation fails fast. Remaining (open): perms check + `auth_token_env`/SecretStore indirection — tracked for the K8s-Secret story in the pack. |
+| #5 proxy protocol: redirects, Connection-nominated smuggling, URL-bearing logs | **Fixed.** `redirect::Policy::none()` (3xx passes through raw — tested against a 169.254 Location), Connection-nominated names stripped both directions (smuggling test), upstream errors logged via `without_url()`. |
+| #6 supply chain: unpinned images/actions, no SBOM/signing | **Partially fixed.** `packages: write` scoped to image/manifest jobs only; workflow default is `contents: read`. Open: digest-pinned bases, SHA-pinned actions (Dependabot now enabled will surface bumps), rustup checksum, SBOM + cosign + provenance — grouped as the "release engineering" work item before any v0 tag. |
+| #7 repo governance | **Fixed.** Branch protection on main (required checks test/coverage/deny/hygiene, no force pushes), SECURITY.md + private vulnerability reporting enabled, Dependabot alerts + security fixes enabled, dependabot.yml (cargo/actions/docker), CODEOWNERS with security-sensitive paths. |
+| #8 no audit log; registry not validated | **Fixed (partial).** Structured `mobula::audit` event per proxied request (cluster, method, path, status, latency); duplicate hostname/id + URL validation fails startup; (id, hostname) pairs logged at boot. Remaining (open): durable Postgres audit records with caller identity — lands with Phase 2. |
+
 ## v0 cut line (one quarter, 1–3 people)
 
 **In:** KubeRay backend only; single binary; SQLite/Postgres, no HA. Cluster

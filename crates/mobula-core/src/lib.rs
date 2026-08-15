@@ -9,4 +9,4 @@ pub mod cluster;
 pub mod registry;
 
 pub use cluster::{ClusterId, ClusterSpec, ClusterState, TransitionError, WorkerGroup};
-pub use registry::{ClusterEndpoint, ClusterRegistry};
+pub use registry::{ClusterEndpoint, ClusterRegistry, RegistryError};

@@ -1,0 +1,7 @@
+* @brandonrc
+
+# Security-sensitive paths — changes here need maintainer review.
+/crates/mobula-api/src/gateway.rs @brandonrc
+/crates/mobula-core/src/registry.rs @brandonrc
+/Dockerfile @brandonrc
+/.github/workflows/ @brandonrc

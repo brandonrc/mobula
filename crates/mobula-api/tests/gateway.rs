@@ -359,3 +359,79 @@ async fn malformed_cluster_token_is_500_not_leak() {
         "request must not reach the cluster"
     );
 }
+
+#[tokio::test]
+async fn connection_nominated_headers_are_not_smuggled() {
+    // RFC 9110 §7.6.1: headers named in Connection are hop-by-hop. A
+    // static denylist alone lets `Connection: x-secret` smuggle headers.
+    let log: SeenLog = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = log.clone();
+    let app = Router::new().fallback(move |req: AxumRequest| {
+        let log = log_clone.clone();
+        async move {
+            let smuggled = req.headers().get("x-internal-secret").is_some();
+            log.lock().unwrap().push(Seen {
+                method: smuggled.to_string(),
+                path: String::new(),
+                authorization: None,
+                body: Bytes::new(),
+            });
+            "ok"
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let gw = app_with_cluster(addr, None);
+    let res = gw
+        .oneshot(
+            Request::get("/api/jobs/")
+                .header(header::HOST, "demo.ray.test")
+                .header(header::CONNECTION, "x-internal-secret")
+                .header("x-internal-secret", "sensitive")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let seen = log.lock().unwrap();
+    assert_eq!(
+        seen[0].method, "false",
+        "Connection-nominated header must be stripped southbound"
+    );
+}
+
+#[tokio::test]
+async fn southbound_redirects_are_not_followed() {
+    // A 302 from the cluster must pass through raw — following it would
+    // make the gateway an SSRF amplifier.
+    let app = Router::new().fallback(|| async {
+        (
+            StatusCode::FOUND,
+            [(header::LOCATION, "http://169.254.169.254/latest/meta-data/")],
+            "",
+        )
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let gw = app_with_cluster(addr, None);
+    let res = gw
+        .oneshot(
+            Request::get("/api/jobs/")
+                .header(header::HOST, "demo.ray.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FOUND, "3xx must pass through");
+    assert!(res.headers().get(header::LOCATION).is_some());
+}

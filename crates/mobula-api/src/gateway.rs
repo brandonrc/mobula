@@ -36,7 +36,17 @@ impl GatewayState {
     pub fn new(registry: ClusterRegistry) -> Self {
         Self {
             registry: Arc::new(registry),
-            client: reqwest::Client::new(),
+            // Reverse-proxy client posture (security issues #3/#5):
+            // never follow redirects southbound (SSRF amplifier — 3xx
+            // passes through to the caller untouched), and bound how long
+            // a hung head can pin a connection. read_timeout is per read,
+            // so long log streams stay alive as long as bytes flow.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("static client config"),
         }
     }
 }
@@ -71,6 +81,7 @@ async fn proxy(
     cluster: &ClusterEndpoint,
     req: Request,
 ) -> Result<Response, GatewayError> {
+    let started = std::time::Instant::now();
     let (parts, body) = req.into_parts();
 
     let path_and_query = parts
@@ -83,6 +94,8 @@ async fn proxy(
         cluster.api_base_url.trim_end_matches('/'),
         path_and_query
     );
+    let method = parts.method.clone();
+    let path = parts.uri.path().to_string();
 
     let body = axum::body::to_bytes(body, MAX_BODY_BYTES)
         .await
@@ -102,15 +115,31 @@ async fn proxy(
         .body(body)
         .send()
         .await
-        .map_err(|e| GatewayError::Upstream(cluster.id.to_string(), e.to_string()))?;
+        // without_url(): reqwest error strings can embed the full
+        // southbound URL incl. query — keep topology out of logs (#5).
+        .map_err(|e| GatewayError::Upstream(cluster.id.to_string(), e.without_url().to_string()))?;
 
     let status = upstream.status();
+    let nominated = connection_nominated(upstream.headers());
     let mut response_headers = HeaderMap::new();
     for (name, value) in upstream.headers() {
-        if !is_hop_by_hop(name) {
+        if !is_hop_by_hop(name) && !nominated.contains(name.as_str()) {
             response_headers.insert(name.clone(), value.clone());
         }
     }
+
+    // Append-only audit trail (issue #8): every proxied request, one
+    // structured line. Caller identity joins this record when Phase 2
+    // authn lands.
+    tracing::info!(
+        target: "mobula::audit",
+        cluster = %cluster.id,
+        %method,
+        path = %path,
+        status = status.as_u16(),
+        latency_ms = started.elapsed().as_millis() as u64,
+        "gateway request"
+    );
 
     let mut response = Response::builder()
         .status(status)
@@ -120,13 +149,30 @@ async fn proxy(
     Ok(response)
 }
 
-/// Copy client headers southbound, dropping hop-by-hop headers, the
-/// northbound Host, and any inbound Authorization — the caller's identity
-/// must never reach the cluster; only the injected Ray token does.
+/// Headers nominated by the `Connection` header are hop-by-hop per
+/// RFC 9110 §7.6.1 and must not be forwarded — a static denylist alone
+/// leaves a smuggling channel (`Connection: x-secret`) (issue #5).
+fn connection_nominated(headers: &HeaderMap) -> std::collections::HashSet<String> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Copy client headers southbound, dropping hop-by-hop headers (static
+/// set plus Connection-nominated names), the northbound Host, and any
+/// inbound Authorization — the caller's identity must never reach the
+/// cluster; only the injected Ray token does.
 fn southbound_headers(inbound: &HeaderMap) -> HeaderMap {
+    let nominated = connection_nominated(inbound);
     let mut headers = HeaderMap::new();
     for (name, value) in inbound {
         if is_hop_by_hop(name)
+            || nominated.contains(name.as_str())
             || name == header::HOST
             || name == header::AUTHORIZATION
             || name == header::CONTENT_LENGTH
