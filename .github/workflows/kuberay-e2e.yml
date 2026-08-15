@@ -1,0 +1,50 @@
+name: KubeRay E2E
+
+# Provisions a real RayCluster through Mobula's KubeRayProvisioner on a
+# kind cluster with the KubeRay operator installed. Heavy (image pulls),
+# so gated: on demand and weekly, plus when the provisioner changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/mobula-provision/**"
+      - ".github/workflows/kuberay-e2e.yml"
+  schedule:
+    - cron: "37 6 * * 1" # Mondays 06:37 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: mobula-e2e
+
+      - name: Install the KubeRay operator
+        run: |
+          helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+          helm repo update
+          helm install kuberay-operator kuberay/kuberay-operator \
+            --version 1.4.0 --wait --timeout 5m
+          kubectl wait --for=condition=Available deploy/kuberay-operator --timeout=180s
+
+      - name: Provision → observe → terminate through Mobula
+        env:
+          MOBULA_E2E_NAMESPACE: default
+        run: cargo test -p mobula-provision --test kuberay_e2e -- --ignored --nocapture
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          kubectl get rayclusters -o wide || true
+          kubectl get pods -o wide || true
+          kubectl describe rayclusters || true

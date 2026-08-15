@@ -36,7 +36,7 @@ jobs:
       - name: Coverage gate (90% lines, CLI shim excluded)
         run: >
           cargo llvm-cov --workspace
-          --ignore-filename-regex 'mobula-cli/src/main\.rs'
+          --ignore-filename-regex 'mobula-cli/src/main\.rs|mobula-provision/src/kuberay_client\.rs'
           --fail-under-lines 90
 
   deny:

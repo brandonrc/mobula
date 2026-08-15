@@ -6,6 +6,10 @@
 //! (PLAN.md, review finding A4).
 
 pub mod kuberay;
+#[cfg(feature = "kuberay")]
+pub mod kuberay_client;
+#[cfg(feature = "kuberay")]
+pub use kuberay_client::KubeRayProvisioner;
 
 use mobula_core::{ClusterId, ClusterSpec, ClusterState};
 

@@ -138,9 +138,20 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 > the Store with explicit per-route (action, target) checks; DELETE sets
 > desired=Terminated for the reconciler. The gateway proxied surface uses
 > `Target::Job`. Tripwire test: developer denied cluster-create, operator
-> allowed. 76 tests, 91.4%. Next: (3b) KubeRay `Provisioner` backend
-> (kube-rs) + kind e2e; (4) resync loop + TTL reaping + suspend; Postgres
-> `Store` (same SQL).
+> allowed. 76 tests, 91.4%.
+>
+> Slice 3b (2026-08-15): **live KubeRay backend**. 3b-1 = pure
+> spec→RayCluster translation + status→state mapping (5 tests), where the
+> ADR-0007 field-ownership rule lives (autoscaling on ⇒ omit
+> replicas/scaleStrategy; own min/max only). 3b-2 = `KubeRayProvisioner`
+> over kube-rs dynamic API — server-side apply with the `mobula` field
+> manager, idempotent teardown (404=ok), observe→status_to_state, label-
+> scoped list. Gated behind the `kuberay` feature (default-on so CI checks
+> it); the live client is coverage-excluded (e2e-only) and exercised by a
+> new `kuberay-e2e` workflow: kind + KubeRay operator + an `--ignored`
+> integration test doing apply→observe-until-Running→terminate. 79 tests,
+> 92.1%. Next: (4) resync loop wired into `serve` + TTL reaping + suspend;
+> Postgres `Store` (same SQL).
 - Reconciler over KubeRay CRs: declarative cluster specs, state machine,
   suspend/resume, TTL reaping, per-project quotas (Kueue delegation where
   present).
