@@ -9,17 +9,56 @@ pub mod gateway;
 use axum::{routing::get, Json, Router};
 use mobula_core::ClusterRegistry;
 use serde::Serialize;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 
-#[derive(Serialize)]
+/// OpenAPI document, aggregated from `#[utoipa::path]` decorators on the
+/// handlers below. Every new control-plane endpoint MUST carry the
+/// decorator and register here — /docs and /api/v1/openapi.json are the
+/// API contract users see.
+#[derive(OpenApi)]
+#[openapi(
+    paths(healthz, version),
+    components(schemas(VersionInfo)),
+    info(
+        title = "Mobula",
+        description = "FOSS control plane for Ray clusters. Cluster-bound \
+        traffic (the Ray Jobs API) is served by hostname, not documented \
+        here: each registered cluster's hostname exposes Ray's own \
+        /api/jobs/ surface through the federating gateway.",
+        license(name = "Apache-2.0")
+    )
+)]
+struct ApiDoc;
+
+#[derive(Serialize, ToSchema)]
 struct VersionInfo {
+    /// Always "mobula".
+    #[schema(example = "mobula")]
     name: &'static str,
+    /// Control-plane semver.
+    #[schema(example = "0.0.1")]
     version: &'static str,
 }
 
+/// Liveness/readiness probe.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "system",
+    responses((status = 200, description = "Control plane is up", body = str))
+)]
 async fn healthz() -> &'static str {
     "ok"
 }
 
+/// Control-plane identity and version.
+#[utoipa::path(
+    get,
+    path = "/api/v1/version",
+    tag = "system",
+    responses((status = 200, description = "Name and semver", body = VersionInfo))
+)]
 async fn version() -> Json<VersionInfo> {
     Json(VersionInfo {
         name: "mobula",
@@ -39,6 +78,7 @@ pub fn build_router() -> Router {
 pub fn build_app(registry: ClusterRegistry) -> Router {
     let gw = gateway::GatewayState::new(registry);
     Router::new()
+        .merge(SwaggerUi::new("/docs").url("/api/v1/openapi.json", ApiDoc::openapi()))
         .route("/healthz", get(healthz))
         .route("/api/v1/version", get(version))
         // Fallback is registered before the layer so gateway dispatch also
@@ -126,6 +166,36 @@ mod tests {
 
         tx.send(()).unwrap();
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn openapi_document_covers_registered_paths() {
+        let res = build_router()
+            .oneshot(
+                Request::get("/api/v1/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["info"]["title"], "Mobula");
+        assert!(doc["paths"]["/healthz"].is_object());
+        assert!(doc["paths"]["/api/v1/version"].is_object());
+        assert!(doc["components"]["schemas"]["VersionInfo"].is_object());
+    }
+
+    #[tokio::test]
+    async fn swagger_ui_is_served() {
+        let res = build_router()
+            .oneshot(Request::get("/docs/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]
