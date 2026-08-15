@@ -51,9 +51,19 @@ pub async fn host_gateway(State(gw): State<GatewayState>, req: Request, next: Ne
         .cloned();
 
     match cluster {
+        Some(cluster) if is_websocket_upgrade(req.headers()) => {
+            ws::proxy_upgrade(&cluster, req).await
+        }
         Some(cluster) => proxy(&gw, &cluster, req).await.into_response(),
         None => next.run(req).await,
     }
+}
+
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
 async fn proxy(
@@ -142,6 +152,135 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
     )
 }
 
+/// Websocket passthrough — Ray's job log tail (`…/logs/tail`) is a
+/// websocket endpoint proxied by the dashboard head; the gateway bridges
+/// it with the same credential swap as plain HTTP.
+mod ws {
+    use axum::extract::ws::{self as axws, WebSocketUpgrade};
+    use axum::extract::{FromRequestParts, Request};
+    use axum::http::{header, HeaderValue, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use futures::{SinkExt, StreamExt};
+    use mobula_core::ClusterEndpoint;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::protocol::Message as TsMessage;
+
+    pub async fn proxy_upgrade(cluster: &ClusterEndpoint, req: Request) -> Response {
+        let (mut parts, _body) = req.into_parts();
+
+        let path_and_query = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
+            .to_string();
+        let base = cluster.api_base_url.trim_end_matches('/');
+        let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = base.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            base.to_string()
+        };
+        let url = format!("{ws_base}{path_and_query}");
+
+        let mut southbound = match url.into_client_request() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(cluster = %cluster.id, error = %e, "bad upstream ws url");
+                return (StatusCode::BAD_GATEWAY, "bad upstream url").into_response();
+            }
+        };
+        if let Some(token) = &cluster.auth_token {
+            match HeaderValue::from_str(&format!("Bearer {token}")) {
+                Ok(v) => {
+                    southbound.headers_mut().insert(header::AUTHORIZATION, v);
+                }
+                Err(_) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "bad cluster token").into_response()
+                }
+            }
+        }
+
+        // Connect southbound BEFORE accepting the client upgrade so an
+        // unreachable cluster surfaces as 502, not a dead socket.
+        let upstream = match tokio_tungstenite::connect_async(southbound).await {
+            Ok((stream, _resp)) => stream,
+            Err(e) => {
+                tracing::warn!(cluster = %cluster.id, error = %e, "upstream ws connect failed");
+                return (StatusCode::BAD_GATEWAY, "cluster unreachable").into_response();
+            }
+        };
+
+        let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(u) => u,
+            Err(e) => return e.into_response(),
+        };
+        upgrade
+            .on_upgrade(move |client| bridge(client, upstream))
+            .into_response()
+    }
+
+    async fn bridge<S>(client: axws::WebSocket, upstream: tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let (mut client_tx, mut client_rx) = client.split();
+        let (mut upstream_tx, mut upstream_rx) = upstream.split();
+
+        let northbound = async {
+            while let Some(Ok(msg)) = upstream_rx.next().await {
+                let Some(msg) = ts_to_axum(msg) else { continue };
+                if client_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            let _ = client_tx.close().await;
+        };
+        let southbound = async {
+            while let Some(Ok(msg)) = client_rx.next().await {
+                let Some(msg) = axum_to_ts(msg) else { continue };
+                if upstream_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            let _ = upstream_tx.close().await;
+        };
+        // Either side closing tears down the bridge.
+        futures::future::select(Box::pin(northbound), Box::pin(southbound)).await;
+    }
+
+    fn ts_to_axum(msg: TsMessage) -> Option<axws::Message> {
+        Some(match msg {
+            TsMessage::Text(t) => axws::Message::Text(t.as_str().into()),
+            TsMessage::Binary(b) => axws::Message::Binary(b),
+            TsMessage::Ping(p) => axws::Message::Ping(p),
+            TsMessage::Pong(p) => axws::Message::Pong(p),
+            TsMessage::Close(frame) => axws::Message::Close(frame.map(|f| axws::CloseFrame {
+                code: f.code.into(),
+                reason: f.reason.as_str().into(),
+            })),
+            TsMessage::Frame(_) => return None,
+        })
+    }
+
+    fn axum_to_ts(msg: axws::Message) -> Option<TsMessage> {
+        Some(match msg {
+            axws::Message::Text(t) => TsMessage::Text(t.as_str().into()),
+            axws::Message::Binary(b) => TsMessage::Binary(b),
+            axws::Message::Ping(p) => TsMessage::Ping(p),
+            axws::Message::Pong(p) => TsMessage::Pong(p),
+            axws::Message::Close(frame) => TsMessage::Close(frame.map(|f| {
+                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: f.code.into(),
+                    reason: f.reason.as_str().to_string().into(),
+                }
+            })),
+        })
+    }
+}
+
+#[derive(Debug)]
 enum GatewayError {
     BodyTooLarge,
     BadToken,
@@ -164,5 +303,101 @@ impl IntoResponse for GatewayError {
                 (StatusCode::BAD_GATEWAY, "cluster unreachable").into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderName;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (k, v) in pairs {
+            map.append(
+                k.parse::<HeaderName>().unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn southbound_strips_host_auth_and_hop_by_hop() {
+        let inbound = headers(&[
+            ("host", "demo.ray.test"),
+            ("authorization", "Bearer user-jwt"),
+            ("connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("content-length", "42"),
+            ("content-type", "application/json"),
+            ("x-request-id", "abc123"),
+        ]);
+        let out = southbound_headers(&inbound);
+        assert!(out.get(header::HOST).is_none());
+        assert!(out.get(header::AUTHORIZATION).is_none());
+        assert!(out.get(header::CONNECTION).is_none());
+        assert!(out.get(header::TRANSFER_ENCODING).is_none());
+        assert!(out.get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(out.get(header::CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(out.get("x-request-id").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn southbound_preserves_repeated_headers() {
+        let inbound = headers(&[("accept-encoding", "gzip"), ("accept-encoding", "br")]);
+        let out = southbound_headers(&inbound);
+        assert_eq!(out.get_all("accept-encoding").iter().count(), 2);
+    }
+
+    #[test]
+    fn hop_by_hop_classification() {
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert!(
+                is_hop_by_hop(&name.parse::<HeaderName>().unwrap()),
+                "{name}"
+            );
+        }
+        for name in ["content-type", "accept", "x-anything"] {
+            assert!(
+                !is_hop_by_hop(&name.parse::<HeaderName>().unwrap()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_upgrade_detection_is_case_insensitive() {
+        assert!(is_websocket_upgrade(&headers(&[("upgrade", "WebSocket")])));
+        assert!(is_websocket_upgrade(&headers(&[("upgrade", "websocket")])));
+        assert!(!is_websocket_upgrade(&headers(&[("upgrade", "h2c")])));
+        assert!(!is_websocket_upgrade(&headers(&[])));
+    }
+
+    #[test]
+    fn gateway_error_status_codes() {
+        assert_eq!(
+            GatewayError::BodyTooLarge.into_response().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            GatewayError::BadToken.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            GatewayError::Upstream("c".into(), "e".into())
+                .into_response()
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
     }
 }

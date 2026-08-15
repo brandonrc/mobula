@@ -24,6 +24,21 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage gate (90% lines, CLI shim excluded)
+        run: >
+          cargo llvm-cov --workspace
+          --ignore-filename-regex 'mobula-cli/src/main\.rs'
+          --fail-under-lines 90
+
   deny:
     runs-on: ubuntu-latest
     steps:

@@ -61,6 +61,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn load_registry_missing_file_errors() {
+        assert!(load_registry(std::path::Path::new("/nonexistent/clusters.toml")).is_err());
+    }
+
+    #[test]
+    fn load_registry_rejects_invalid_toml() {
+        let dir = std::env::temp_dir().join(format!("mobula-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.toml");
+        std::fs::write(&path, "clusters = 'not a table'").unwrap();
+        let err = load_registry(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_registry_reads_valid_file() {
+        let dir = std::env::temp_dir().join(format!("mobula-cli-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ok.toml");
+        std::fs::write(
+            &path,
+            "[[clusters]]\nid = \"a\"\nhostname = \"a.test\"\napi_base_url = \"http://a:8265\"\n",
+        )
+        .unwrap();
+        let reg = load_registry(&path).unwrap();
+        assert_eq!(reg.clusters.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn registry_toml_round_trip() {
         let toml = r#"
             [[clusters]]

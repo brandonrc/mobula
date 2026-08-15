@@ -1,0 +1,73 @@
+name: Contract
+
+# The Jobs-API drift alarm (PLAN.md gate S4): the real Python
+# JobSubmissionClient replayed through the gateway against a live Ray head.
+# Runs on gateway changes, weekly (to catch new Ray releases moving the
+# surface underneath us), and on demand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "contract/**"
+      - ".github/workflows/contract.yml"
+      - "Cargo.*"
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  jobs-api:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Supported-version matrix (two Ray minors policy). "ray[default]"
+        # unpinned = latest release, our early-warning canary.
+        ray: ["ray[default]"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ray
+        run: |
+          pip install "${{ matrix.ray }}"
+          python -c "import ray; print('ray', ray.__version__)"
+
+      - name: Start Ray head
+        run: |
+          ray start --head --dashboard-host=127.0.0.1 --dashboard-port=8265
+          # Wait for the dashboard job API to come up.
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8265/api/version && break || sleep 2
+          done
+
+      - name: Start Mobula gateway in front of it
+        run: |
+          echo "127.0.0.1 demo.ray.test" | sudo tee -a /etc/hosts
+          cat > clusters.toml <<'EOF'
+          [[clusters]]
+          id = "demo"
+          hostname = "demo.ray.test"
+          api_base_url = "http://127.0.0.1:8265"
+          EOF
+          cargo build -p mobula-cli
+          nohup ./target/debug/mobula serve --bind 0.0.0.0:8484 --registry clusters.toml \
+            > mobula.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8484/healthz && break || sleep 1
+          done
+
+      - name: Replay JobSubmissionClient through the gateway
+        run: python contract/jobs_client_replay.py
+
+      - name: Gateway logs
+        if: always()
+        run: cat mobula.log || true

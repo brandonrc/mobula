@@ -22,8 +22,10 @@ mobula-api = { path = "crates/mobula-api" }
 mobula-proxy = { path = "crates/mobula-proxy" }
 
 async-trait = "0.1"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio-tungstenite = "0.26"
 toml = "0.9"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

@@ -206,3 +206,156 @@ async fn unreachable_cluster_returns_bad_gateway() {
 
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
+
+mod websocket {
+    use super::*;
+    use axum::extract::ws::{Message as AxMessage, WebSocket, WebSocketUpgrade};
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::protocol::Message as TsMessage;
+
+    /// Mock Ray head websocket endpoint: records the Authorization header,
+    /// streams three log lines, echoes one client frame, then closes.
+    async fn ws_tail(
+        State(log): State<SeenLog>,
+        req_headers: axum::http::HeaderMap,
+        upgrade: WebSocketUpgrade,
+    ) -> impl IntoResponse {
+        log.lock().unwrap().push(Seen {
+            method: "WS".into(),
+            path: "/api/jobs/x/logs/tail".into(),
+            authorization: req_headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from),
+            body: Bytes::new(),
+        });
+        upgrade.on_upgrade(|mut socket: WebSocket| async move {
+            for line in ["line-1", "line-2", "line-3"] {
+                socket.send(AxMessage::Text(line.into())).await.unwrap();
+            }
+            if let Some(Ok(AxMessage::Text(t))) = socket.recv().await {
+                socket
+                    .send(AxMessage::Text(format!("echo:{t}").into()))
+                    .await
+                    .unwrap();
+            }
+            let _ = socket.close().await;
+        })
+    }
+
+    async fn spawn_mock_ws_head() -> (SocketAddr, SeenLog) {
+        let log: SeenLog = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/api/jobs/x/logs/tail", axum::routing::any(ws_tail))
+            .with_state(log.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, log)
+    }
+
+    /// Serve the gateway on a real port; websockets can't go through
+    /// `oneshot`. Registry hostname "127.0.0.1" matches the loopback Host
+    /// header the ws client sends.
+    async fn spawn_gateway(head: SocketAddr, token: Option<&str>) -> SocketAddr {
+        let app = mobula_api::build_app(ClusterRegistry {
+            clusters: vec![ClusterEndpoint {
+                id: ClusterId("demo".into()),
+                hostname: "127.0.0.1".into(),
+                api_base_url: format!("http://{head}"),
+                auth_token: token.map(String::from),
+            }],
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn log_tail_bridges_frames_and_swaps_credentials() {
+        let (head, log) = spawn_mock_ws_head().await;
+        let gw = spawn_gateway(head, Some("ray-ws-token")).await;
+
+        let mut req = format!("ws://{gw}/api/jobs/x/logs/tail")
+            .into_client_request()
+            .unwrap();
+        // The caller's own credential must be stripped at the gateway.
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer user-oidc-jwt".parse().unwrap(),
+        );
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+        let mut lines = Vec::new();
+        for _ in 0..3 {
+            match ws.next().await.unwrap().unwrap() {
+                TsMessage::Text(t) => lines.push(t.as_str().to_string()),
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        assert_eq!(lines, ["line-1", "line-2", "line-3"]);
+
+        // Southbound direction: client frame reaches the mock and echoes.
+        ws.send(TsMessage::Text("hello".into())).await.unwrap();
+        match ws.next().await.unwrap().unwrap() {
+            TsMessage::Text(t) => assert_eq!(t.as_str(), "echo:hello"),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+
+        let seen = log.lock().unwrap();
+        assert_eq!(seen[0].method, "WS");
+        assert_eq!(
+            seen[0].authorization.as_deref(),
+            Some("Bearer ray-ws-token"),
+            "gateway must inject the cluster token on the ws handshake"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_to_unreachable_cluster_fails_handshake_with_502() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = listener.local_addr().unwrap();
+        drop(listener);
+        let gw = spawn_gateway(dead, None).await;
+
+        let req = format!("ws://{gw}/api/jobs/x/logs/tail")
+            .into_client_request()
+            .unwrap();
+        let err = tokio_tungstenite::connect_async(req).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("502"),
+            "expected 502 handshake rejection, got: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_cluster_token_is_500_not_leak() {
+    let (addr, log) = spawn_mock_ray_head().await;
+    // A token with a newline can't become a header value; the gateway must
+    // fail closed rather than forward the request unauthenticated.
+    let app = app_with_cluster(addr, Some("bad\ntoken"));
+
+    let res = app
+        .oneshot(
+            Request::get("/api/jobs/")
+                .header(header::HOST, "demo.ray.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "request must not reach the cluster"
+    );
+}
