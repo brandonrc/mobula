@@ -5,6 +5,8 @@
 //! idempotency key so an HA failover mid-provision cannot double-provision
 //! (PLAN.md, review finding A4).
 
+pub mod kuberay;
+
 use mobula_core::{ClusterId, ClusterSpec, ClusterState};
 
 #[derive(Debug, thiserror::Error)]

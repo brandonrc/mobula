@@ -1198,6 +1198,7 @@ dependencies = [
  "async-trait",
  "mobula-core",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
