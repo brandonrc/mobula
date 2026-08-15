@@ -30,6 +30,11 @@ jobs:
       - name: Generate openapi.json from the code
         run: cargo test -p mobula-api export_openapi
 
+      - name: Render openapi.yaml
+        run: |
+          pip install --quiet pyyaml
+          python3 -c "import json,yaml; yaml.safe_dump(json.load(open('openapi.json')), open('openapi.yaml','w'), sort_keys=False, default_flow_style=False)"
+
       - name: Push spec to mobula-api (if it changed)
         env:
           TOKEN: ${{ secrets.MOBULA_API_PUSH_TOKEN }}
@@ -40,6 +45,7 @@ jobs:
           fi
           git clone "https://x-access-token:${TOKEN}@github.com/brandonrc/mobula-api.git" out
           cp openapi.json out/openapi.json
+          cp openapi.yaml out/openapi.yaml
           cd out
           if git diff --quiet; then
             echo "spec unchanged; nothing to push"
@@ -47,6 +53,6 @@ jobs:
           fi
           git config user.name "mobula-ci"
           git config user.email "ci@mobula.invalid"
-          git add openapi.json
-          git commit -m "chore: sync openapi.json from mobula@${GITHUB_SHA::7}"
+          git add openapi.json openapi.yaml
+          git commit -m "chore: sync spec from mobula@${GITHUB_SHA::7}"
           git push
