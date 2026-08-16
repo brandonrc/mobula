@@ -20,7 +20,7 @@ LocalQueue (namespaced tenant handle).
 ## Decision
 **Kueue is the pool engine; Mobula owns pool topology, admission UX, and
 attribution.** A Mobula `ResourcePool` translates to Kueue objects
-(`kueue.x-k8s.io/v1beta1`):
+(`kueue.x-k8s.io/v1beta2`):
 
 - one `ResourceFlavor` per pool flavor (node labels + taints);
 - one `ClusterQueue` per pool, with `spec.cohortName` pointing at a shared

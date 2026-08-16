@@ -21,14 +21,14 @@ use crate::kuberay::FIELD_MANAGER;
 use crate::kueue::{self, POOL_LABEL};
 use crate::{PoolObservation, PoolProvisioner, ProvisionError};
 
-/// The Kueue kinds Mobula manages; `clusterqueues.kueue.x-k8s.io/v1beta1`
+/// The Kueue kinds Mobula manages; `clusterqueues.kueue.x-k8s.io/v1beta2`
 /// doubles as the discovery probe for [`KueueClient::kueue_present`].
 const KINDS: [&str; 4] = ["Cohort", "ResourceFlavor", "ClusterQueue", "LocalQueue"];
 
 fn kueue_gvk(kind: &str) -> GroupVersionKind {
     GroupVersionKind {
         group: "kueue.x-k8s.io".into(),
-        version: "v1beta1".into(),
+        version: "v1beta2".into(),
         kind: kind.into(),
     }
 }
@@ -314,7 +314,7 @@ impl PoolProvisioner for KueueClient {
 
     async fn kueue_present(&self) -> bool {
         // Discovery: does the API server serve clusterqueues
-        // kueue.x-k8s.io/v1beta1? Cached per client — installing Kueue into
+        // kueue.x-k8s.io/v1beta2? Cached per client — installing Kueue into
         // a running control plane takes effect on restart.
         *self
             .present

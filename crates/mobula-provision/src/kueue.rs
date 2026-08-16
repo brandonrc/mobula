@@ -21,7 +21,12 @@
 use mobula_core::{AllocationSpec, FlavorSpec, PoolSpec};
 use serde_json::{json, Value};
 
-pub const API_VERSION: &str = "kueue.x-k8s.io/v1beta1";
+/// API version for all Kueue objects Mobula manages. v1beta2 is the storage
+/// version since Kueue v0.19 and the only one carrying `spec.cohortName`
+/// (v1beta1 spells it `spec.cohort` and is deprecated) — applying a v1beta1
+/// manifest with `cohortName` is rejected by the structural schema
+/// ("field not declared in schema"), which the kueue-e2e workflow caught.
+pub const API_VERSION: &str = "kueue.x-k8s.io/v1beta2";
 /// Label a workload carries to nominate its LocalQueue
 /// (kueue.x-k8s.io/queue-name).
 pub const QUEUE_LABEL: &str = "kueue.x-k8s.io/queue-name";
@@ -71,7 +76,7 @@ pub fn to_resource_flavor(pool: &str, flavor: &FlavorSpec) -> Value {
 }
 
 /// Build the Cohort manifest — the shared capacity envelope member
-/// ClusterQueues borrow from (KEP-79; `v1beta1` since Kueue v0.13). Empty
+/// ClusterQueues borrow from (KEP-79; `v1beta2` since Kueue v0.19). Empty
 /// spec: the v0 topology keeps quotas on the ClusterQueues, not on the
 /// cohort itself.
 pub fn to_cohort(pool: &PoolSpec) -> Value {
@@ -232,7 +237,7 @@ mod tests {
             effect: "NoSchedule".into(),
         });
         let m = to_resource_flavor("gpu-pool", &f);
-        assert_eq!(m["apiVersion"], "kueue.x-k8s.io/v1beta1");
+        assert_eq!(m["apiVersion"], "kueue.x-k8s.io/v1beta2");
         assert_eq!(m["kind"], "ResourceFlavor");
         assert_eq!(m["metadata"]["name"], "a100");
         assert_eq!(m["metadata"]["labels"][POOL_LABEL], "gpu-pool");
@@ -249,7 +254,7 @@ mod tests {
     #[test]
     fn cohort_is_named_and_empty() {
         let m = to_cohort(&pool());
-        assert_eq!(m["apiVersion"], "kueue.x-k8s.io/v1beta1");
+        assert_eq!(m["apiVersion"], "kueue.x-k8s.io/v1beta2");
         assert_eq!(m["kind"], "Cohort");
         assert_eq!(m["metadata"]["name"], "research");
         assert_eq!(m["metadata"]["labels"][POOL_LABEL], "gpu-pool");
@@ -304,7 +309,7 @@ mod tests {
     #[test]
     fn local_queue_points_at_pool_in_project_namespace() {
         let m = to_local_queue(&alloc());
-        assert_eq!(m["apiVersion"], "kueue.x-k8s.io/v1beta1");
+        assert_eq!(m["apiVersion"], "kueue.x-k8s.io/v1beta2");
         assert_eq!(m["kind"], "LocalQueue");
         assert_eq!(m["metadata"]["name"], "proj-a");
         assert_eq!(m["metadata"]["namespace"], "proj-a");
