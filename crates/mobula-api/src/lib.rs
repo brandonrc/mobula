@@ -8,6 +8,7 @@ pub mod auth_layer;
 pub mod clusters;
 pub mod gateway;
 pub mod pools;
+pub mod registry;
 pub mod services;
 pub mod usage;
 
@@ -53,6 +54,7 @@ use utoipa_swagger_ui::SwaggerUi;
         services::get_service,
         services::deploy_service,
         services::delete_service,
+        registry::list_registry,
     ),
     components(
         schemas(
@@ -69,6 +71,8 @@ use utoipa_swagger_ui::SwaggerUi;
             usage::UsageGroup,
             services::DeployService,
             services::ServiceView,
+            registry::RegistryEntryView,
+            registry::RegistryValidation,
             mobula_core::ClusterSpec,
             mobula_core::WorkerGroup,
             mobula_core::ClusterState,
@@ -100,6 +104,10 @@ use utoipa_swagger_ui::SwaggerUi;
          samples. Reads need Read on the cluster target (Viewer+) — \
          consumption reporting is cluster data, not pool topology. Mounted \
          only when a store is configured."),
+        (name = "registry", description = "The job gateway's routing table \
+         (ADR-0002). Admin-only: it is the credential-routing table. Static \
+         config today; dynamic registration of managed clusters is a \
+         follow-up."),
     ),
     info(
         title = "Mobula",
@@ -284,7 +292,7 @@ fn build_app_full_svc_inner(
     let fail_closed = validator.is_none() && !allow_unauthenticated;
     let auth = auth_layer::AuthState {
         validator,
-        registry,
+        registry: registry.clone(),
     };
     // Resolve each sub-router's own state before merging (they differ:
     // AuthState vs ClusterApiState), then apply the shared layers to the
@@ -295,6 +303,10 @@ fn build_app_full_svc_inner(
         .route("/api/v1/version", get(version))
         .route("/api/v1/authz/check", any(auth_layer::authz_check))
         .with_state(auth.clone());
+    // Registry routes mount unconditionally (gateway-only deployments have a
+    // routing table even without a store); merged once the app is
+    // state-complete (Router<()>).
+    app = app.merge(registry::router(registry.clone()));
     if let Some(store) = store {
         let policy = Arc::new(policy);
         app = app
@@ -500,6 +512,9 @@ mod tests {
         assert!(doc["paths"]["/api/v1/metrics"]["get"].is_object());
         assert!(doc["components"]["schemas"]["UsageReport"].is_object());
         assert!(doc["components"]["schemas"]["PoolUsageView"].is_object());
+        // The gateway registry contract (Admin-only read).
+        assert!(doc["paths"]["/api/v1/registry/clusters"]["get"].is_object());
+        assert!(doc["components"]["schemas"]["RegistryEntryView"].is_object());
         // Bearer security scheme is advertised for client codegen.
         assert_eq!(
             doc["components"]["securitySchemes"]["bearer"]["scheme"],

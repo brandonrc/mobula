@@ -69,7 +69,7 @@ Effective v1 matrix (from `Role::grants`):
 
 | Endpoint class | Required permission | Roles that pass |
 |---|---|---|
-| Any `GET` on cluster/registry/audit data | `Read` on the route's target | Viewer and above |
+| Any `GET` on cluster/audit data | `Read` on the route's target | Viewer and above |
 | Cluster lifecycle mutations (create, patch, suspend, resume, terminate) | `Write`/`Delete` on `Target::Cluster` | Operator, Admin |
 | Job-surface mutations (submit, stop, delete via proxy) | `Write` on `Target::Job` | Developer, Admin |
 | Pool topology reads (`GET /api/v1/pools…`) | `Read` on `Target::Pool` | Viewer and above |
@@ -287,7 +287,8 @@ The one cluster representation, used by list, detail, and action responses.
   "id": "demo",
   "hostname": "demo.ray.example.com",
   "api_base_url": "https://demo-head-svc:8265",
-  "token_set": true
+  "token_set": true,
+  "validation": null
 }
 ```
 
@@ -863,6 +864,28 @@ mobula_pool_resource_usage{pool="gpu-pool",project="proj-a",resource="cpu"} 10
 
 - **Auth:** `Read` on `Target::Cluster` (a scrape token is a Bearer JWT).
 - Values are the latest sample per (pool, project, resource) label set.
+
+### 5.14 Registry — `GET /api/v1/registry/clusters`
+
+The job gateway's routing table (ADR-0002). **Implemented**
+(`registry.rs`), mounted unconditionally (gateway-only deployments have a
+registry even without a store).
+
+- **Auth:** **Admin only** — the registry is the credential-routing table
+  (§2.2). The route enforces `Admin` on `Target::Cluster`; `ext_authz` maps
+  the prefix to `Cluster` for the verb check.
+- **Response 200:** `[RegistryEntryView]` —
+  `{ id, hostname, api_base_url, token_set, validation }`.
+- `token_set` is the only token fact exposed: static Ray tokens are
+  `skip_serializing` on `ClusterEndpoint` and must never appear in a
+  response (security issue #4).
+- `validation` is always `null` today (reserved for per-entry
+  health/reachability): registry validation is fail-fast at startup, so
+  served entries are valid by construction.
+- Static config only — managed clusters from the Store do not get routing
+  entries automatically; dynamic registration is a follow-up (security
+  review #2 treats the dynamic registry as an SSRF surface).
+
 
 
 ## 6. Endpoint × milestone summary

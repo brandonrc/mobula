@@ -52,8 +52,8 @@ fn required_permission(method: &Method) -> PermissionType {
 /// must be derived from the path — a Developer has Write on `Job`/`Service`
 /// but only Read on `Cluster`, and an Operator is the reverse. These prefixes
 /// MUST stay in sync with the router prefixes in `clusters.rs`
-/// (`/api/v1/clusters`), `services.rs` (`/api/v1/services`), and `pools.rs`
-/// (`/api/v1/pools`).
+/// (`/api/v1/clusters`), `services.rs` (`/api/v1/services`), `pools.rs`
+/// (`/api/v1/pools`), and `registry.rs` (`/api/v1/registry`).
 ///
 /// Matching is on segment boundaries — an exact match or a `<prefix>/…`
 /// child — so `/api/v1/clusters-evil` is NOT a cluster path and falls through
@@ -67,6 +67,10 @@ fn target_for_path(path: &str) -> Target {
         Target::Service
     } else if is_under("/api/v1/pools") {
         Target::Pool
+    } else if is_under("/api/v1/registry") {
+        // Registry entries describe cluster routing; the route handler itself
+        // enforces Admin — this mapping is for the ext_authz verb check.
+        Target::Cluster
     } else {
         Target::Job
     }
