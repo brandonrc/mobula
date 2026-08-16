@@ -8,3 +8,6 @@ target/
 # Generated OpenAPI spec — emitted by the export_openapi test and pushed to
 # the mobula-api repo by CI; never committed here (source of truth is the code).
 openapi.json
+
+# local serve pid file
+server.pid
