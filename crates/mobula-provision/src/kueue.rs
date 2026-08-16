@@ -145,6 +145,13 @@ pub fn to_cluster_queue(pool: &PoolSpec) -> Value {
         },
         "spec": {
             "cohortName": pool.cohort,
+            // Empty selector = all namespaces eligible. Kueue's default
+            // (null) is a NOTHING selector — no LocalQueue in any namespace
+            // may use the ClusterQueue ("workload namespace doesn't match
+            // ClusterQueue selector"), so a pool would admit zero workloads
+            // (caught by the kueue-e2e workflow). Mobula scopes tenancy
+            // through allocations, not namespace labels.
+            "namespaceSelector": {},
             "fairSharing": {
                 "weight": weight_json(pool.fair_sharing_weight),
             },
@@ -269,6 +276,10 @@ mod tests {
         assert_eq!(m["metadata"]["labels"][POOL_LABEL], "gpu-pool");
         assert_eq!(m["spec"]["cohortName"], "research");
         assert_eq!(m["spec"]["fairSharing"]["weight"], 2.0);
+        // All namespaces eligible: Kueue's null default admits NOTHING
+        // ("workload namespace doesn't match ClusterQueue selector" — caught
+        // by kueue-e2e). Tenancy is scoped by Mobula allocations instead.
+        assert_eq!(m["spec"]["namespaceSelector"], json!({}));
     }
 
     #[test]
