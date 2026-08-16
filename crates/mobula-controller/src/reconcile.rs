@@ -327,12 +327,11 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                     "cluster made no progress — backing off"
                 );
             }
-            Some(true) => {
-                if c.failure_count != 0 || c.next_attempt_at != 0 {
-                    self.store.record_attempt(&c.id, 0, 0).await?;
-                }
+            // Progress after a prior failure: clear the backoff.
+            Some(true) if c.failure_count != 0 || c.next_attempt_at != 0 => {
+                self.store.record_attempt(&c.id, 0, 0).await?;
             }
-            None => {}
+            _ => {}
         }
 
         Ok(action)
