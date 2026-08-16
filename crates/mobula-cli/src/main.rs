@@ -198,7 +198,9 @@ async fn main() -> std::io::Result<()> {
 
             // Fail-closed invariants (non-loopback needs auth, registry
             // validation) are enforced inside serve() so they can't be
-            // bypassed by library embedders (#36).
+            // bypassed by library embedders (#36). The non-loopback refusal
+            // is also enforced at the router level (#45), so a direct
+            // axum::serve of a validator-less router still fails closed.
             mobula_api::serve(
                 bind,
                 mobula_api::ServeOptions {

@@ -9,8 +9,13 @@ pub mod clusters;
 pub mod gateway;
 pub mod services;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::{ConnectInfo, Request};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::{routing::any, routing::get, Json, Router};
 use mobula_auth::Validator;
 use mobula_core::ClusterRegistry;
@@ -132,6 +137,13 @@ async fn version() -> Json<VersionInfo> {
 
 /// Build the control-plane router with no gateway clusters and no authn
 /// (dev/test convenience).
+///
+/// Gated behind `test-util`/`test`: it defaults `validator = None`, which
+/// bypasses auth, so it must never be reachable in a production build. Use
+/// [`serve`]/[`serve_with_shutdown`], which carry the fail-closed guards
+/// (#45).
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
 pub fn build_router() -> Router {
     build_app(ClusterRegistry::default(), None)
 }
@@ -143,6 +155,10 @@ pub fn build_router() -> Router {
 /// 2. gateway host dispatch — runs before route matching so a cluster
 ///    hostname can't be shadowed by a control-plane path,
 /// 3. routes + fallback.
+///
+/// Gated behind `test-util`/`test`: `validator = None` bypasses auth (#45).
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
 pub fn build_app(registry: ClusterRegistry, validator: Option<Arc<Validator>>) -> Router {
     build_app_full(registry, validator, None, Default::default())
 }
@@ -154,6 +170,10 @@ pub fn build_app(registry: ClusterRegistry, validator: Option<Arc<Validator>>) -
 /// 2. gateway host dispatch — before route matching so a cluster hostname
 ///    can't be shadowed by a control-plane path,
 /// 3. routes + fallback.
+///
+/// Gated behind `test-util`/`test`: `validator = None` bypasses auth (#45).
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
 pub fn build_app_full(
     registry: ClusterRegistry,
     validator: Option<Arc<Validator>>,
@@ -165,6 +185,14 @@ pub fn build_app_full(
 
 /// As [`build_app_full`], plus an optional Serve-service provisioner; when
 /// present, the `/api/v1/services` routes are mounted.
+///
+/// Gated behind `test-util`/`test`: it defaults `allow_unauthenticated = true`
+/// so it never installs the fail-closed guard, which is wrong for production.
+/// Production goes through [`serve_with_shutdown`] →
+/// [`build_app_full_svc_inner`] with the caller's real `allow_unauthenticated`
+/// (#45).
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_app_full_svc(
     registry: ClusterRegistry,
@@ -173,8 +201,53 @@ pub fn build_app_full_svc(
     policy: clusters::PolicyConfig,
     services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
 ) -> Router {
+    build_app_full_svc_inner(registry, validator, store, policy, services, true)
+}
+
+/// Router-level fail-closed guard (#45, moving #36's invariant into the
+/// router): when no validator is configured, refuse any request whose peer
+/// isn't loopback so a direct `axum::serve(build_...())` also fails closed
+/// for remote clients, regardless of bind address. If connect-info is absent
+/// we cannot prove the peer is loopback, so we refuse — this is the outermost
+/// layer.
+async fn refuse_non_loopback(req: Request, next: Next) -> Response {
+    let is_loopback = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(false);
+    if !is_loopback {
+        tracing::warn!(
+            target: "mobula::audit",
+            decision = "deny", reason = "unauthenticated_non_loopback",
+            "refusing non-loopback request: no authentication is configured"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "no authentication is configured; non-loopback access is refused",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// The real router builder. `allow_unauthenticated` decides whether the
+/// fail-closed guard is installed: when a validator is present it is never
+/// needed; when absent and NOT explicitly allowed, the outermost
+/// [`refuse_non_loopback`] layer keeps the control plane closed to remote
+/// peers even if an embedder `axum::serve`s this router directly.
+#[allow(clippy::too_many_arguments)]
+fn build_app_full_svc_inner(
+    registry: ClusterRegistry,
+    validator: Option<Arc<Validator>>,
+    store: Option<Arc<dyn mobula_controller::Store>>,
+    policy: clusters::PolicyConfig,
+    services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
+    allow_unauthenticated: bool,
+) -> Router {
     let registry = Arc::new(registry);
     let gw = gateway::GatewayState::new(registry.clone());
+    let fail_closed = validator.is_none() && !allow_unauthenticated;
     let auth = auth_layer::AuthState {
         validator,
         registry,
@@ -194,7 +267,7 @@ pub fn build_app_full_svc(
     if let Some(services) = services {
         app = app.merge(services::router(services));
     }
-    app
+    let app = app
         // Fallback is registered before the layers so gateway dispatch
         // also wraps unmatched paths — cluster traffic like /api/jobs/
         // has no control-plane route and must still hit the middleware.
@@ -206,7 +279,13 @@ pub fn build_app_full_svc(
         .layer(axum::middleware::from_fn_with_state(
             auth,
             auth_layer::require_auth,
-        ))
+        ));
+    // Outermost when installed: applied last so it wraps auth + gateway.
+    if fail_closed {
+        app.layer(axum::middleware::from_fn(refuse_non_loopback))
+    } else {
+        app
+    }
 }
 
 /// Everything [`serve`] needs, including the fail-closed switches. Kept in
@@ -262,15 +341,19 @@ pub async fn serve_with_shutdown(
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "mobula-api listening");
+    // ConnectInfo must be populated for the router-level fail-closed guard
+    // (#45) to distinguish loopback from remote peers.
+    let app = build_app_full_svc_inner(
+        opts.registry,
+        opts.validator,
+        opts.store,
+        opts.policy,
+        opts.services,
+        opts.allow_unauthenticated,
+    );
     axum::serve(
         listener,
-        build_app_full_svc(
-            opts.registry,
-            opts.validator,
-            opts.store,
-            opts.policy,
-            opts.services,
-        ),
+        app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -401,6 +484,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A well-formed cluster create body (passes deserialization so the
+    /// request reaches the guard/handler rather than 400-ing on parse).
+    fn cluster_create_body() -> String {
+        serde_json::json!({
+            "id": "c1",
+            "spec": {
+                "name": "c1", "project": "demo", "ray_version": "2.57.0",
+                "image": "rayproject/ray:2.57.0", "head_cpu": "1",
+                "head_memory": "2Gi", "worker_groups": [], "ttl_seconds": null
+            }
+        })
+        .to_string()
+    }
+
+    fn with_peer(mut req: Request<Body>, ip: &str) -> Request<Body> {
+        let addr: SocketAddr = format!("{ip}:40000").parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
+    }
+
+    /// #45: the PRODUCTION router path (inner builder, validator=None, not
+    /// allow_unauthenticated) must fail closed for a non-loopback peer even
+    /// on a protected route with a well-formed body.
+    #[tokio::test]
+    async fn no_validator_router_denies_protected_route() {
+        let store = Arc::new(mobula_controller::InMemoryStore::new());
+        let app = build_app_full_svc_inner(
+            ClusterRegistry::default(),
+            None,
+            Some(store),
+            Default::default(),
+            None,
+            false,
+        );
+        let req = with_peer(
+            Request::post("/api/v1/clusters")
+                .header("content-type", "application/json")
+                .body(Body::from(cluster_create_body()))
+                .unwrap(),
+            "203.0.113.7",
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// #45: a non-loopback peer with no validator is refused (connect-info
+    /// present, remote IP).
+    #[tokio::test]
+    async fn no_validator_non_loopback_peer_is_refused() {
+        let app = build_app_full_svc_inner(
+            ClusterRegistry::default(),
+            None,
+            None,
+            Default::default(),
+            None,
+            false,
+        );
+        let req = with_peer(
+            Request::get("/healthz").body(Body::empty()).unwrap(),
+            "203.0.113.9",
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// #45: a loopback peer is still served with no validator — guards
+    /// against the guard false-positiving on legitimate local traffic.
+    #[tokio::test]
+    async fn no_validator_loopback_peer_still_served() {
+        let app = build_app_full_svc_inner(
+            ClusterRegistry::default(),
+            None,
+            None,
+            Default::default(),
+            None,
+            false,
+        );
+        let req = with_peer(
+            Request::get("/healthz").body(Body::empty()).unwrap(),
+            "127.0.0.1",
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]
