@@ -9,6 +9,8 @@ use mobula_core::{ClusterId, ClusterSpec, ClusterState, DriftCondition};
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
+use mobula_core::JobRecord;
+
 use crate::store::{
     now_unix, spec_changed, DesiredState, IntentOutcome, IntentRecord, IntentStatus, Store,
     StoreError, StoredCluster,
@@ -49,6 +51,16 @@ CREATE TABLE IF NOT EXISTS intents (
 CREATE TABLE IF NOT EXISTS control (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+-- Persistent job history (Phase 3, #20). Deliberately has NO foreign key to
+-- clusters: records outlive the clusters that ran them.
+CREATE TABLE IF NOT EXISTS jobs (
+    id            TEXT PRIMARY KEY,
+    cluster       TEXT NOT NULL,
+    submitter     TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    duration_secs INTEGER,
+    submitted_at  INTEGER NOT NULL
 );
 "#;
 
@@ -422,5 +434,43 @@ impl Store for SqliteStore {
         .await?
         .rows_affected();
         Ok(affected)
+    }
+
+    async fn record_job(&self, job: JobRecord) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO jobs (id, cluster, submitter, status, duration_secs, submitted_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET status = excluded.status, \
+                 duration_secs = excluded.duration_secs",
+        )
+        .bind(&job.id)
+        .bind(&job.cluster)
+        .bind(&job.submitter)
+        .bind(&job.status)
+        .bind(job.duration_secs.map(|d| d as i64))
+        .bind(job.submitted_at as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_jobs(&self) -> Result<Vec<JobRecord>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM jobs ORDER BY submitted_at DESC")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok::<_, StoreError>(JobRecord {
+                    id: row.try_get::<String, _>("id")?,
+                    cluster: row.try_get::<String, _>("cluster")?,
+                    submitter: row.try_get::<String, _>("submitter")?,
+                    status: row.try_get::<String, _>("status")?,
+                    duration_secs: row
+                        .try_get::<Option<i64>, _>("duration_secs")?
+                        .map(|d| d as u64),
+                    submitted_at: row.try_get::<i64, _>("submitted_at")? as u64,
+                })
+            })
+            .collect()
     }
 }

@@ -5,7 +5,7 @@
 //! store lands in the next slice behind the same trait.
 
 use async_trait::async_trait;
-use mobula_core::{ClusterId, ClusterSpec, ClusterState, DriftCondition};
+use mobula_core::{ClusterId, ClusterSpec, ClusterState, DriftCondition, JobRecord};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -204,6 +204,14 @@ pub trait Store: Send + Sync {
     /// Bound outbox growth: delete `Applied` rows whose `completed_at` is
     /// older than `applied_before`. Returns how many were removed.
     async fn reap_intents(&self, applied_before: u64) -> Result<u64, StoreError>;
+
+    /// Record or update a job in the persistent history (Phase 3, #20),
+    /// keyed by job id. Job records live independently of clusters, so they
+    /// survive the deletion of the cluster that ran them.
+    async fn record_job(&self, job: JobRecord) -> Result<(), StoreError>;
+
+    /// List job history, most recently submitted first.
+    async fn list_jobs(&self) -> Result<Vec<JobRecord>, StoreError>;
 }
 
 pub mod memory {
@@ -218,6 +226,7 @@ pub mod memory {
         clusters: Mutex<HashMap<String, StoredCluster>>,
         intents: Mutex<HashMap<String, IntentRecord>>,
         quarantined: AtomicBool,
+        jobs: Mutex<HashMap<String, JobRecord>>,
     }
 
     impl InMemoryStore {
@@ -378,6 +387,17 @@ pub mod memory {
                     && r.completed_at.is_some_and(|c| c < applied_before))
             });
             Ok((before - map.len()) as u64)
+        }
+
+        async fn record_job(&self, job: JobRecord) -> Result<(), StoreError> {
+            self.jobs.lock().unwrap().insert(job.id.clone(), job);
+            Ok(())
+        }
+
+        async fn list_jobs(&self) -> Result<Vec<JobRecord>, StoreError> {
+            let mut jobs: Vec<JobRecord> = self.jobs.lock().unwrap().values().cloned().collect();
+            jobs.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
+            Ok(jobs)
         }
     }
 }

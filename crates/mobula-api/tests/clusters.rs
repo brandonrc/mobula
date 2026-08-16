@@ -93,6 +93,12 @@ impl Store for SlowListStore {
             .record_attempt(id, failure_count, next_attempt_at)
             .await
     }
+    async fn record_job(&self, job: mobula_core::JobRecord) -> Result<(), StoreError> {
+        self.inner.record_job(job).await
+    }
+    async fn list_jobs(&self) -> Result<Vec<mobula_core::JobRecord>, StoreError> {
+        self.inner.list_jobs().await
+    }
 }
 
 fn create_body(id: &str) -> serde_json::Value {

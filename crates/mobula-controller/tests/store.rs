@@ -141,6 +141,36 @@ async fn conformance(store: &dyn Store) {
     store.upsert_desired(&id, spec("demo", 3)).await.unwrap();
     assert_eq!(store.get(&id).await.unwrap().unwrap().failure_count, 3);
 
+    // Job history round-trips and is independent of clusters (#20/Phase 3).
+    store
+        .record_job(mobula_core::JobRecord {
+            id: "raysubmit_1".into(),
+            cluster: "gone-cluster".into(),
+            submitter: "user@x".into(),
+            status: "RUNNING".into(),
+            duration_secs: None,
+            submitted_at: 1000,
+        })
+        .await
+        .unwrap();
+    // Re-record with the same id updates status/duration (terminal).
+    store
+        .record_job(mobula_core::JobRecord {
+            id: "raysubmit_1".into(),
+            cluster: "gone-cluster".into(),
+            submitter: "user@x".into(),
+            status: "SUCCEEDED".into(),
+            duration_secs: Some(42),
+            submitted_at: 1000,
+        })
+        .await
+        .unwrap();
+    let jobs = store.list_jobs().await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, "SUCCEEDED");
+    assert_eq!(jobs[0].duration_secs, Some(42));
+    assert_eq!(jobs[0].cluster, "gone-cluster");
+
     // set_desired on a missing cluster errors.
     assert!(store
         .set_desired(&ClusterId("ghost".into()), DesiredState::Running)

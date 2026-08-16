@@ -6,11 +6,13 @@
 //! never depend on a cloud SDK or Kubernetes client (see ADR-0002).
 
 pub mod cluster;
+pub mod job;
 pub mod registry;
 pub mod service;
 
 pub use cluster::{
     ClusterId, ClusterSpec, ClusterState, DriftCondition, TransitionError, WorkerGroup,
 };
+pub use job::JobRecord;
 pub use registry::{ClusterEndpoint, ClusterRegistry, RegistryError};
 pub use service::{ServiceSpec, UpgradeStrategy};
