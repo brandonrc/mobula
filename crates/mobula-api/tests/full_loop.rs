@@ -13,7 +13,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use mobula_controller::{InMemoryStore, Reconciler};
 use mobula_core::{ClusterId, ClusterSpec, ClusterState};
-use mobula_provision::{ObservedCluster, ProvisionError, Provisioner};
+use mobula_provision::{ApplyResponse, ObservedCluster, ProvisionError, Provisioner};
 use tower::ServiceExt;
 
 /// Mock provisioner: `apply` brings a cluster to Running, `observe` reports
@@ -21,16 +21,27 @@ use tower::ServiceExt;
 #[derive(Default)]
 struct MockProvisioner {
     state: Mutex<HashMap<String, ClusterState>>,
+    gen: Mutex<HashMap<String, u64>>,
 }
 
 #[async_trait]
 impl Provisioner for MockProvisioner {
-    async fn apply(&self, id: &ClusterId, _: &ClusterSpec, _: &str) -> Result<(), ProvisionError> {
+    async fn apply(
+        &self,
+        id: &ClusterId,
+        _: &ClusterSpec,
+        generation: u64,
+        _: &str,
+    ) -> Result<ApplyResponse, ProvisionError> {
         self.state
             .lock()
             .unwrap()
             .insert(id.0.clone(), ClusterState::Running);
-        Ok(())
+        self.gen.lock().unwrap().insert(id.0.clone(), generation);
+        Ok(ApplyResponse {
+            generation,
+            api_base_url: None,
+        })
     }
     async fn terminate(&self, id: &ClusterId) -> Result<(), ProvisionError> {
         self.state
@@ -44,6 +55,7 @@ impl Provisioner for MockProvisioner {
             Some(state) => Ok(ObservedCluster {
                 id: id.clone(),
                 state: *state,
+                observed_generation: self.gen.lock().unwrap().get(&id.0).copied(),
                 api_base_url: None,
             }),
             None => Err(ProvisionError::NotFound(id.clone())),

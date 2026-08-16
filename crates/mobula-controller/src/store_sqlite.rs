@@ -9,7 +9,10 @@ use mobula_core::{ClusterId, ClusterSpec, ClusterState};
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
-use crate::store::{now_unix, spec_changed, DesiredState, Store, StoreError, StoredCluster};
+use crate::store::{
+    now_unix, spec_changed, DesiredState, IntentOutcome, IntentRecord, IntentStatus, Store,
+    StoreError, StoredCluster,
+};
 
 impl From<sqlx::Error> for StoreError {
     fn from(e: sqlx::Error) -> Self {
@@ -32,19 +35,56 @@ CREATE TABLE IF NOT EXISTS clusters (
     created_at            INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS intents (
-    intent_key TEXT PRIMARY KEY
+    intent_key         TEXT PRIMARY KEY,
+    params_fingerprint TEXT NOT NULL DEFAULT '',
+    status             TEXT NOT NULL DEFAULT 'applied',
+    response_json      TEXT,
+    created_at         INTEGER NOT NULL DEFAULT 0,
+    completed_at       INTEGER
 );
 "#;
+
+/// Additive migrations for databases created by an older single-column
+/// `intents` schema (ADR-0007 outbox, #39). Each is idempotent: on a fresh
+/// DB the column already exists and SQLite errors with "duplicate column
+/// name", which we ignore. Ordering doesn't matter (all independent).
+const INTENT_MIGRATIONS: &[&str] = &[
+    "ALTER TABLE intents ADD COLUMN params_fingerprint TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE intents ADD COLUMN status TEXT NOT NULL DEFAULT 'applied'",
+    "ALTER TABLE intents ADD COLUMN response_json TEXT",
+    "ALTER TABLE intents ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE intents ADD COLUMN completed_at INTEGER",
+];
 
 pub struct SqliteStore {
     pool: SqlitePool,
 }
 
 impl SqliteStore {
+    async fn init(pool: &SqlitePool) -> Result<(), StoreError> {
+        // Wait for the write lock rather than failing SQLITE_BUSY under
+        // concurrent writers (#42) — matters for the file/multi-connection
+        // deployment; harmless for the single-connection in-memory store.
+        sqlx::query("PRAGMA busy_timeout = 5000")
+            .execute(pool)
+            .await?;
+        sqlx::query(SCHEMA).execute(pool).await?;
+        for m in INTENT_MIGRATIONS {
+            // Ignore "duplicate column name" on fresh DBs; surface anything else.
+            if let Err(e) = sqlx::query(m).execute(pool).await {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Connect (creating the file if needed) and apply the schema.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new().connect(url).await?;
-        sqlx::query(SCHEMA).execute(&pool).await?;
+        Self::init(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -55,8 +95,15 @@ impl SqliteStore {
             .max_connections(1)
             .connect("sqlite::memory:")
             .await?;
-        sqlx::query(SCHEMA).execute(&pool).await?;
+        Self::init(&pool).await?;
         Ok(Self { pool })
+    }
+}
+
+fn intent_status_from_str(s: &str) -> IntentStatus {
+    match s {
+        "pending" => IntentStatus::Pending,
+        _ => IntentStatus::Applied,
     }
 }
 
@@ -97,47 +144,66 @@ fn row_to_cluster(row: SqliteRow) -> Result<StoredCluster, StoreError> {
 #[async_trait]
 impl Store for SqliteStore {
     async fn upsert_desired(&self, id: &ClusterId, spec: ClusterSpec) -> Result<u64, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        // BEGIN IMMEDIATE takes the write lock at transaction start (#42), so
+        // two concurrent upserts on the same id are serialized: the second
+        // blocks until the first commits and then reads the already-bumped
+        // generation, instead of both reading gen=N under a DEFERRED tx and
+        // collapsing two spec changes into one bump. `pool.begin()` is
+        // DEFERRED (read lock, upgraded lazily) and cannot give this.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
-        let existing = sqlx::query("SELECT spec_json, generation FROM clusters WHERE id = ?")
-            .bind(&id.0)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let result: Result<u64, StoreError> = async {
+            let existing = sqlx::query("SELECT spec_json, generation FROM clusters WHERE id = ?")
+                .bind(&id.0)
+                .fetch_optional(&mut *conn)
+                .await?;
 
-        let generation: u64 = match existing {
-            Some(row) => {
-                let cur_json: String = row.try_get("spec_json")?;
-                let cur: ClusterSpec = serde_json::from_str(&cur_json).map_err(json_err)?;
-                let gen: i64 = row.try_get("generation")?;
-                if spec_changed(&cur, &spec) {
-                    gen as u64 + 1
-                } else {
-                    gen as u64
+            let generation: u64 = match existing {
+                Some(row) => {
+                    let cur_json: String = row.try_get("spec_json")?;
+                    let cur: ClusterSpec = serde_json::from_str(&cur_json).map_err(json_err)?;
+                    let gen: i64 = row.try_get("generation")?;
+                    if spec_changed(&cur, &spec) {
+                        gen as u64 + 1
+                    } else {
+                        gen as u64
+                    }
                 }
+                None => 1,
+            };
+
+            let spec_json = serde_json::to_string(&spec).map_err(json_err)?;
+            // Keep desired/observed on update; default desired=running on insert.
+            sqlx::query(
+                r#"
+                INSERT INTO clusters (id, spec_json, generation, desired, observed_generation, created_at)
+                VALUES (?, ?, ?, 'running', 0, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    spec_json = excluded.spec_json,
+                    generation = excluded.generation
+                "#,
+            )
+            .bind(&id.0)
+            .bind(&spec_json)
+            .bind(generation as i64)
+            .bind(now_unix() as i64)
+            .execute(&mut *conn)
+            .await?;
+            Ok(generation)
+        }
+        .await;
+
+        match result {
+            Ok(generation) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(generation)
             }
-            None => 1,
-        };
-
-        let spec_json = serde_json::to_string(&spec).map_err(json_err)?;
-        // Keep desired/observed on update; default desired=running on insert.
-        sqlx::query(
-            r#"
-            INSERT INTO clusters (id, spec_json, generation, desired, observed_generation, created_at)
-            VALUES (?, ?, ?, 'running', 0, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                spec_json = excluded.spec_json,
-                generation = excluded.generation
-            "#,
-        )
-        .bind(&id.0)
-        .bind(&spec_json)
-        .bind(generation as i64)
-        .bind(now_unix() as i64)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(generation)
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
     }
 
     async fn get(&self, id: &ClusterId) -> Result<Option<StoredCluster>, StoreError> {
@@ -187,13 +253,98 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    async fn record_intent(&self, key: &str) -> Result<bool, StoreError> {
-        let affected =
-            sqlx::query("INSERT INTO intents (intent_key) VALUES (?) ON CONFLICT DO NOTHING")
-                .bind(key)
-                .execute(&self.pool)
-                .await?
-                .rows_affected();
-        Ok(affected > 0)
+    async fn begin_intent(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<IntentOutcome, StoreError> {
+        // Atomic open under BEGIN IMMEDIATE so two reconcilers can't both
+        // treat the same key as fresh. Insert a pending row if absent;
+        // otherwise classify against the stored fingerprint.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<IntentOutcome, StoreError> = async {
+            let existing: Option<String> =
+                sqlx::query("SELECT params_fingerprint FROM intents WHERE intent_key = ?")
+                    .bind(key)
+                    .fetch_optional(&mut *conn)
+                    .await?
+                    .map(|row| row.try_get::<String, _>("params_fingerprint"))
+                    .transpose()?;
+            match existing {
+                Some(fp) if fp != fingerprint => Ok(IntentOutcome::ParamMismatch),
+                Some(_) => Ok(IntentOutcome::Proceed { replay: true }),
+                None => {
+                    sqlx::query(
+                        "INSERT INTO intents (intent_key, params_fingerprint, status, created_at) \
+                         VALUES (?, ?, 'pending', ?)",
+                    )
+                    .bind(key)
+                    .bind(fingerprint)
+                    .bind(now_unix() as i64)
+                    .execute(&mut *conn)
+                    .await?;
+                    Ok(IntentOutcome::Proceed { replay: false })
+                }
+            }
+        }
+        .await;
+
+        match result {
+            Ok(outcome) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(outcome)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn complete_intent(&self, key: &str, response_json: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE intents SET status = 'applied', response_json = ?, completed_at = ? \
+             WHERE intent_key = ?",
+        )
+        .bind(response_json)
+        .bind(now_unix() as i64)
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_intent(&self, key: &str) -> Result<Option<IntentRecord>, StoreError> {
+        let row = sqlx::query("SELECT * FROM intents WHERE intent_key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            Ok::<_, StoreError>(IntentRecord {
+                key: row.try_get::<String, _>("intent_key")?,
+                params_fingerprint: row.try_get::<String, _>("params_fingerprint")?,
+                status: intent_status_from_str(&row.try_get::<String, _>("status")?),
+                response_json: row.try_get::<Option<String>, _>("response_json")?,
+                created_at: row.try_get::<i64, _>("created_at")? as u64,
+                completed_at: row
+                    .try_get::<Option<i64>, _>("completed_at")?
+                    .map(|v| v as u64),
+            })
+        })
+        .transpose()
+    }
+
+    async fn reap_intents(&self, applied_before: u64) -> Result<u64, StoreError> {
+        let affected = sqlx::query(
+            "DELETE FROM intents WHERE status = 'applied' \
+             AND completed_at IS NOT NULL AND completed_at < ?",
+        )
+        .bind(applied_before as i64)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
     }
 }

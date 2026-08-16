@@ -26,22 +26,45 @@ pub enum ProvisionError {
 pub struct ObservedCluster {
     pub id: ClusterId,
     pub state: ClusterState,
+    /// The spec generation the backing cluster actually reflects, read back
+    /// from the resource Mobula stamps (ADR-0006, #40) — *not* the desired
+    /// generation the engine intended. `None` when the backend exposes no
+    /// generation marker (e.g. an out-of-band resource). The reconcile
+    /// engine records this, so convergence is observed rather than
+    /// self-certified.
+    pub observed_generation: Option<u64>,
     /// Base URL of the cluster's native Ray dashboard/job API, reachable
     /// from the control plane. The job gateway proxies to this; it is never
     /// exposed to users directly.
     pub api_base_url: Option<String>,
 }
 
+/// The outcome of an [`Provisioner::apply`], stored in the transactional
+/// outbox (ADR-0007, #39) so a replay can return it without re-actuating a
+/// non-idempotent backend. Serializable because the store persists it as
+/// opaque JSON.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApplyResponse {
+    /// The generation this apply actuated.
+    pub generation: u64,
+    /// The cluster's native Ray API base URL, if the backend can name it.
+    pub api_base_url: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub trait Provisioner: Send + Sync {
-    /// Create or update the backing resources for `spec`. Idempotent per
-    /// `idempotency_key`: repeating a call must not create duplicates.
+    /// Create or update the backing resources for `spec` at `generation`.
+    /// Idempotent per `idempotency_key`: repeating a call must not create
+    /// duplicates. `generation` is stamped onto the backing resource so
+    /// [`Provisioner::observe`] can read it back (ADR-0006, #40). Returns
+    /// the [`ApplyResponse`] recorded in the outbox (ADR-0007, #39).
     async fn apply(
         &self,
         id: &ClusterId,
         spec: &ClusterSpec,
+        generation: u64,
         idempotency_key: &str,
-    ) -> Result<(), ProvisionError>;
+    ) -> Result<ApplyResponse, ProvisionError>;
 
     /// Begin teardown. Idempotent; succeeds if already gone.
     async fn terminate(&self, id: &ClusterId) -> Result<(), ProvisionError>;

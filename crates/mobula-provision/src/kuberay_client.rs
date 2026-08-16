@@ -13,8 +13,13 @@ use kube::discovery::ApiResource;
 use kube::Client;
 use mobula_core::{ClusterId, ClusterSpec, ServiceSpec};
 
-use crate::kuberay::{self, CLUSTER_ID_LABEL, FIELD_MANAGER, MANAGED_BY_LABEL};
-use crate::{ObservedCluster, ObservedService, ProvisionError, Provisioner, ServiceProvisioner};
+use crate::kuberay::{
+    self, CLUSTER_ID_LABEL, FIELD_MANAGER, GENERATION_ANNOTATION, MANAGED_BY_LABEL,
+};
+use crate::{
+    ApplyResponse, ObservedCluster, ObservedService, ProvisionError, Provisioner,
+    ServiceProvisioner,
+};
 
 impl From<kube::Error> for ProvisionError {
     fn from(e: kube::Error) -> Self {
@@ -71,6 +76,21 @@ impl KubeRayProvisioner {
     fn api(&self) -> Api<DynamicObject> {
         Api::namespaced_with(self.client.clone(), &self.namespace, &raycluster_resource())
     }
+
+    /// The dashboard/job API URL KubeRay's head service exposes for `id`.
+    fn api_base_url(&self, id: &str) -> String {
+        format!("http://{id}-head-svc.{}.svc:8265", self.namespace)
+    }
+}
+
+/// Read the Mobula generation an observed RayCluster carries (ADR-0006, #40)
+/// from its metadata annotation, if present and parseable.
+fn observed_generation(obj: &DynamicObject) -> Option<u64> {
+    obj.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(GENERATION_ANNOTATION))
+        .and_then(|v| v.parse().ok())
 }
 
 #[async_trait]
@@ -79,9 +99,10 @@ impl Provisioner for KubeRayProvisioner {
         &self,
         id: &ClusterId,
         spec: &ClusterSpec,
+        generation: u64,
         idempotency_key: &str,
-    ) -> Result<(), ProvisionError> {
-        let manifest = kuberay::to_raycluster(id, spec, self.autoscaling);
+    ) -> Result<ApplyResponse, ProvisionError> {
+        let manifest = kuberay::to_raycluster(id, spec, self.autoscaling, generation);
         // Wrap the manifest as a DynamicObject the dynamic Api can apply.
         let mut obj = DynamicObject::new(&id.0, &raycluster_resource());
         obj.metadata = ObjectMeta {
@@ -90,6 +111,13 @@ impl Provisioner for KubeRayProvisioner {
                 (MANAGED_BY_LABEL.to_string(), FIELD_MANAGER.to_string()),
                 (CLUSTER_ID_LABEL.to_string(), id.0.clone()),
             ])),
+            // Stamp the generation on the CR so observe() reads it back
+            // (ADR-0006, #40). The pod-template stamp lives inside the spec
+            // (manifest["spec"]) and rolls pods on a bump.
+            annotations: Some(std::collections::BTreeMap::from([(
+                GENERATION_ANNOTATION.to_string(),
+                generation.to_string(),
+            )])),
             ..Default::default()
         };
         obj.data = serde_json::json!({ "spec": manifest["spec"] });
@@ -104,9 +132,12 @@ impl Provisioner for KubeRayProvisioner {
             .await?;
         tracing::info!(
             target: "mobula::audit",
-            cluster = %id, key = idempotency_key, "raycluster applied"
+            cluster = %id, generation, key = idempotency_key, "raycluster applied"
         );
-        Ok(())
+        Ok(ApplyResponse {
+            generation,
+            api_base_url: Some(self.api_base_url(&id.0)),
+        })
     }
 
     async fn terminate(&self, id: &ClusterId) -> Result<(), ProvisionError> {
@@ -132,14 +163,11 @@ impl Provisioner for KubeRayProvisioner {
         let state = kuberay::status_to_state(&status);
         // The head service KubeRay creates is `<name>-head-svc`; the job
         // gateway targets its dashboard port.
-        let api_base_url = Some(format!(
-            "http://{}-head-svc.{}.svc:8265",
-            id.0, self.namespace
-        ));
         Ok(ObservedCluster {
             id: id.clone(),
             state,
-            api_base_url,
+            observed_generation: observed_generation(&obj),
+            api_base_url: Some(self.api_base_url(&id.0)),
         })
     }
 
@@ -158,10 +186,8 @@ impl Provisioner for KubeRayProvisioner {
                 Some(ObservedCluster {
                     id: ClusterId(name.clone()),
                     state: kuberay::status_to_state(&status),
-                    api_base_url: Some(format!(
-                        "http://{name}-head-svc.{}.svc:8265",
-                        self.namespace
-                    )),
+                    observed_generation: observed_generation(&obj),
+                    api_base_url: Some(self.api_base_url(&name)),
                 })
             })
             .collect())
