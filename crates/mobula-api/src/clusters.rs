@@ -37,6 +37,19 @@ pub struct PolicyConfig {
 pub struct ClusterApiState {
     pub store: Arc<dyn Store>,
     pub policy: Arc<PolicyConfig>,
+    /// Per-project admission locks (#44). Quota admission is a non-atomic
+    /// read-check-write (list -> admit -> upsert) with `.await` points and
+    /// the new cluster not yet in the store, so two concurrent creates for
+    /// the same project can both observe pre-insert usage and both admit,
+    /// over-committing the quota permanently. Holding a per-project lock
+    /// across that section serializes same-project creates (the second then
+    /// sees the first's committed row and is correctly 409'd) while leaving
+    /// different projects concurrent.
+    ///
+    /// FOLLOW-UP: this is in-process only. A multi-replica / Postgres
+    /// deployment needs the check-and-commit in a single store transaction
+    /// (a `Store` method); tracked separately, not implemented here.
+    pub admit_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// Request body for creating/updating a managed cluster.
@@ -178,7 +191,20 @@ async fn create_cluster(
     // unlimited in v0. Checked against max-demand of the project's other
     // live clusters plus this request.
     let project = body.spec.project.clone();
-    if let Some(limit) = st.policy.quotas.get(&project).copied() {
+    // When a quota applies, serialize concurrent same-project creates by
+    // holding a per-project lock across the whole read-check-write section
+    // (list -> admit -> upsert) so the TOCTOU window can't over-admit (#44).
+    // The guard is an OwnedMutexGuard so it stays alive past the `if let`,
+    // covering the `upsert_desired` below; it drops at end of function.
+    // Projects without a quota skip the lock entirely and stay concurrent.
+    let _admit_guard = if let Some(limit) = st.policy.quotas.get(&project).copied() {
+        // Fetch-or-insert this project's lock (brief std::Mutex hold, never
+        // across an await), then acquire it.
+        let lock = {
+            let mut locks = st.admit_locks.lock().unwrap();
+            locks.entry(project.clone()).or_default().clone()
+        };
+        let guard = lock.lock_owned().await;
         let requested = match cluster_demand(&body.spec) {
             Ok((_, max)) => max,
             Err(e) => {
@@ -220,7 +246,11 @@ async fn create_cluster(
             );
             return (StatusCode::CONFLICT, exceeded.to_string()).into_response();
         }
-    }
+        // Keep the lock held across the upsert below.
+        Some(guard)
+    } else {
+        None
+    };
 
     match st.store.upsert_desired(&id, body.spec).await {
         Ok(generation) => {
@@ -288,5 +318,9 @@ pub fn router(store: Arc<dyn Store>, policy: Arc<PolicyConfig>) -> Router {
             "/api/v1/clusters/{id}",
             get(get_cluster).delete(delete_cluster),
         )
-        .with_state(ClusterApiState { store, policy })
+        .with_state(ClusterApiState {
+            store,
+            policy,
+            admit_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        })
 }
