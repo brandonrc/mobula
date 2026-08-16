@@ -37,6 +37,12 @@ pub struct StoredCluster {
     /// distinct from `observed_state`. `None` when the cluster is converging
     /// normally.
     pub condition: Option<DriftCondition>,
+    /// Consecutive no-progress reconcile attempts (#43). Resets to 0 on
+    /// progress; drives the exponential backoff delay.
+    pub failure_count: u32,
+    /// Unix seconds before which the reconciler must not re-actuate this
+    /// cluster (#43 backoff gate). 0 means "no backoff pending".
+    pub next_attempt_at: u64,
     /// Unix seconds when the cluster was first created (for TTL reaping).
     pub created_at: u64,
 }
@@ -169,6 +175,16 @@ pub trait Store: Send + Sync {
     /// Enter or leave quarantine.
     async fn set_quarantine(&self, quarantined: bool) -> Result<(), StoreError>;
 
+    /// Persist a cluster's backoff state after a reconcile attempt (#43):
+    /// `failure_count` consecutive no-progress attempts and the unix time
+    /// before which not to re-actuate. Both 0 clears the backoff.
+    async fn record_attempt(
+        &self,
+        id: &ClusterId,
+        failure_count: u32,
+        next_attempt_at: u64,
+    ) -> Result<(), StoreError>;
+
     /// Transactional outbox (ADR-0007): open an intent to actuate `key` with
     /// the given spec `fingerprint`, committing a `Pending` row *before* the
     /// provider call. Returns [`IntentOutcome::Proceed`] when the caller
@@ -234,6 +250,8 @@ pub mod memory {
                 observed_state: observed.and_then(|c| c.observed_state),
                 observed_generation: observed.map(|c| c.observed_generation).unwrap_or(0),
                 condition: observed.and_then(|c| c.condition),
+                failure_count: observed.map(|c| c.failure_count).unwrap_or(0),
+                next_attempt_at: observed.map(|c| c.next_attempt_at).unwrap_or(0),
                 created_at: observed.map(|c| c.created_at).unwrap_or_else(now_unix),
             };
             map.insert(id.0.clone(), record);
@@ -295,6 +313,19 @@ pub mod memory {
 
         async fn set_quarantine(&self, quarantined: bool) -> Result<(), StoreError> {
             self.quarantined.store(quarantined, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn record_attempt(
+            &self,
+            id: &ClusterId,
+            failure_count: u32,
+            next_attempt_at: u64,
+        ) -> Result<(), StoreError> {
+            if let Some(c) = self.clusters.lock().unwrap().get_mut(&id.0) {
+                c.failure_count = failure_count;
+                c.next_attempt_at = next_attempt_at;
+            }
             Ok(())
         }
 

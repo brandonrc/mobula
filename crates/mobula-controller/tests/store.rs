@@ -132,6 +132,15 @@ async fn conformance(store: &dyn Store) {
     store.set_quarantine(false).await.unwrap();
     assert!(!store.is_quarantined().await.unwrap());
 
+    // Backoff state round-trips (#43).
+    store.record_attempt(&id, 3, 12_345).await.unwrap();
+    let got = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(got.failure_count, 3);
+    assert_eq!(got.next_attempt_at, 12_345);
+    // A fresh upsert (unchanged spec) preserves the backoff state.
+    store.upsert_desired(&id, spec("demo", 3)).await.unwrap();
+    assert_eq!(store.get(&id).await.unwrap().unwrap().failure_count, 3);
+
     // set_desired on a missing cluster errors.
     assert!(store
         .set_desired(&ClusterId("ghost".into()), DesiredState::Running)

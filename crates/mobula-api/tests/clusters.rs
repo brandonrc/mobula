@@ -83,6 +83,16 @@ impl Store for SlowListStore {
     async fn set_quarantine(&self, quarantined: bool) -> Result<(), StoreError> {
         self.inner.set_quarantine(quarantined).await
     }
+    async fn record_attempt(
+        &self,
+        id: &ClusterId,
+        failure_count: u32,
+        next_attempt_at: u64,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .record_attempt(id, failure_count, next_attempt_at)
+            .await
+    }
 }
 
 fn create_body(id: &str) -> serde_json::Value {

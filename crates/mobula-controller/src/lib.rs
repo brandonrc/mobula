@@ -9,7 +9,7 @@ pub mod reconcile;
 pub mod store;
 pub mod store_sqlite;
 
-pub use reconcile::{Action, ReconcileError, Reconciler};
+pub use reconcile::{Action, RateLimits, ReconcileError, Reconciler};
 pub use store::{
     memory::InMemoryStore, DesiredState, IntentOutcome, IntentRecord, IntentStatus, Store,
     StoreError, StoredCluster,
