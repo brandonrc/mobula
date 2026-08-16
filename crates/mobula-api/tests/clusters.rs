@@ -157,6 +157,15 @@ impl Store for SlowListStore {
     ) -> Result<Vec<mobula_controller::UsageSample>, StoreError> {
         self.inner.usage_samples(project, pool, from, to).await
     }
+    async fn record_audit(&self, event: &mobula_core::AuditEvent) -> Result<u64, StoreError> {
+        self.inner.record_audit(event).await
+    }
+    async fn list_audit(
+        &self,
+        filter: &mobula_core::AuditFilter,
+    ) -> Result<(Vec<(u64, mobula_core::AuditEvent)>, Option<u64>), StoreError> {
+        self.inner.list_audit(filter).await
+    }
 }
 
 fn create_body(id: &str) -> serde_json::Value {

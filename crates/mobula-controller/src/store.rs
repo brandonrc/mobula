@@ -6,7 +6,8 @@
 
 use async_trait::async_trait;
 use mobula_core::{
-    AllocationSpec, ClusterId, ClusterSpec, ClusterState, DriftCondition, JobRecord, PoolSpec,
+    AllocationSpec, AuditEvent, AuditFilter, ClusterId, ClusterSpec, ClusterState, DriftCondition,
+    JobRecord, PoolSpec,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -372,6 +373,24 @@ pub trait Store: Send + Sync {
         from: u64,
         to: u64,
     ) -> Result<Vec<UsageSample>, StoreError>;
+
+    /// Append an audit event (api-v1.md §5.9). Append-only: returns the
+    /// row's `seq`, a 1-based monotonic sequence number that doubles as the
+    /// pagination cursor for [`Store::list_audit`]. Callers must treat a
+    /// failure as non-fatal (log and continue) — audit persistence never
+    /// fails the request being audited.
+    async fn record_audit(&self, event: &AuditEvent) -> Result<u64, StoreError>;
+
+    /// List audit events matching `filter`, newest-first by `seq`
+    /// (descending). `filter.cursor` selects only rows with
+    /// `seq < cursor`; the page holds at most `filter.effective_limit()`
+    /// rows. The returned `next_cursor` is `Some(seq)` of the oldest row in
+    /// the page when more matching rows exist beyond it, `None` at the end —
+    /// pass it back as `cursor` for the next page.
+    async fn list_audit(
+        &self,
+        filter: &AuditFilter,
+    ) -> Result<(Vec<(u64, AuditEvent)>, Option<u64>), StoreError>;
 }
 
 #[cfg(test)]
@@ -457,6 +476,9 @@ pub mod memory {
         pools: Mutex<HashMap<String, StoredPool>>,
         allocations: Mutex<HashMap<(String, String), AllocationSpec>>,
         usage: Mutex<Vec<UsageSample>>,
+        /// (seq, event) in insertion order; seq is 1-based from `audit_seq`.
+        audit: Mutex<Vec<(u64, AuditEvent)>>,
+        audit_seq: std::sync::atomic::AtomicU64,
     }
 
     impl InMemoryStore {
@@ -741,6 +763,37 @@ pub mod memory {
             out.sort_by_key(|s| s.ts);
             Ok(out)
         }
+
+        async fn record_audit(&self, event: &AuditEvent) -> Result<u64, StoreError> {
+            let seq = self.audit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            self.audit.lock().unwrap().push((seq, event.clone()));
+            Ok(seq)
+        }
+
+        async fn list_audit(
+            &self,
+            filter: &AuditFilter,
+        ) -> Result<(Vec<(u64, AuditEvent)>, Option<u64>), StoreError> {
+            let limit = filter.effective_limit() as usize;
+            let mut rows: Vec<(u64, AuditEvent)> = self
+                .audit
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(seq, e)| filter.cursor.is_none_or(|c| *seq < c) && filter.matches(e))
+                .cloned()
+                .collect();
+            // Newest first; insertion order is ascending seq.
+            rows.reverse();
+            // Fetch one row beyond the page to know whether more exist.
+            let next_cursor = if rows.len() > limit {
+                rows.truncate(limit);
+                rows.last().map(|(seq, _)| *seq)
+            } else {
+                None
+            };
+            Ok((rows, next_cursor))
+        }
     }
 }
 
@@ -925,6 +978,17 @@ pub(crate) mod testkit {
         ) -> Result<Vec<UsageSample>, StoreError> {
             self.check("usage_samples")?;
             self.inner.usage_samples(project, pool, from, to).await
+        }
+        async fn record_audit(&self, event: &AuditEvent) -> Result<u64, StoreError> {
+            self.check("record_audit")?;
+            self.inner.record_audit(event).await
+        }
+        async fn list_audit(
+            &self,
+            filter: &AuditFilter,
+        ) -> Result<(Vec<(u64, AuditEvent)>, Option<u64>), StoreError> {
+            self.check("list_audit")?;
+            self.inner.list_audit(filter).await
         }
     }
 }

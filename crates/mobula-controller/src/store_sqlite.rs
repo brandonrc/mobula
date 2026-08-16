@@ -5,9 +5,12 @@
 //! Postgres (the SQL is standard); a Postgres impl reuses this shape.
 
 use async_trait::async_trait;
-use mobula_core::{AllocationSpec, ClusterId, ClusterSpec, ClusterState, DriftCondition, PoolSpec};
+use mobula_core::{
+    AllocationSpec, AuditDecision, AuditEvent, AuditFilter, AuditRequired, ClusterId, ClusterSpec,
+    ClusterState, DriftCondition, PoolSpec,
+};
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use mobula_core::JobRecord;
 
@@ -94,6 +97,27 @@ CREATE TABLE IF NOT EXISTS usage_samples (
     source   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_samples_project_ts ON usage_samples (project, ts);
+-- Persisted audit trail (api-v1.md §5.9): append-only. `seq` is the
+-- pagination cursor (rows are read newest-first). Filter-facing fields are
+-- plain columns; `required_json` keeps the spec's JSON-text convention.
+-- Postgres port: `INTEGER PRIMARY KEY AUTOINCREMENT` becomes an identity
+-- column; the SELECT/INSERT statements below are standard SQL.
+CREATE TABLE IF NOT EXISTS audit_events (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            INTEGER NOT NULL,
+    subject       TEXT,
+    decision      TEXT NOT NULL,
+    reason        TEXT,
+    action        TEXT,
+    cluster       TEXT,
+    method        TEXT,
+    path          TEXT,
+    status        INTEGER,
+    latency_ms    INTEGER,
+    required_json TEXT,
+    granted_roles TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS audit_events_ts ON audit_events (ts);
 "#;
 
 /// Additive column migrations for databases created by an older schema (#39
@@ -737,6 +761,135 @@ impl Store for SqliteStore {
                 })
             })
             .collect()
+    }
+
+    async fn record_audit(&self, event: &AuditEvent) -> Result<u64, StoreError> {
+        let required_json = match &event.required {
+            Some(r) => Some(serde_json::to_string(r).map_err(json_err)?),
+            None => None,
+        };
+        let granted_roles = serde_json::to_string(&event.granted_roles).map_err(json_err)?;
+        // RETURNING is standard SQL (SQLite 3.35+, Postgres) — one round
+        // trip, no last_insert_rowid() coupling to the connection.
+        let row = sqlx::query(
+            "INSERT INTO audit_events \
+             (ts, subject, decision, reason, action, cluster, method, path, \
+              status, latency_ms, required_json, granted_roles) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+        )
+        .bind(event.ts.min(i64::MAX as u64) as i64)
+        .bind(&event.subject)
+        .bind(event.decision.as_str())
+        .bind(&event.reason)
+        .bind(&event.action)
+        .bind(&event.cluster)
+        .bind(&event.method)
+        .bind(&event.path)
+        .bind(event.status.map(|s| s as i64))
+        .bind(event.latency_ms.map(|l| l.min(i64::MAX as u64) as i64))
+        .bind(required_json)
+        .bind(granted_roles)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get::<i64, _>("seq")? as u64)
+    }
+
+    async fn list_audit(
+        &self,
+        filter: &AuditFilter,
+    ) -> Result<(Vec<(u64, AuditEvent)>, Option<u64>), StoreError> {
+        // One condition per filter field, ANDed — must stay behaviourally
+        // identical to `AuditFilter::matches` (the conformance suite runs
+        // the same scenarios against both). `WHERE 1=1` keeps the
+        // conditional appends uniform; `substr(path, 1, length(?)) = ?`
+        // instead of LIKE so a prefix containing `%`/`_` can't go wildcard.
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT seq, ts, subject, decision, reason, action, cluster, method, path, \
+             status, latency_ms, required_json, granted_roles FROM audit_events WHERE 1=1",
+        );
+        if let Some(cursor) = filter.cursor {
+            qb.push(" AND seq < ")
+                .push_bind(cursor.min(i64::MAX as u64) as i64);
+        }
+        if let Some(from) = filter.from {
+            qb.push(" AND ts >= ")
+                .push_bind(from.min(i64::MAX as u64) as i64);
+        }
+        if let Some(to) = filter.to {
+            qb.push(" AND ts <= ")
+                .push_bind(to.min(i64::MAX as u64) as i64);
+        }
+        if let Some(subject) = &filter.subject {
+            qb.push(" AND subject = ").push_bind(subject);
+        }
+        if let Some(cluster) = &filter.cluster {
+            qb.push(" AND cluster = ").push_bind(cluster);
+        }
+        if let Some(method) = &filter.method {
+            qb.push(" AND method = ").push_bind(method);
+        }
+        if let Some(prefix) = &filter.path_prefix {
+            // `push_bind` appends the placeholder itself; never write `?`.
+            qb.push(" AND substr(path, 1, length(")
+                .push_bind(prefix)
+                .push(")) = ")
+                .push_bind(prefix);
+        }
+        if let Some(min) = filter.min_status {
+            // NULL status rows are excluded: NULL >= n is never true.
+            qb.push(" AND status >= ").push_bind(min as i64);
+        }
+        if let Some(decision) = filter.decision {
+            qb.push(" AND decision = ").push_bind(decision.as_str());
+        }
+        if let Some(reason) = &filter.reason {
+            qb.push(" AND reason = ").push_bind(reason);
+        }
+        // One row beyond the page tells us whether a next page exists.
+        qb.push(" ORDER BY seq DESC LIMIT ")
+            .push_bind(filter.effective_limit() as i64 + 1);
+        let rows = qb.build().fetch_all(&self.pool).await?;
+
+        let limit = filter.effective_limit() as usize;
+        let mut out: Vec<(u64, AuditEvent)> = rows
+            .into_iter()
+            .map(|row| {
+                let required = match row.try_get::<Option<String>, _>("required_json")? {
+                    Some(s) => Some(serde_json::from_str::<AuditRequired>(&s).map_err(json_err)?),
+                    None => None,
+                };
+                let granted_roles = serde_json::from_str::<Vec<String>>(
+                    &row.try_get::<String, _>("granted_roles")?,
+                )
+                .map_err(json_err)?;
+                let decision = AuditDecision::parse(&row.try_get::<String, _>("decision")?)
+                    .ok_or_else(|| StoreError::Backend("bad audit decision".to_string()))?;
+                let event = AuditEvent {
+                    ts: row.try_get::<i64, _>("ts")? as u64,
+                    subject: row.try_get::<Option<String>, _>("subject")?,
+                    decision,
+                    reason: row.try_get::<Option<String>, _>("reason")?,
+                    action: row.try_get::<Option<String>, _>("action")?,
+                    cluster: row.try_get::<Option<String>, _>("cluster")?,
+                    method: row.try_get::<Option<String>, _>("method")?,
+                    path: row.try_get::<Option<String>, _>("path")?,
+                    status: row.try_get::<Option<i64>, _>("status")?.map(|s| s as u16),
+                    latency_ms: row
+                        .try_get::<Option<i64>, _>("latency_ms")?
+                        .map(|l| l as u64),
+                    required,
+                    granted_roles,
+                };
+                Ok::<_, StoreError>((row.try_get::<i64, _>("seq")? as u64, event))
+            })
+            .collect::<Result<_, _>>()?;
+        let next_cursor = if out.len() > limit {
+            out.truncate(limit);
+            out.last().map(|(seq, _)| *seq)
+        } else {
+            None
+        };
+        Ok((out, next_cursor))
     }
 }
 

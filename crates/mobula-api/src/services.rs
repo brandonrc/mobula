@@ -77,7 +77,14 @@ async fn list_services(
     State(st): State<ServiceApiState>,
     identity: Option<Extension<Identity>>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Service) {
+    if let Some(deny) = authorize(
+        None,
+        ident(&identity),
+        PermissionType::Read,
+        Target::Service,
+    )
+    .await
+    {
         return deny;
     }
     match st.provisioner.list().await {
@@ -102,7 +109,14 @@ async fn get_service(
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Service) {
+    if let Some(deny) = authorize(
+        None,
+        ident(&identity),
+        PermissionType::Read,
+        Target::Service,
+    )
+    .await
+    {
         return deny;
     }
     match st.provisioner.get(&name).await {
@@ -126,7 +140,14 @@ async fn deploy_service(
     identity: Option<Extension<Identity>>,
     Json(body): Json<DeployService>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Write, Target::Service) {
+    if let Some(deny) = authorize(
+        None,
+        ident(&identity),
+        PermissionType::Write,
+        Target::Service,
+    )
+    .await
+    {
         return deny;
     }
     match st.provisioner.deploy(&body.name, &body.spec).await {
@@ -157,7 +178,14 @@ async fn delete_service(
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Write, Target::Service) {
+    if let Some(deny) = authorize(
+        None,
+        ident(&identity),
+        PermissionType::Write,
+        Target::Service,
+    )
+    .await
+    {
         return deny;
     }
     match st.provisioner.delete(&name).await {

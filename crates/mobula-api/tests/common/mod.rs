@@ -402,4 +402,19 @@ impl mobula_controller::Store for FailingStore {
         self.check("usage_samples")?;
         self.inner.usage_samples(project, pool, from, to).await
     }
+    async fn record_audit(
+        &self,
+        event: &mobula_core::AuditEvent,
+    ) -> Result<u64, mobula_controller::StoreError> {
+        self.check("record_audit")?;
+        self.inner.record_audit(event).await
+    }
+    async fn list_audit(
+        &self,
+        filter: &mobula_core::AuditFilter,
+    ) -> Result<(Vec<(u64, mobula_core::AuditEvent)>, Option<u64>), mobula_controller::StoreError>
+    {
+        self.check("list_audit")?;
+        self.inner.list_audit(filter).await
+    }
 }

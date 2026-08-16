@@ -485,6 +485,177 @@ async fn sqlite_store_usage_conforms() {
     usage_conformance(&store).await;
 }
 
+/// Audit-trail conformance (api-v1.md §5.9), run against BOTH impls.
+async fn audit_conformance(store: &dyn Store) {
+    use mobula_core::{AuditDecision, AuditEvent, AuditFilter, AuditRequired};
+    let event =
+        |ts: u64, subject: Option<&str>, decision: AuditDecision, status: Option<u16>| AuditEvent {
+            ts,
+            subject: subject.map(String::from),
+            decision,
+            status,
+            ..Default::default()
+        };
+    let filter = |f: &mut AuditFilter| std::mem::take(f);
+
+    // Append: seq is 1-based and monotonic; rows round-trip intact.
+    let s1 = store
+        .record_audit(&AuditEvent {
+            ts: 100,
+            subject: Some("alice".into()),
+            decision: AuditDecision::Deny,
+            reason: Some("insufficient_permission".into()),
+            action: Some("create_cluster".into()),
+            cluster: Some("demo".into()),
+            method: Some("POST".into()),
+            path: Some("/api/v1/clusters".into()),
+            status: Some(403),
+            latency_ms: Some(4),
+            required: Some(AuditRequired {
+                action: "write".into(),
+                target: "cluster".into(),
+            }),
+            granted_roles: vec!["viewer".into()],
+        })
+        .await
+        .unwrap();
+    let s2 = store
+        .record_audit(&event(200, Some("bob"), AuditDecision::Allow, Some(200)))
+        .await
+        .unwrap();
+    // Authn failure: no subject/status — nulls round-trip, never invented.
+    let s3 = store
+        .record_audit(&AuditEvent {
+            ts: 300,
+            decision: AuditDecision::Deny,
+            reason: Some("missing_token".into()),
+            path: Some("/api/v1/clusters".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!([s1, s2, s3], [1, 2, 3]);
+
+    // Full read: newest-first by seq, no next page.
+    let (rows, next) = store.list_audit(&AuditFilter::default()).await.unwrap();
+    assert_eq!(rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [3, 2, 1]);
+    assert_eq!(next, None);
+    let full = &rows[2].1;
+    assert_eq!(full.subject.as_deref(), Some("alice"));
+    assert_eq!(full.decision, AuditDecision::Deny);
+    assert_eq!(
+        full.required,
+        Some(AuditRequired {
+            action: "write".into(),
+            target: "cluster".into()
+        })
+    );
+    assert_eq!(full.granted_roles, ["viewer"]);
+    assert_eq!(full.latency_ms, Some(4));
+    // Null-absent fields stay null-absent.
+    assert!(rows[0].1.subject.is_none());
+    assert!(rows[0].1.status.is_none());
+    assert!(rows[0].1.granted_roles.is_empty());
+
+    // Filters: from/to inclusive, subject, min_status, decision.
+    let (rows, _) = store
+        .list_audit(&filter(&mut AuditFilter {
+            from: Some(200),
+            to: Some(200),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.ts, 200);
+
+    let (rows, _) = store
+        .list_audit(&filter(&mut AuditFilter {
+            subject: Some("alice".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 1);
+
+    // min_status excludes rows with no status at all (NULL semantics).
+    let (rows, _) = store
+        .list_audit(&filter(&mut AuditFilter {
+            min_status: Some(400),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 1);
+
+    let (rows, _) = store
+        .list_audit(&filter(&mut AuditFilter {
+            decision: Some(AuditDecision::Deny),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [3, 1]);
+
+    let (rows, _) = store
+        .list_audit(&filter(&mut AuditFilter {
+            cluster: Some("demo".into()),
+            method: Some("POST".into()),
+            path_prefix: Some("/api/v1".into()),
+            reason: Some("insufficient_permission".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 1);
+
+    // Limit + cursor round-trip across two pages, no overlap, no gap.
+    let (page1, next) = store
+        .list_audit(&filter(&mut AuditFilter {
+            limit: Some(2),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(page1.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [3, 2]);
+    assert_eq!(next, Some(2));
+    let (page2, next) = store
+        .list_audit(&filter(&mut AuditFilter {
+            limit: Some(2),
+            cursor: next,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(page2.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [1]);
+    assert_eq!(next, None);
+
+    // A cursor beyond the oldest row paginates to nothing.
+    let (page, next) = store
+        .list_audit(&filter(&mut AuditFilter {
+            cursor: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert!(page.is_empty());
+    assert_eq!(next, None);
+}
+
+#[tokio::test]
+async fn in_memory_store_audit_conforms() {
+    audit_conformance(&InMemoryStore::new()).await;
+}
+
+#[tokio::test]
+async fn sqlite_store_audit_conforms() {
+    let store = SqliteStore::in_memory().await.unwrap();
+    audit_conformance(&store).await;
+}
+
 #[tokio::test]
 async fn sqlite_store_pool_conforms() {
     let store = SqliteStore::in_memory().await.unwrap();

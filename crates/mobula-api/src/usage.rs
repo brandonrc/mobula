@@ -96,7 +96,14 @@ async fn usage_report(
     Query(q): Query<UsageQuery>,
 ) -> Response {
     // Consumption reporting reads like cluster data, not pool topology.
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Cluster) {
+    if let Some(deny) = authorize(
+        Some(&st.store),
+        ident(&identity),
+        PermissionType::Read,
+        Target::Cluster,
+    )
+    .await
+    {
         return deny;
     }
     let to = q.to.unwrap_or_else(now_unix);
@@ -201,7 +208,14 @@ async fn metrics(
     State(st): State<UsageApiState>,
     identity: Option<Extension<Identity>>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Cluster) {
+    if let Some(deny) = authorize(
+        Some(&st.store),
+        ident(&identity),
+        PermissionType::Read,
+        Target::Cluster,
+    )
+    .await
+    {
         return deny;
     }
     let samples = match st.store.usage_samples(None, None, 0, now_unix()).await {

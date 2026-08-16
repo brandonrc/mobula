@@ -66,11 +66,16 @@ async fn list_registry(
     // (mobula-auth grants matrix), and api-v1.md §2.2 classifies registry
     // surfaces as Admin. Target::Cluster because registry entries describe
     // cluster routing.
+    // No store on this router: the denial is trace-only (gateway-only
+    // deployments persist no audit trail).
     if let Some(deny) = authorize(
+        None,
         identity.as_ref().map(|e| &e.0),
         PermissionType::Admin,
         Target::Cluster,
-    ) {
+    )
+    .await
+    {
         return deny;
     }
     let entries: Vec<RegistryEntryView> = st

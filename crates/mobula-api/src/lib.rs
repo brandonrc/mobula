@@ -4,6 +4,7 @@
 //! admin paths. The Ray Jobs gateway (Phase 1) mounts here as well, one base
 //! path per cluster.
 
+pub mod audit;
 pub mod auth_layer;
 pub mod clusters;
 pub mod gateway;
@@ -55,6 +56,7 @@ use utoipa_swagger_ui::SwaggerUi;
         services::deploy_service,
         services::delete_service,
         registry::list_registry,
+        audit::list_audit_events,
     ),
     components(
         schemas(
@@ -73,6 +75,10 @@ use utoipa_swagger_ui::SwaggerUi;
             services::ServiceView,
             registry::RegistryEntryView,
             registry::RegistryValidation,
+            audit::AuditListResponse,
+            mobula_core::AuditEvent,
+            mobula_core::AuditRequired,
+            mobula_core::AuditDecision,
             mobula_core::ClusterSpec,
             mobula_core::WorkerGroup,
             mobula_core::ClusterState,
@@ -108,6 +114,11 @@ use utoipa_swagger_ui::SwaggerUi;
          (ADR-0002). Admin-only: it is the credential-routing table. Static \
          config today; dynamic registration of managed clusters is a \
          follow-up."),
+        (name = "audit", description = "The persisted audit trail \
+         (api-v1.md §5.9): every authn/authz decision, mutation, and \
+         proxied gateway request, newest-first with seq-cursor pagination \
+         and CSV export. Admin-only — audit subjects are Admin data. \
+         Mounted only when a store is configured."),
     ),
     info(
         title = "Mobula",
@@ -288,11 +299,12 @@ fn build_app_full_svc_inner(
     allow_unauthenticated: bool,
 ) -> Router {
     let registry = Arc::new(registry);
-    let gw = gateway::GatewayState::new(registry.clone());
+    let gw = gateway::GatewayState::new(registry.clone(), store.clone());
     let fail_closed = validator.is_none() && !allow_unauthenticated;
     let auth = auth_layer::AuthState {
         validator,
         registry: registry.clone(),
+        store: store.clone(),
     };
     // Resolve each sub-router's own state before merging (they differ:
     // AuthState vs ClusterApiState), then apply the shared layers to the
@@ -312,7 +324,8 @@ fn build_app_full_svc_inner(
         app = app
             .merge(clusters::router(store.clone(), policy.clone()))
             .merge(pools::router(store.clone()))
-            .merge(usage::router(store, policy));
+            .merge(usage::router(store.clone(), policy))
+            .merge(audit::router(store));
     }
     if let Some(services) = services {
         app = app.merge(services::router(services));
@@ -515,6 +528,10 @@ mod tests {
         // The gateway registry contract (Admin-only read).
         assert!(doc["paths"]["/api/v1/registry/clusters"]["get"].is_object());
         assert!(doc["components"]["schemas"]["RegistryEntryView"].is_object());
+        // The audit trail contract (Admin-only, api-v1.md §5.9).
+        assert!(doc["paths"]["/api/v1/audit"]["get"].is_object());
+        assert!(doc["components"]["schemas"]["AuditEvent"].is_object());
+        assert!(doc["components"]["schemas"]["AuditListResponse"].is_object());
         // Bearer security scheme is advertised for client codegen.
         assert_eq!(
             doc["components"]["securitySchemes"]["bearer"]["scheme"],

@@ -14,14 +14,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use mobula_auth::{Identity, PermissionType, Target};
-use mobula_controller::{DesiredState, Store};
-use mobula_core::{ClusterId, ClusterSpec};
+use mobula_controller::{now_unix, DesiredState, Store};
+use mobula_core::{AuditDecision, AuditEvent, ClusterId, ClusterSpec};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use mobula_policy::{admit, cluster_demand, PriceSheet, ResourceMap};
 use std::collections::HashMap;
 
+use crate::audit::emit;
 use crate::auth_layer::authorize;
 
 /// Governance config for the cluster API (Phase 4): an optional price
@@ -132,7 +133,14 @@ async fn list_clusters(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Cluster) {
+    if let Some(deny) = authorize(
+        Some(&st.store),
+        ident(&identity),
+        PermissionType::Read,
+        Target::Cluster,
+    )
+    .await
+    {
         return deny;
     }
     match st.store.list().await {
@@ -162,7 +170,14 @@ async fn get_cluster(
     identity: Option<Extension<Identity>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Cluster) {
+    if let Some(deny) = authorize(
+        Some(&st.store),
+        ident(&identity),
+        PermissionType::Read,
+        Target::Cluster,
+    )
+    .await
+    {
         return deny;
     }
     match st.store.get(&ClusterId(id)).await {
@@ -190,7 +205,14 @@ async fn create_cluster(
     identity: Option<Extension<Identity>>,
     Json(body): Json<CreateCluster>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Write, Target::Cluster) {
+    if let Some(deny) = authorize(
+        Some(&st.store),
+        ident(&identity),
+        PermissionType::Write,
+        Target::Cluster,
+    )
+    .await
+    {
         return deny;
     }
     let id = ClusterId(body.id);
@@ -247,12 +269,20 @@ async fn create_cluster(
             Err(e) => return store_err(e),
         };
         if let Err(exceeded) = admit(&project, limit, in_use, requested) {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "deny", reason = "quota_exceeded",
-                subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
-                cluster = %id, project = %project, "cluster create denied"
-            );
+            emit(
+                Some(&st.store),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(&identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Deny,
+                    reason: Some("quota_exceeded".into()),
+                    action: Some("create_cluster".into()),
+                    cluster: Some(id.to_string()),
+                    status: Some(StatusCode::CONFLICT.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
             return (StatusCode::CONFLICT, exceeded.to_string()).into_response();
         }
         // Keep the lock held across the upsert below.
@@ -263,13 +293,19 @@ async fn create_cluster(
 
     match st.store.upsert_desired(&id, body.spec).await {
         Ok(generation) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "allow",
-                subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
-                action = "create_cluster", cluster = %id, generation,
-                "cluster upserted"
-            );
+            emit(
+                Some(&st.store),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(&identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Allow,
+                    action: Some("create_cluster".into()),
+                    cluster: Some(id.to_string()),
+                    status: Some(StatusCode::CREATED.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
             // Pool admission (ADR-0010): resolve the project's Kueue queue
             // assignment from the allocations in the store and record it in
             // the audit log. The reconcile loop re-derives the assignment
@@ -279,14 +315,30 @@ async fn create_cluster(
             // from before pools existed.
             match mobula_controller::queue_assignment_for_project(st.store.as_ref(), &project).await
             {
-                Ok(Some(q)) => tracing::info!(
-                    target: "mobula::audit",
-                    decision = "allow",
-                    subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
-                    action = "queue_assign", cluster = %id, project = %project,
-                    queue = %q.queue_name, elastic = q.elastic,
-                    "cluster admitted to pool queue"
-                ),
+                Ok(Some(q)) => {
+                    // The queue name/project aren't AuditEvent fields
+                    // (api-v1.md §5.9); keep them in the trace stream.
+                    tracing::info!(
+                        target: "mobula::audit",
+                        decision = "allow",
+                        subject = ?ident(&identity).map(|i| i.subject.as_str()),
+                        action = "queue_assign", cluster = %id, project = %project,
+                        queue = %q.queue_name, elastic = q.elastic,
+                        "cluster admitted to pool queue"
+                    );
+                    emit(
+                        Some(&st.store),
+                        AuditEvent {
+                            ts: now_unix(),
+                            subject: ident(&identity).map(|i| i.subject.clone()),
+                            decision: AuditDecision::Allow,
+                            action: Some("queue_assign".into()),
+                            cluster: Some(id.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(error = %e, cluster = %id, "queue assignment lookup failed")
@@ -316,20 +368,33 @@ async fn delete_cluster(
     identity: Option<Extension<Identity>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Write, Target::Cluster) {
+    if let Some(deny) = authorize(
+        Some(&st.store),
+        ident(&identity),
+        PermissionType::Write,
+        Target::Cluster,
+    )
+    .await
+    {
         return deny;
     }
     let id = ClusterId(id);
     // Desired = Terminated; the reconciler tears down the backing resources.
     match st.store.set_desired(&id, DesiredState::Terminated).await {
         Ok(()) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "allow",
-                subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
-                action = "delete_cluster", cluster = %id,
-                "cluster marked for termination"
-            );
+            emit(
+                Some(&st.store),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(&identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Allow,
+                    action: Some("delete_cluster".into()),
+                    cluster: Some(id.to_string()),
+                    status: Some(StatusCode::ACCEPTED.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
             StatusCode::ACCEPTED.into_response()
         }
         // Distinguish "not found" from a real store failure (review R3#6):
@@ -379,7 +444,14 @@ async fn list_jobs(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Job) {
+    if let Some(deny) = authorize(
+        Some(&st.store),
+        ident(&identity),
+        PermissionType::Read,
+        Target::Job,
+    )
+    .await
+    {
         return deny;
     }
     match st.store.list_jobs().await {

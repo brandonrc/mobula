@@ -14,7 +14,10 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use mobula_core::{ClusterEndpoint, ClusterRegistry};
+use mobula_controller::{now_unix, Store};
+use mobula_core::{AuditDecision, AuditEvent, ClusterEndpoint, ClusterRegistry};
+
+use crate::audit::emit;
 
 /// Request bodies are buffered before forwarding; job submissions are tiny
 /// and runtime-env package uploads are modest. Bounded (with the
@@ -42,12 +45,16 @@ pub struct GatewayState {
     /// Bounds concurrent proxied requests so buffered bodies can't OOM the
     /// gateway (#30). Shared across HTTP and websocket paths.
     inflight: Arc<tokio::sync::Semaphore>,
+    /// Audit persistence for the per-request trail (api-v1.md §5.9);
+    /// `None` in gateway-only mode — events stay trace-only there.
+    store: Option<Arc<dyn Store>>,
 }
 
 impl GatewayState {
-    pub fn new(registry: Arc<ClusterRegistry>) -> Self {
+    pub fn new(registry: Arc<ClusterRegistry>, store: Option<Arc<dyn Store>>) -> Self {
         Self {
             registry,
+            store,
             inflight: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT)),
             // Reverse-proxy client posture (security issues #3/#5):
             // never follow redirects southbound (SSRF amplifier — 3xx
@@ -83,7 +90,7 @@ pub async fn host_gateway(State(gw): State<GatewayState>, req: Request, next: Ne
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "gateway closing").into_response(),
     };
     if is_websocket_upgrade(req.headers()) {
-        ws::proxy_upgrade(&cluster, req).await
+        ws::proxy_upgrade(gw.store.as_ref(), &cluster, req).await
     } else {
         proxy(&gw, &cluster, req).await.into_response()
     }
@@ -102,11 +109,12 @@ async fn proxy(
     req: Request,
 ) -> Result<Response, GatewayError> {
     let started = std::time::Instant::now();
+    // `None` only in dev-unauthenticated mode; the audit row's subject
+    // stays null there rather than inventing a placeholder.
     let subject = req
         .extensions()
         .get::<mobula_auth::Identity>()
-        .map(|i| i.subject.clone())
-        .unwrap_or_else(|| "-".into());
+        .map(|i| i.subject.clone());
     let (parts, body) = req.into_parts();
 
     let path_and_query = parts
@@ -163,18 +171,25 @@ async fn proxy(
         response_headers.insert(name.clone(), value.clone());
     }
 
-    // Append-only audit trail (issue #8): every proxied request, one
-    // structured line. Subject is "-" only in dev-unauthenticated mode.
-    tracing::info!(
-        target: "mobula::audit",
-        subject = %subject,
-        cluster = %cluster.id,
-        %method,
-        path = %path,
-        status = status.as_u16(),
-        latency_ms = started.elapsed().as_millis() as u64,
-        "gateway request"
-    );
+    // Append-only audit trail (issue #8, api-v1.md §5.9): every proxied
+    // request, one row. Gateway rows are always decision=allow — a request
+    // Mobula refuses never reaches here (auth_layer emits the deny row);
+    // an upstream 4xx/5xx is the cluster's answer and lives in `status`.
+    emit(
+        gw.store.as_ref(),
+        AuditEvent {
+            ts: now_unix(),
+            subject,
+            decision: AuditDecision::Allow,
+            cluster: Some(cluster.id.to_string()),
+            method: Some(method.to_string()),
+            path: Some(path),
+            status: Some(status.as_u16()),
+            latency_ms: Some(started.elapsed().as_millis() as u64),
+            ..Default::default()
+        },
+    )
+    .await;
 
     let mut response = Response::builder()
         .status(status)
@@ -256,16 +271,22 @@ mod ws {
     use axum::http::{header, HeaderValue, StatusCode};
     use axum::response::{IntoResponse, Response};
     use futures::{SinkExt, StreamExt};
-    use mobula_core::ClusterEndpoint;
+    use mobula_controller::{now_unix, Store};
+    use mobula_core::{AuditDecision, AuditEvent, ClusterEndpoint};
+    use std::sync::Arc;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::protocol::Message as TsMessage;
 
-    pub async fn proxy_upgrade(cluster: &ClusterEndpoint, req: Request) -> Response {
+    pub async fn proxy_upgrade(
+        store: Option<&Arc<dyn Store>>,
+        cluster: &ClusterEndpoint,
+        req: Request,
+    ) -> Response {
+        // `None` only in dev-unauthenticated mode (see proxy()).
         let subject = req
             .extensions()
             .get::<mobula_auth::Identity>()
-            .map(|i| i.subject.clone())
-            .unwrap_or_else(|| "-".into());
+            .map(|i| i.subject.clone());
         let (mut parts, _body) = req.into_parts();
 
         let path_and_query = parts
@@ -323,14 +344,21 @@ mod ws {
             Ok(u) => u,
             Err(e) => return e.into_response(),
         };
-        tracing::info!(
-            target: "mobula::audit",
-            subject = %subject,
-            cluster = %cluster.id,
-            method = "WS",
-            path = %parts.uri.path(),
-            "gateway websocket bridge opened"
-        );
+        // The bridge opening is an allowed gateway request (same policy as
+        // HTTP proxy rows); there is no status/latency until it closes.
+        crate::audit::emit(
+            store,
+            AuditEvent {
+                ts: now_unix(),
+                subject,
+                decision: AuditDecision::Allow,
+                cluster: Some(cluster.id.to_string()),
+                method: Some("WS".into()),
+                path: Some(parts.uri.path().to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
         upgrade
             .on_upgrade(move |client| bridge(client, upstream))
             .into_response()

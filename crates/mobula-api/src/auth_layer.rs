@@ -5,6 +5,10 @@
 //! host. Requests addressed to a registered cluster hostname are NEVER
 //! public — the stock Ray client sends `Authorization` on every call
 //! (including `/api/version` negotiation), so the full surface is gated.
+//!
+//! Every refusal (authn failure, authz denial) is an audit event via
+//! [`crate::audit::emit`] — traced on the `mobula::audit` target and
+//! persisted when a store is configured (api-v1.md §5.9).
 
 use std::sync::Arc;
 
@@ -13,12 +17,17 @@ use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use mobula_auth::{Identity, PermissionType, Target, Validator};
-use mobula_core::ClusterRegistry;
+use mobula_controller::{now_unix, Store};
+use mobula_core::{AuditDecision, AuditEvent, AuditRequired, ClusterRegistry};
+
+use crate::audit::{emit, permission_str, role_str, target_str};
 
 #[derive(Clone)]
 pub struct AuthState {
     pub validator: Option<Arc<Validator>>,
     pub registry: Arc<ClusterRegistry>,
+    /// Audit persistence (api-v1.md §5.9); `None` in gateway-only mode.
+    pub store: Option<Arc<dyn Store>>,
 }
 
 /// Paths that stay public on the control-plane host (never on cluster
@@ -53,7 +62,8 @@ fn required_permission(method: &Method) -> PermissionType {
 /// but only Read on `Cluster`, and an Operator is the reverse. These prefixes
 /// MUST stay in sync with the router prefixes in `clusters.rs`
 /// (`/api/v1/clusters`), `services.rs` (`/api/v1/services`), `pools.rs`
-/// (`/api/v1/pools`), and `registry.rs` (`/api/v1/registry`).
+/// (`/api/v1/pools`), `registry.rs` (`/api/v1/registry`), and `audit.rs`
+/// (`/api/v1/audit`).
 ///
 /// Matching is on segment boundaries — an exact match or a `<prefix>/…`
 /// child — so `/api/v1/clusters-evil` is NOT a cluster path and falls through
@@ -67,9 +77,10 @@ fn target_for_path(path: &str) -> Target {
         Target::Service
     } else if is_under("/api/v1/pools") {
         Target::Pool
-    } else if is_under("/api/v1/registry") {
-        // Registry entries describe cluster routing; the route handler itself
-        // enforces Admin — this mapping is for the ext_authz verb check.
+    } else if is_under("/api/v1/registry") || is_under("/api/v1/audit") {
+        // Registry entries describe cluster routing and the audit trail is
+        // dominated by cluster decisions; both route handlers enforce Admin
+        // themselves — this mapping is for the ext_authz verb check.
         Target::Cluster
     } else {
         Target::Job
@@ -100,25 +111,44 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
         return next.run(req).await;
     }
 
+    let method = req.method().clone();
     let path = req.uri().path().to_string();
     let Some(token) = bearer(&req) else {
         // Audit 401s at INFO so credential-stuffing / token-guessing is
-        // visible in the audit stream, not just debug logs (#23).
-        tracing::info!(
-            target: "mobula::audit",
-            decision = "deny", reason = "missing_token",
-            path = %path, "authentication failed"
-        );
+        // visible in the audit stream, not just debug logs (#23). Authn
+        // failures have no identity, so the row's subject is null.
+        emit(
+            st.store.as_ref(),
+            AuditEvent {
+                ts: now_unix(),
+                decision: AuditDecision::Deny,
+                reason: Some("missing_token".into()),
+                method: Some(method.to_string()),
+                path: Some(path),
+                status: Some(StatusCode::UNAUTHORIZED.as_u16()),
+                ..Default::default()
+            },
+        )
+        .await;
         return unauthorized("missing bearer token");
     };
     let identity = match validator.validate(token).await {
         Ok(i) => i,
         Err(e) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "deny", reason = "invalid_token",
-                error = %e, path = %path, "authentication failed"
-            );
+            tracing::debug!(error = %e, "token validation failed");
+            emit(
+                st.store.as_ref(),
+                AuditEvent {
+                    ts: now_unix(),
+                    decision: AuditDecision::Deny,
+                    reason: Some("invalid_token".into()),
+                    method: Some(method.to_string()),
+                    path: Some(path),
+                    status: Some(StatusCode::UNAUTHORIZED.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
             return unauthorized("invalid token");
         }
     };
@@ -132,12 +162,25 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
         // Target::Job is correct here: cluster-host traffic is the proxied
         // Ray job surface, guarded by host_is_cluster above.
         if !identity.permits(required, Target::Job) {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "deny", reason = "insufficient_permission",
-                subject = %identity.subject, required = ?required, target = "job",
-                granted = ?identity.roles, "authorization denied"
-            );
+            emit(
+                st.store.as_ref(),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: Some(identity.subject.clone()),
+                    decision: AuditDecision::Deny,
+                    reason: Some("insufficient_permission".into()),
+                    method: Some(method.to_string()),
+                    path: Some(path),
+                    status: Some(StatusCode::FORBIDDEN.as_u16()),
+                    required: Some(AuditRequired {
+                        action: permission_str(required),
+                        target: "job".into(),
+                    }),
+                    granted_roles: identity.roles.iter().map(role_str).collect(),
+                    ..Default::default()
+                },
+            )
+            .await;
             return (StatusCode::FORBIDDEN, "insufficient permission").into_response();
         }
     }
@@ -150,7 +193,13 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
 /// access is refused, `None` when permitted. `identity` is `None` only in
 /// dev/no-auth mode (guarded by `--dev-allow-unauthenticated`), where all
 /// access is permitted; otherwise deny-by-default against (action, target).
-pub fn authorize(
+///
+/// A denial is also an audit event (api-v1.md §5.9) carrying the
+/// required/granted permission detail, persisted when `store` is `Some` —
+/// handlers pass their store state; store-less routers (registry, services)
+/// pass `None` and the denial is trace-only.
+pub async fn authorize(
+    store: Option<&Arc<dyn Store>>,
     identity: Option<&Identity>,
     action: PermissionType,
     target: Target,
@@ -159,12 +208,23 @@ pub fn authorize(
         None => None,
         Some(id) if id.permits(action, target) => None,
         Some(id) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "deny", reason = "insufficient_permission",
-                subject = %id.subject, required = ?action, target = ?target,
-                granted = ?id.roles, "authorization denied"
-            );
+            emit(
+                store,
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: Some(id.subject.clone()),
+                    decision: AuditDecision::Deny,
+                    reason: Some("insufficient_permission".into()),
+                    status: Some(StatusCode::FORBIDDEN.as_u16()),
+                    required: Some(AuditRequired {
+                        action: permission_str(action),
+                        target: target_str(target),
+                    }),
+                    granted_roles: id.roles.iter().map(role_str).collect(),
+                    ..Default::default()
+                },
+            )
+            .await;
             Some((StatusCode::FORBIDDEN, "insufficient permission").into_response())
         }
     }
@@ -200,32 +260,57 @@ pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response 
         .unwrap_or_else(|| req.uri().path().to_string());
 
     let Some(token) = bearer(&req) else {
-        tracing::info!(
-            target: "mobula::audit",
-            decision = "deny", reason = "missing_token",
-            path = %path, "ext_authz"
-        );
+        emit(
+            st.store.as_ref(),
+            AuditEvent {
+                ts: now_unix(),
+                decision: AuditDecision::Deny,
+                reason: Some("missing_token".into()),
+                method: Some(method.to_string()),
+                path: Some(path),
+                status: Some(StatusCode::UNAUTHORIZED.as_u16()),
+                ..Default::default()
+            },
+        )
+        .await;
         return unauthorized("missing bearer token");
     };
     let identity: Identity = match validator.validate(token).await {
         Ok(i) => i,
         Err(e) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "deny", reason = "invalid_token",
-                error = %e, path = %path, "ext_authz"
-            );
+            tracing::debug!(error = %e, "token validation failed");
+            emit(
+                st.store.as_ref(),
+                AuditEvent {
+                    ts: now_unix(),
+                    decision: AuditDecision::Deny,
+                    reason: Some("invalid_token".into()),
+                    method: Some(method.to_string()),
+                    path: Some(path),
+                    status: Some(StatusCode::UNAUTHORIZED.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
             return unauthorized("invalid token");
         }
     };
     let required = required_permission(&method);
     let target = target_for_path(&path);
     if identity.permits(required, target) {
-        tracing::info!(
-            target: "mobula::audit",
-            decision = "allow", subject = %identity.subject,
-            target = ?target, %method, path = %path, "ext_authz"
-        );
+        emit(
+            st.store.as_ref(),
+            AuditEvent {
+                ts: now_unix(),
+                subject: Some(identity.subject.clone()),
+                decision: AuditDecision::Allow,
+                method: Some(method.to_string()),
+                path: Some(path),
+                status: Some(StatusCode::OK.as_u16()),
+                ..Default::default()
+            },
+        )
+        .await;
         (
             StatusCode::OK,
             [("x-mobula-subject", identity.subject.clone())],
@@ -233,12 +318,25 @@ pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response 
         )
             .into_response()
     } else {
-        tracing::info!(
-            target: "mobula::audit",
-            decision = "deny", reason = "insufficient_permission",
-            subject = %identity.subject, required = ?required, target = ?target,
-            granted = ?identity.roles, %method, path = %path, "ext_authz"
-        );
+        emit(
+            st.store.as_ref(),
+            AuditEvent {
+                ts: now_unix(),
+                subject: Some(identity.subject.clone()),
+                decision: AuditDecision::Deny,
+                reason: Some("insufficient_permission".into()),
+                method: Some(method.to_string()),
+                path: Some(path),
+                status: Some(StatusCode::FORBIDDEN.as_u16()),
+                required: Some(AuditRequired {
+                    action: permission_str(required),
+                    target: target_str(target),
+                }),
+                granted_roles: identity.roles.iter().map(role_str).collect(),
+                ..Default::default()
+            },
+        )
+        .await;
         (StatusCode::FORBIDDEN, "insufficient permission").into_response()
     }
 }
@@ -291,6 +389,7 @@ mod tests {
             target_for_path("/api/v1/pools/gpu/allocations/p"),
             Target::Pool
         );
+        assert_eq!(target_for_path("/api/v1/audit"), Target::Cluster);
         assert_eq!(target_for_path("/api/jobs/"), Target::Job);
         // Segment boundary, not naive prefix: `clusters-evil` is not clusters.
         assert_eq!(target_for_path("/api/v1/clusters-evil"), Target::Job);

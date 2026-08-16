@@ -19,12 +19,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use mobula_auth::{Identity, PermissionType, Target};
-use mobula_controller::{Store, StoreError, StoredPool};
-use mobula_core::{AllocationSpec, FlavorSpec, PoolSpec};
+use mobula_controller::{now_unix, Store, StoreError, StoredPool};
+use mobula_core::{AllocationSpec, AuditDecision, AuditEvent, FlavorSpec, PoolSpec};
 use mobula_provision::PoolObservation;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::audit::emit;
 use crate::auth_layer::authorize;
 
 fn ident(ext: &Option<Extension<Identity>>) -> Option<&Identity> {
@@ -146,7 +147,14 @@ async fn list_pools(
     State(st): State<Arc<dyn Store>>,
     identity: Option<Extension<Identity>>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Pool) {
+    if let Some(deny) = authorize(
+        Some(&st),
+        ident(&identity),
+        PermissionType::Read,
+        Target::Pool,
+    )
+    .await
+    {
         return deny;
     }
     match st.list_pools().await {
@@ -178,7 +186,14 @@ async fn create_pool(
     identity: Option<Extension<Identity>>,
     Json(body): Json<CreatePool>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Write, Target::Pool) {
+    if let Some(deny) = authorize(
+        Some(&st),
+        ident(&identity),
+        PermissionType::Write,
+        Target::Pool,
+    )
+    .await
+    {
         return deny;
     }
     if let Err(e) = body.spec.validate() {
@@ -198,13 +213,20 @@ async fn create_pool(
     }
     match st.upsert_pool(&name, body.spec).await {
         Ok(generation) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "allow",
-                subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
-                action = "create_pool", pool = %name, generation,
-                "pool created"
-            );
+            // The pool name isn't an AuditEvent field (api-v1.md §5.9);
+            // the action string carries the pool scope.
+            emit(
+                Some(&st),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(&identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Allow,
+                    action: Some("create_pool".into()),
+                    status: Some(StatusCode::CREATED.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "name": name, "generation": generation })),
@@ -229,7 +251,14 @@ async fn get_pool(
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Pool) {
+    if let Some(deny) = authorize(
+        Some(&st),
+        ident(&identity),
+        PermissionType::Read,
+        Target::Pool,
+    )
+    .await
+    {
         return deny;
     }
     match st.get_pool(&name).await {
@@ -253,18 +282,30 @@ async fn delete_pool(
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Delete, Target::Pool) {
+    if let Some(deny) = authorize(
+        Some(&st),
+        ident(&identity),
+        PermissionType::Delete,
+        Target::Pool,
+    )
+    .await
+    {
         return deny;
     }
     match st.delete_pool(&name).await {
         Ok(()) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "allow",
-                subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
-                action = "delete_pool", pool = %name,
-                "pool deleted"
-            );
+            emit(
+                Some(&st),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(&identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Allow,
+                    action: Some("delete_pool".into()),
+                    status: Some(StatusCode::ACCEPTED.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
             StatusCode::ACCEPTED.into_response()
         }
         // Mirror delete_cluster: the store distinguishes "not found" from a
@@ -298,7 +339,14 @@ async fn put_allocation(
     Path((name, project)): Path<(String, String)>,
     Json(body): Json<PutAllocation>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Write, Target::Pool) {
+    if let Some(deny) = authorize(
+        Some(&st),
+        ident(&identity),
+        PermissionType::Write,
+        Target::Pool,
+    )
+    .await
+    {
         return deny;
     }
     // Path params win; a contradicting body is a client error.
@@ -329,13 +377,18 @@ async fn put_allocation(
     }
     match st.upsert_allocation(alloc).await {
         Ok(()) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "allow",
-                subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
-                action = "put_allocation", pool = %name, project = %project,
-                "allocation upserted"
-            );
+            emit(
+                Some(&st),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(&identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Allow,
+                    action: Some("put_allocation".into()),
+                    status: Some(StatusCode::OK.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
             Json(serde_json::json!({ "pool": name, "project": project })).into_response()
         }
         Err(e) => store_err(e),
@@ -355,7 +408,14 @@ async fn list_allocations(
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Pool) {
+    if let Some(deny) = authorize(
+        Some(&st),
+        ident(&identity),
+        PermissionType::Read,
+        Target::Pool,
+    )
+    .await
+    {
         return deny;
     }
     match st.list_allocations(&name).await {
@@ -381,18 +441,30 @@ async fn delete_allocation(
     identity: Option<Extension<Identity>>,
     Path((name, project)): Path<(String, String)>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Delete, Target::Pool) {
+    if let Some(deny) = authorize(
+        Some(&st),
+        ident(&identity),
+        PermissionType::Delete,
+        Target::Pool,
+    )
+    .await
+    {
         return deny;
     }
     match st.delete_allocation(&name, &project).await {
         Ok(()) => {
-            tracing::info!(
-                target: "mobula::audit",
-                decision = "allow",
-                subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
-                action = "delete_allocation", pool = %name, project = %project,
-                "allocation deleted"
-            );
+            emit(
+                Some(&st),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(&identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Allow,
+                    action: Some("delete_allocation".into()),
+                    status: Some(StatusCode::ACCEPTED.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
             StatusCode::ACCEPTED.into_response()
         }
         Err(StoreError::Backend(m)) if m.contains("no such allocation") => {
@@ -463,7 +535,14 @@ async fn pool_usage(
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Pool) {
+    if let Some(deny) = authorize(
+        Some(&st),
+        ident(&identity),
+        PermissionType::Read,
+        Target::Pool,
+    )
+    .await
+    {
         return deny;
     }
     let p = match st.get_pool(&name).await {

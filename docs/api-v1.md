@@ -659,15 +659,37 @@ the wildcard the validator already warns about.
 
 ### 5.9 Audit — `GET /api/v1/audit`
 
-Audit viewer (ui-ux-spec §5.7). **New; Milestone B.** JSONL audit target
-today (`mobula::audit` tracing target), Postgres-backed with filtering in
-Phase 3.
+Audit viewer (ui-ux-spec §5.7). **Implemented** (2026-08-16, Milestone B):
+events persist to the store (`audit_events` table; SQLite now, the SQL is
+Postgres-portable) AND keep flowing to the `mobula::audit` tracing target,
+so the `--audit-log` JSONL export is unchanged. Every audit-emitting site —
+gateway per-request rows, authn failures, authz denials, cluster/pool
+mutations — goes through `mobula_api::audit::emit`. The route mounts only
+when a store is configured (gateway-only deployments stay trace-only).
 
 - **Auth:** Admin.
-- **Query:** `limit`, `cursor`; filters `from`, `to` (unix seconds),
-  `subject`, `cluster`, `method`, `path_prefix`, `min_status`,
-  `decision` (`allow|deny`), `reason`. `?format=csv` exports.
-- **Response 200:** `{ "items": [AuditEvent], "next_cursor": "…" }`
+- **Query:** `limit` (default 100, max 1000), `cursor`; filters `from`,
+  `to` (unix seconds, inclusive), `subject`, `cluster`, `method`,
+  `path_prefix`, `min_status`, `decision` (`allow|deny`), `reason`.
+  `?format=csv` exports the page as `text/csv` with a header row (RFC 4180
+  quoting; `granted_roles` joins with `;`). `from > to`, an unknown
+  `decision`/`format`, or a mistyped number is a 400.
+- **Response 200:** `{ "items": [AuditEvent], "next_cursor": 41 }` — this
+  endpoint is the ONE list route that wraps items in an envelope, because
+  the cursor has to live somewhere.
+- **Pagination:** rows are newest-first by an autoincrement `seq`;
+  `cursor` means "only rows with `seq` strictly before this value";
+  `next_cursor` is the oldest returned row's `seq` when more rows exist,
+  `null` at the end. Pass it back as `cursor` for the next (older) page.
+- **Decision policy:** `deny` rows are emitted at the point of refusal
+  (authn failures, authz denials, quota denials). Gateway per-request rows
+  are always `allow` — a request Mobula refuses never reaches the gateway,
+  and an upstream 4xx/5xx is the cluster's answer to an allowed request,
+  carried in `status`.
+- **Missing context is `null`, never invented** (§2.1): authn failures
+  have no `subject`; gateway rows have no `action`/`reason`; handler rows
+  (mutations, `authorize` denials) carry `action`/`cluster` instead of
+  `method`/`path`; `required`/`granted_roles` appear on authz denials only.
 
 ```json
 // AuditEvent — superset of the fields already emitted to mobula::audit
