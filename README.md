@@ -26,6 +26,17 @@ curl localhost:8484/healthz
 curl localhost:8484/api/v1/version
 ```
 
+For the **full local stack** — a kind cluster with the KubeRay operator, the
+control plane, and the dashboard, so you can create real RayClusters and watch
+them reconcile — use the dev-stack script (see [docs/dev-stack.md](docs/dev-stack.md)):
+
+```bash
+./scripts/dev-stack.sh up       # kind + KubeRay operator + namespace
+./scripts/dev-stack.sh serve    # control plane against that cluster
+./scripts/dev-stack.sh ui       # dashboard (separate terminal)
+./scripts/dev-stack.sh smoke    # verify the API end-to-end
+```
+
 To front a Ray cluster with the job gateway, give `serve` a registry:
 
 ```toml
