@@ -10,7 +10,9 @@ use axum::http::{header, Request, StatusCode};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-use mobula_controller::{DesiredState, InMemoryStore, Store, StoreError, StoredCluster};
+use mobula_controller::{
+    DesiredState, InMemoryStore, IntentOutcome, IntentRecord, Store, StoreError, StoredCluster,
+};
 use mobula_core::{ClusterId, ClusterSpec, ClusterState};
 
 /// Store decorator that widens the quota check->write window: `list()` reads
@@ -52,8 +54,21 @@ impl Store for SlowListStore {
             .record_observation(id, observed, observed_generation)
             .await
     }
-    async fn record_intent(&self, key: &str) -> Result<bool, StoreError> {
-        self.inner.record_intent(key).await
+    async fn begin_intent(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<IntentOutcome, StoreError> {
+        self.inner.begin_intent(key, fingerprint).await
+    }
+    async fn complete_intent(&self, key: &str, response_json: &str) -> Result<(), StoreError> {
+        self.inner.complete_intent(key, response_json).await
+    }
+    async fn get_intent(&self, key: &str) -> Result<Option<IntentRecord>, StoreError> {
+        self.inner.get_intent(key).await
+    }
+    async fn reap_intents(&self, applied_before: u64) -> Result<u64, StoreError> {
+        self.inner.reap_intents(applied_before).await
     }
 }
 
