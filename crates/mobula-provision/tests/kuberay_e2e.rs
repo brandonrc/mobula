@@ -44,9 +44,11 @@ async fn provisions_observes_and_terminates() {
         .expect("connect to cluster");
     let id = ClusterId("e2e-demo".into());
 
-    // Idempotent apply.
-    prov.apply(&id, &tiny_spec(), "e2e/1").await.expect("apply");
-    prov.apply(&id, &tiny_spec(), "e2e/1")
+    // Idempotent apply (generation 1).
+    prov.apply(&id, &tiny_spec(), 1, "e2e/1")
+        .await
+        .expect("apply");
+    prov.apply(&id, &tiny_spec(), 1, "e2e/1")
         .await
         .expect("second apply is idempotent");
 
@@ -70,6 +72,13 @@ async fn provisions_observes_and_terminates() {
             .unwrap()
             .contains("e2e-demo-head-svc"));
         if state == ClusterState::Running {
+            // #40: the generation Mobula stamped must round-trip back through
+            // observe() from the CR annotation.
+            assert_eq!(
+                obs.observed_generation,
+                Some(1),
+                "observed generation must be read back from the applied CR"
+            );
             last = state;
             break;
         }

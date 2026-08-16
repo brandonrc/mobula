@@ -6,15 +6,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use mobula_controller::{Action, DesiredState, InMemoryStore, Reconciler, SqliteStore, Store};
+use mobula_controller::{
+    Action, DesiredState, InMemoryStore, ReconcileError, Reconciler, SqliteStore, Store,
+};
 use mobula_core::{ClusterId, ClusterSpec, ClusterState, WorkerGroup};
-use mobula_provision::{ObservedCluster, ProvisionError, Provisioner};
+use mobula_provision::{ApplyResponse, ObservedCluster, ProvisionError, Provisioner};
 
 #[derive(Default)]
 struct MockProvisioner {
     /// Observed state per cluster (None entry = provisioned-but-unknown;
     /// absent = NotFound).
     state: Mutex<HashMap<String, ClusterState>>,
+    /// Generation each cluster currently carries — the value `observe`
+    /// reads back (#40). Set by `apply`, unchanged by `set_state` so a
+    /// drift (state flip) keeps the applied generation.
+    gen: Mutex<HashMap<String, u64>>,
     apply_keys: Mutex<Vec<String>>,
     terminate_calls: Mutex<Vec<String>>,
 }
@@ -39,15 +45,20 @@ impl Provisioner for MockProvisioner {
         &self,
         id: &ClusterId,
         _spec: &ClusterSpec,
+        generation: u64,
         idempotency_key: &str,
-    ) -> Result<(), ProvisionError> {
+    ) -> Result<ApplyResponse, ProvisionError> {
         self.apply_keys.lock().unwrap().push(idempotency_key.into());
-        // Applying makes it Running.
+        // Applying makes it Running at the applied generation.
         self.state
             .lock()
             .unwrap()
             .insert(id.0.clone(), ClusterState::Running);
-        Ok(())
+        self.gen.lock().unwrap().insert(id.0.clone(), generation);
+        Ok(ApplyResponse {
+            generation,
+            api_base_url: Some(format!("http://{}-head:8265", id.0)),
+        })
     }
 
     async fn terminate(&self, id: &ClusterId) -> Result<(), ProvisionError> {
@@ -64,6 +75,7 @@ impl Provisioner for MockProvisioner {
             Some(state) => Ok(ObservedCluster {
                 id: id.clone(),
                 state: *state,
+                observed_generation: self.gen.lock().unwrap().get(&id.0).copied(),
                 api_base_url: Some(format!("http://{}-head:8265", id.0)),
             }),
             None => Err(ProvisionError::NotFound(id.clone())),
@@ -71,6 +83,7 @@ impl Provisioner for MockProvisioner {
     }
 
     async fn list(&self) -> Result<Vec<ObservedCluster>, ProvisionError> {
+        let gens = self.gen.lock().unwrap();
         Ok(self
             .state
             .lock()
@@ -79,6 +92,7 @@ impl Provisioner for MockProvisioner {
             .map(|(k, v)| ObservedCluster {
                 id: ClusterId(k.clone()),
                 state: *v,
+                observed_generation: gens.get(k).copied(),
                 api_base_url: None,
             })
             .collect())
@@ -273,6 +287,114 @@ async fn run_loop_converges_then_stops_on_shutdown() {
         .await
         .expect("loop should stop promptly on shutdown")
         .unwrap();
+}
+
+/// A provisioner that always *observes* generation 1 no matter what
+/// generation was applied — modelling a cluster whose pods have not yet
+/// rolled to a newer spec. Used to prove the engine records the observed
+/// (read-back) generation, never the desired one (#40).
+#[derive(Default)]
+struct LaggingProvisioner {
+    applies: Mutex<usize>,
+}
+
+#[async_trait]
+impl Provisioner for LaggingProvisioner {
+    async fn apply(
+        &self,
+        _id: &ClusterId,
+        _spec: &ClusterSpec,
+        generation: u64,
+        _key: &str,
+    ) -> Result<mobula_provision::ApplyResponse, ProvisionError> {
+        *self.applies.lock().unwrap() += 1;
+        Ok(mobula_provision::ApplyResponse {
+            generation,
+            api_base_url: None,
+        })
+    }
+    async fn terminate(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
+        Ok(())
+    }
+    async fn observe(&self, id: &ClusterId) -> Result<ObservedCluster, ProvisionError> {
+        // Running, but forever stuck reporting generation 1.
+        Ok(ObservedCluster {
+            id: id.clone(),
+            state: ClusterState::Running,
+            observed_generation: Some(1),
+            api_base_url: None,
+        })
+    }
+    async fn list(&self) -> Result<Vec<ObservedCluster>, ProvisionError> {
+        Ok(vec![])
+    }
+}
+
+#[tokio::test]
+async fn observed_generation_is_read_back_not_self_certified() {
+    // #40: after a spec bump to generation 2, the cluster still reports
+    // generation 1 (pods not rolled). The engine must record the OBSERVED
+    // generation (1), not self-certify the desired one (2), and therefore
+    // must keep applying until the cluster actually catches up.
+    let store = Arc::new(InMemoryStore::new());
+    let prov = Arc::new(LaggingProvisioner::default());
+    let rec = Reconciler::new(store.clone(), prov.clone());
+    let id = ClusterId("demo".into());
+
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap(); // gen 1
+    rec.reconcile_all().await;
+    // Bump the spec → desired generation 2.
+    assert_eq!(store.upsert_desired(&id, spec("demo", 3)).await.unwrap(), 2);
+    rec.reconcile_all().await;
+
+    let stored = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.generation, 2, "desired advanced");
+    assert_eq!(
+        stored.observed_generation, 1,
+        "observed generation is read back from the cluster, not the desired gen"
+    );
+
+    // Because observed (1) < desired (2), convergence is NOT declared and the
+    // next pass applies again — the opposite of self-certifying a no-op.
+    let before = *prov.applies.lock().unwrap();
+    rec.reconcile_all().await;
+    assert_eq!(
+        *prov.applies.lock().unwrap(),
+        before + 1,
+        "must keep applying until the observed generation catches up"
+    );
+}
+
+#[tokio::test]
+async fn conflicting_intent_fingerprint_is_rejected() {
+    // #39: an outbox key reused with a different spec fingerprint (e.g. a DB
+    // restore that reused generation 1 for a different spec) must be refused,
+    // and the provider must not be actuated.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap(); // gen 1 → key demo/1
+
+    // Pre-seed the outbox for demo/1 with a conflicting fingerprint.
+    let outcome = store
+        .begin_intent("demo/1", "a-different-fingerprint")
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        mobula_controller::IntentOutcome::Proceed { replay: false }
+    );
+
+    let r = rec.reconcile_all().await;
+    assert!(
+        matches!(r[0].1, Err(ReconcileError::StaleIntent(_))),
+        "a conflicting-fingerprint intent must be rejected, got {:?}",
+        r[0].1
+    );
+    assert_eq!(
+        prov.apply_count(),
+        0,
+        "must not actuate under a conflicting intent"
+    );
 }
 
 #[tokio::test]

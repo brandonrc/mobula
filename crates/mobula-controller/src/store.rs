@@ -78,6 +78,54 @@ pub(crate) fn spec_changed(a: &ClusterSpec, b: &ClusterSpec) -> bool {
         })
 }
 
+/// A canonical fingerprint of the actuation-relevant spec, used by the
+/// outbox to detect a *conflicting* re-use of an intent key (ADR-0007:
+/// stale-generation writes must be rejected). Two specs that produce the
+/// same generation must produce the same fingerprint; a `{id}/{generation}`
+/// key that reappears with a different fingerprint is a restore/rollback
+/// anomaly. `ClusterSpec`'s fields are all actuation-relevant, so its JSON
+/// serialization is a stable fingerprint.
+pub(crate) fn params_fingerprint(spec: &ClusterSpec) -> String {
+    serde_json::to_string(spec).unwrap_or_default()
+}
+
+/// Lifecycle of an outbox intent (ADR-0007). A `Pending` row left behind by
+/// a crash between `begin_intent` and `complete_intent` tells recovery the
+/// previous apply may not have finished; `Applied` means it committed and a
+/// response was stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentStatus {
+    Pending,
+    Applied,
+}
+
+/// A persisted outbox row: what we were about to actuate (`key`), the spec
+/// fingerprint we actuated, the completion status, and the stored provider
+/// response (opaque JSON so the store stays decoupled from provider types).
+#[derive(Debug, Clone)]
+pub struct IntentRecord {
+    pub key: String,
+    pub params_fingerprint: String,
+    pub status: IntentStatus,
+    pub response_json: Option<String>,
+    pub created_at: u64,
+    pub completed_at: Option<u64>,
+}
+
+/// Result of opening an intent before actuating (ADR-0007 fence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntentOutcome {
+    /// Safe to actuate. `replay` is true when a matching-params row already
+    /// existed (a crash-recovery or drift re-apply of the *same* desired
+    /// state) — the caller still applies, because the provider call is
+    /// idempotent per key and drift repair depends on re-applying.
+    Proceed { replay: bool },
+    /// The key already exists with a *different* fingerprint: a stale or
+    /// conflicting generation write (e.g. a DB restore reusing a generation
+    /// number for a different spec). The caller must refuse to actuate.
+    ParamMismatch,
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     /// Create or update desired spec. Returns the (possibly bumped)
@@ -98,23 +146,37 @@ pub trait Store: Send + Sync {
         observed_generation: u64,
     ) -> Result<(), StoreError>;
 
-    /// Transactional outbox / fence (ADR-0007): record that we are about to
-    /// actuate `key`. Returns true if newly recorded, false if it was
-    /// already present — the provisioner call is still idempotent either
-    /// way, but this gives crash-recovery a record of in-flight intents.
-    async fn record_intent(&self, key: &str) -> Result<bool, StoreError>;
+    /// Transactional outbox (ADR-0007): open an intent to actuate `key` with
+    /// the given spec `fingerprint`, committing a `Pending` row *before* the
+    /// provider call. Returns [`IntentOutcome::Proceed`] when the caller
+    /// should actuate (fresh, or a same-params re-apply), or
+    /// [`IntentOutcome::ParamMismatch`] when the key already exists with a
+    /// different fingerprint (reject — stale/conflicting generation).
+    async fn begin_intent(&self, key: &str, fingerprint: &str)
+        -> Result<IntentOutcome, StoreError>;
+
+    /// Mark an opened intent `Applied` and store the provider `response_json`
+    /// (opaque). Called after a successful provider actuation.
+    async fn complete_intent(&self, key: &str, response_json: &str) -> Result<(), StoreError>;
+
+    /// Read an outbox row (crash-recovery / audit / tests).
+    async fn get_intent(&self, key: &str) -> Result<Option<IntentRecord>, StoreError>;
+
+    /// Bound outbox growth: delete `Applied` rows whose `completed_at` is
+    /// older than `applied_before`. Returns how many were removed.
+    async fn reap_intents(&self, applied_before: u64) -> Result<u64, StoreError>;
 }
 
 pub mod memory {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     /// In-memory `Store` for tests and single-node dev.
     #[derive(Default)]
     pub struct InMemoryStore {
         clusters: Mutex<HashMap<String, StoredCluster>>,
-        intents: Mutex<HashSet<String>>,
+        intents: Mutex<HashMap<String, IntentRecord>>,
     }
 
     impl InMemoryStore {
@@ -187,8 +249,55 @@ pub mod memory {
             Ok(())
         }
 
-        async fn record_intent(&self, key: &str) -> Result<bool, StoreError> {
-            Ok(self.intents.lock().unwrap().insert(key.to_string()))
+        async fn begin_intent(
+            &self,
+            key: &str,
+            fingerprint: &str,
+        ) -> Result<IntentOutcome, StoreError> {
+            let mut map = self.intents.lock().unwrap();
+            match map.get(key) {
+                Some(existing) if existing.params_fingerprint != fingerprint => {
+                    Ok(IntentOutcome::ParamMismatch)
+                }
+                Some(_) => Ok(IntentOutcome::Proceed { replay: true }),
+                None => {
+                    map.insert(
+                        key.to_string(),
+                        IntentRecord {
+                            key: key.to_string(),
+                            params_fingerprint: fingerprint.to_string(),
+                            status: IntentStatus::Pending,
+                            response_json: None,
+                            created_at: now_unix(),
+                            completed_at: None,
+                        },
+                    );
+                    Ok(IntentOutcome::Proceed { replay: false })
+                }
+            }
+        }
+
+        async fn complete_intent(&self, key: &str, response_json: &str) -> Result<(), StoreError> {
+            if let Some(rec) = self.intents.lock().unwrap().get_mut(key) {
+                rec.status = IntentStatus::Applied;
+                rec.response_json = Some(response_json.to_string());
+                rec.completed_at = Some(now_unix());
+            }
+            Ok(())
+        }
+
+        async fn get_intent(&self, key: &str) -> Result<Option<IntentRecord>, StoreError> {
+            Ok(self.intents.lock().unwrap().get(key).cloned())
+        }
+
+        async fn reap_intents(&self, applied_before: u64) -> Result<u64, StoreError> {
+            let mut map = self.intents.lock().unwrap();
+            let before = map.len();
+            map.retain(|_, r| {
+                !(r.status == IntentStatus::Applied
+                    && r.completed_at.is_some_and(|c| c < applied_before))
+            });
+            Ok((before - map.len()) as u64)
         }
     }
 }

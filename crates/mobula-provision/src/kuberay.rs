@@ -21,14 +21,26 @@ pub const KIND: &str = "RayCluster";
 pub const FIELD_MANAGER: &str = "mobula";
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 pub const CLUSTER_ID_LABEL: &str = "mobula.dev/cluster-id";
+/// Annotation carrying the Mobula spec generation this resource reflects
+/// (ADR-0006, #40). Stamped on the RayCluster metadata (so `observe` can
+/// read back the generation the cluster actually carries) *and* on the pod
+/// templates (so a generation bump changes the pod-template hash and KubeRay
+/// rolls the pods — the roll drives `.status.state` away from ready until it
+/// completes, making convergence observed rather than self-certified).
+pub const GENERATION_ANNOTATION: &str = "mobula.dev/generation";
 
-/// Build the RayCluster manifest for `spec`. `autoscaling` selects the
-/// field-ownership regime (ADR-0007).
-pub fn to_raycluster(id: &ClusterId, spec: &ClusterSpec, autoscaling: bool) -> Value {
+/// Build the RayCluster manifest for `spec` at `generation`. `autoscaling`
+/// selects the field-ownership regime (ADR-0007).
+pub fn to_raycluster(
+    id: &ClusterId,
+    spec: &ClusterSpec,
+    autoscaling: bool,
+    generation: u64,
+) -> Value {
     let worker_specs: Vec<Value> = spec
         .worker_groups
         .iter()
-        .map(|g| worker_group_spec(g, &spec.image, autoscaling))
+        .map(|g| worker_group_spec(g, &spec.image, autoscaling, Some(generation)))
         .collect();
 
     json!({
@@ -40,17 +52,20 @@ pub fn to_raycluster(id: &ClusterId, spec: &ClusterSpec, autoscaling: bool) -> V
                 MANAGED_BY_LABEL: FIELD_MANAGER,
                 CLUSTER_ID_LABEL: id.0,
             },
+            "annotations": {
+                GENERATION_ANNOTATION: generation.to_string(),
+            },
         },
         "spec": {
             "rayVersion": spec.ray_version,
             "enableInTreeAutoscaling": autoscaling,
-            "headGroupSpec": head_group_spec(spec),
+            "headGroupSpec": head_group_spec(spec, Some(generation)),
             "workerGroupSpecs": worker_specs,
         },
     })
 }
 
-fn head_group_spec(spec: &ClusterSpec) -> Value {
+fn head_group_spec(spec: &ClusterSpec, generation: Option<u64>) -> Value {
     json!({
         "rayStartParams": { "dashboard-host": "0.0.0.0" },
         "template": pod_template(
@@ -59,11 +74,17 @@ fn head_group_spec(spec: &ClusterSpec) -> Value {
             &spec.head_cpu,
             &spec.head_memory,
             None,
+            generation,
         ),
     })
 }
 
-fn worker_group_spec(g: &WorkerGroup, image: &str, autoscaling: bool) -> Value {
+fn worker_group_spec(
+    g: &WorkerGroup,
+    image: &str,
+    autoscaling: bool,
+    generation: Option<u64>,
+) -> Value {
     // Workers run the cluster image (Kubernetes requires an image on every
     // container; KubeRay does NOT copy the head image onto worker groups,
     // so an empty image would be rejected — review R2#1).
@@ -72,7 +93,7 @@ fn worker_group_spec(g: &WorkerGroup, image: &str, autoscaling: bool) -> Value {
         "minReplicas": g.min_replicas,
         "maxReplicas": g.max_replicas,
         "rayStartParams": {},
-        "template": pod_template("ray-worker", image, &g.cpu, &g.memory, g.gpu.as_deref()),
+        "template": pod_template("ray-worker", image, &g.cpu, &g.memory, g.gpu.as_deref(), generation),
     });
     // ADR-0007: only set `replicas` when we own it (autoscaling off). With
     // the in-tree autoscaler on, the sidecar owns replicas + scaleStrategy;
@@ -89,6 +110,7 @@ fn pod_template(
     cpu: &str,
     memory: &str,
     gpu: Option<&str>,
+    generation: Option<u64>,
 ) -> Value {
     let mut limits = json!({ "cpu": cpu, "memory": memory });
     let mut requests = json!({ "cpu": cpu, "memory": memory });
@@ -105,7 +127,16 @@ fn pod_template(
     if !image.is_empty() {
         container["image"] = json!(image);
     }
-    json!({ "spec": { "containers": [container] } })
+    let mut template = json!({ "spec": { "containers": [container] } });
+    // Stamp the generation into the pod template so a spec bump changes the
+    // template hash and KubeRay rolls the pods (#40). Services pass None —
+    // KubeRay's RayService controller owns their rollout, not Mobula.
+    if let Some(gen) = generation {
+        template["metadata"] = json!({
+            "annotations": { GENERATION_ANNOTATION: gen.to_string() },
+        });
+    }
+    template
 }
 
 pub const SERVICE_KIND: &str = "RayService";
@@ -144,11 +175,11 @@ pub fn to_rayservice(name: &str, spec: &ServiceSpec) -> Value {
                 "rayVersion": spec.ray_version,
                 "headGroupSpec": {
                     "rayStartParams": { "dashboard-host": "0.0.0.0" },
-                    "template": pod_template("ray-head", &spec.image, &spec.head_cpu, &spec.head_memory, None),
+                    "template": pod_template("ray-head", &spec.image, &spec.head_cpu, &spec.head_memory, None, None),
                 },
                 // Serve worker replicas are fixed here; Serve autoscaling is
                 // Ray Serve's own concern (deployment num_replicas).
-                "workerGroupSpecs": [worker_group_spec(&worker, &spec.image, false)],
+                "workerGroupSpecs": [worker_group_spec(&worker, &spec.image, false, None)],
             },
         },
     })
@@ -261,7 +292,12 @@ mod tests {
 
     #[test]
     fn manifest_shape_and_labels() {
-        let m = to_raycluster(&ClusterId("demo".into()), &spec(&[("cpu", 0, 4, 2)]), false);
+        let m = to_raycluster(
+            &ClusterId("demo".into()),
+            &spec(&[("cpu", 0, 4, 2)]),
+            false,
+            1,
+        );
         assert_eq!(m["apiVersion"], "ray.io/v1");
         assert_eq!(m["kind"], "RayCluster");
         assert_eq!(m["metadata"]["name"], "demo");
@@ -276,7 +312,12 @@ mod tests {
 
     #[test]
     fn autoscaling_off_sets_replicas() {
-        let m = to_raycluster(&ClusterId("demo".into()), &spec(&[("cpu", 0, 4, 2)]), false);
+        let m = to_raycluster(
+            &ClusterId("demo".into()),
+            &spec(&[("cpu", 0, 4, 2)]),
+            false,
+            1,
+        );
         let wg = &m["spec"]["workerGroupSpecs"][0];
         assert_eq!(m["spec"]["enableInTreeAutoscaling"], false);
         assert_eq!(wg["replicas"], 2);
@@ -292,7 +333,12 @@ mod tests {
 
     #[test]
     fn autoscaling_on_omits_replicas_adr_0007() {
-        let m = to_raycluster(&ClusterId("demo".into()), &spec(&[("cpu", 1, 8, 3)]), true);
+        let m = to_raycluster(
+            &ClusterId("demo".into()),
+            &spec(&[("cpu", 1, 8, 3)]),
+            true,
+            1,
+        );
         let wg = &m["spec"]["workerGroupSpecs"][0];
         assert_eq!(m["spec"]["enableInTreeAutoscaling"], true);
         // The autoscaler sidecar owns replicas — Mobula must not write it.
@@ -313,7 +359,7 @@ mod tests {
     fn gpu_workers_get_resource_limits() {
         let mut s = spec(&[("gpu", 0, 2, 1)]);
         s.worker_groups[0].gpu = Some("1".into());
-        let m = to_raycluster(&ClusterId("demo".into()), &s, false);
+        let m = to_raycluster(&ClusterId("demo".into()), &s, false, 1);
         let res =
             &m["spec"]["workerGroupSpecs"][0]["template"]["spec"]["containers"][0]["resources"];
         assert_eq!(res["limits"]["nvidia.com/gpu"], "1");

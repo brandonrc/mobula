@@ -2,7 +2,9 @@
 //! implementations, so the sqlx-backed store is proven behaviourally
 //! identical to the reference impl.
 
-use mobula_controller::{DesiredState, InMemoryStore, SqliteStore, Store};
+use mobula_controller::{
+    DesiredState, InMemoryStore, IntentOutcome, IntentStatus, SqliteStore, Store,
+};
 use mobula_core::{ClusterId, ClusterSpec, ClusterState, WorkerGroup};
 
 fn spec(name: &str, replicas: u32) -> ClusterSpec {
@@ -64,10 +66,36 @@ async fn conformance(store: &dyn Store) {
     // list.
     assert_eq!(store.list().await.unwrap().len(), 1);
 
-    // Intent outbox: first claim true, repeat false (stable key dedup).
-    assert!(store.record_intent("demo/2").await.unwrap());
-    assert!(!store.record_intent("demo/2").await.unwrap());
-    assert!(store.record_intent("demo/3").await.unwrap());
+    // Transactional outbox (ADR-0007, #39): a fresh key proceeds; a
+    // same-fingerprint re-open proceeds as a replay (drift/crash re-apply);
+    // a different fingerprint for the same key is a stale/conflicting
+    // generation and is rejected.
+    assert_eq!(
+        store.begin_intent("demo/2", "fp-a").await.unwrap(),
+        IntentOutcome::Proceed { replay: false }
+    );
+    assert_eq!(
+        store.begin_intent("demo/2", "fp-a").await.unwrap(),
+        IntentOutcome::Proceed { replay: true }
+    );
+    assert_eq!(
+        store.begin_intent("demo/2", "fp-b").await.unwrap(),
+        IntentOutcome::ParamMismatch
+    );
+    // Completing stores the provider response and flips status → Applied.
+    store
+        .complete_intent("demo/2", "{\"generation\":2}")
+        .await
+        .unwrap();
+    let rec = store.get_intent("demo/2").await.unwrap().unwrap();
+    assert_eq!(rec.status, IntentStatus::Applied);
+    assert_eq!(rec.response_json.as_deref(), Some("{\"generation\":2}"));
+    assert_eq!(rec.params_fingerprint, "fp-a");
+    // Reap only removes Applied rows older than the cutoff. completed_at is
+    // ~now, so a cutoff of 0 removes nothing; a far-future cutoff removes it.
+    assert_eq!(store.reap_intents(0).await.unwrap(), 0);
+    assert_eq!(store.reap_intents(32_503_680_000).await.unwrap(), 1);
+    assert!(store.get_intent("demo/2").await.unwrap().is_none());
 
     // set_desired on a missing cluster errors.
     assert!(store
@@ -85,6 +113,39 @@ async fn in_memory_store_conforms() {
 async fn sqlite_store_conforms() {
     let store = SqliteStore::in_memory().await.unwrap();
     conformance(&store).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_distinct_upserts_do_not_collapse_generation() {
+    // #42: two concurrent upserts of DIFFERENT specs on the same id must
+    // produce two distinct generation bumps (1 → 3), not collapse into one
+    // (or throw SQLITE_BUSY). A file-backed pool with the default
+    // (multi-connection) options lets the two upserts run on separate
+    // connections; `in_memory()` pins max_connections=1 and so can't race.
+    let dir = std::env::temp_dir().join(format!("mobula-upsert-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("race.db");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let store = std::sync::Arc::new(SqliteStore::connect(&url).await.unwrap());
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap(); // gen 1
+
+    let (s1, s2) = (store.clone(), store.clone());
+    let (i1, i2) = (id.clone(), id.clone());
+    let a = tokio::spawn(async move { s1.upsert_desired(&i1, spec("demo", 2)).await });
+    let b = tokio::spawn(async move { s2.upsert_desired(&i2, spec("demo", 5)).await });
+    a.await.unwrap().unwrap();
+    b.await.unwrap().unwrap();
+
+    // Both changed the spec; BEGIN IMMEDIATE serializes them so each sees the
+    // other's committed bump. Under the old DEFERRED tx both read gen=1 and
+    // wrote gen=2 (collapsed) or the second threw SQLITE_BUSY.
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().generation,
+        3,
+        "two distinct concurrent spec changes must yield two generation bumps"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]

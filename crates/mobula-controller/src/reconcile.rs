@@ -13,7 +13,15 @@ use std::time::Duration;
 use mobula_core::ClusterState;
 use mobula_provision::{ProvisionError, Provisioner};
 
-use crate::store::{now_unix, DesiredState, Store, StoreError, StoredCluster};
+use crate::store::{
+    now_unix, params_fingerprint, DesiredState, IntentOutcome, Store, StoreError, StoredCluster,
+};
+
+/// How long an `Applied` outbox row is retained before the run loop reaps it
+/// (ADR-0007, #39). Kept well beyond a few resync intervals so crash
+/// recovery can still inspect recent intents, but bounded so the table can't
+/// grow one row per (cluster, generation) forever.
+const INTENT_RETENTION_SECS: u64 = 3600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -21,6 +29,11 @@ pub enum ReconcileError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Provision(#[from] ProvisionError),
+    /// The outbox already holds this idempotency key with a *different* spec
+    /// fingerprint — a stale or conflicting generation write (ADR-0007). We
+    /// refuse to actuate rather than apply the wrong spec under an old key.
+    #[error("stale/conflicting intent for key {0}: spec fingerprint mismatch")]
+    StaleIntent(String),
 }
 
 /// Per-cluster outcome of a reconcile pass, for logging/metrics/tests.
@@ -62,29 +75,53 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
     async fn reconcile_one(&self, c: &StoredCluster) -> Result<Action, ReconcileError> {
         // 1. Observe: reconstruct actual state (ADR-0006). A NotFound means
         //    nothing is provisioned yet — model that as no observed state.
+        //    `observed_generation` is the generation the cluster actually
+        //    carries (read back), never the desired one (#40).
         let observed = match self.provisioner.observe(&c.id).await {
-            Ok(o) => Some(o.state),
+            Ok(o) => Some(o),
             Err(ProvisionError::NotFound(_)) => None,
             Err(e) => return Err(e.into()),
         };
+        let observed_state = observed.as_ref().map(|o| o.state);
+        let observed_gen = observed
+            .as_ref()
+            .and_then(|o| o.observed_generation)
+            .unwrap_or(0);
 
         // 2. Decide and actuate against *observed* reality.
         let action = match c.desired {
             DesiredState::Running => {
-                if needs_apply(observed, c.generation, c.observed_generation) {
-                    // Fence + outbox: record the intent before the call
-                    // (ADR-0007). The provisioner call is idempotent per key
-                    // regardless, so a duplicate intent is harmless.
+                if needs_apply(observed_state, observed_gen, c.generation) {
+                    // Transactional outbox (ADR-0007, #39): open the intent —
+                    // committing a pending row — before the provider call.
+                    // A same-params re-open (`replay`) still actuates because
+                    // the call is idempotent per key and drift repair depends
+                    // on re-applying; a *different*-params re-use is rejected.
                     let key = c.intent_key();
-                    self.store.record_intent(&key).await?;
-                    self.provisioner.apply(&c.id, &c.spec, &key).await?;
-                    Action::Applied
+                    let fp = params_fingerprint(&c.spec);
+                    match self.store.begin_intent(&key, &fp).await? {
+                        IntentOutcome::ParamMismatch => {
+                            return Err(ReconcileError::StaleIntent(key));
+                        }
+                        IntentOutcome::Proceed { replay } => {
+                            let resp = self
+                                .provisioner
+                                .apply(&c.id, &c.spec, c.generation, &key)
+                                .await?;
+                            let resp_json = serde_json::to_string(&resp).unwrap_or_default();
+                            self.store.complete_intent(&key, &resp_json).await?;
+                            if replay {
+                                tracing::debug!(cluster = %c.id, key, "re-applied existing intent (drift/replay)");
+                            }
+                            Action::Applied
+                        }
+                    }
                 } else {
                     Action::NoOp
                 }
             }
             DesiredState::Terminated => {
-                if observed.is_some_and(|s| s != ClusterState::Terminated) {
+                if observed_state.is_some_and(|s| s != ClusterState::Terminated) {
                     self.provisioner.terminate(&c.id).await?;
                     Action::Terminated
                 } else {
@@ -94,14 +131,15 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
         };
 
         // 3. Re-observe and persist status reconstructed from reality, not
-        //    from what we intended (ADR-0006).
-        let final_state = match self.provisioner.observe(&c.id).await {
-            Ok(o) => Some(o.state),
-            Err(ProvisionError::NotFound(_)) => None,
+        //    from what we intended (ADR-0006). Record the generation the
+        //    cluster reports, so convergence is observed, not self-certified.
+        let (final_state, final_gen) = match self.provisioner.observe(&c.id).await {
+            Ok(o) => (Some(o.state), o.observed_generation.unwrap_or(0)),
+            Err(ProvisionError::NotFound(_)) => (None, 0),
             Err(e) => return Err(e.into()),
         };
         self.store
-            .record_observation(&c.id, final_state, c.generation)
+            .record_observation(&c.id, final_state, final_gen)
             .await?;
 
         Ok(action)
@@ -148,6 +186,14 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                     if let Err(e) = self.reap_expired(now_unix()).await {
                         tracing::warn!(error = %e, "reap pass failed");
                     }
+                    // Bound outbox growth (ADR-0007, #39): drop Applied
+                    // intents older than the retention window.
+                    let cutoff = now_unix().saturating_sub(INTENT_RETENTION_SECS);
+                    match self.store.reap_intents(cutoff).await {
+                        Ok(n) if n > 0 => tracing::debug!(reaped = n, "outbox intents reaped"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "intent reap pass failed"),
+                    }
                     for (id, res) in self.reconcile_all().await {
                         if let Err(e) = res {
                             tracing::warn!(cluster = %id, error = %e, "reconcile failed");
@@ -173,13 +219,21 @@ fn is_expired(c: &StoredCluster, now: u64) -> bool {
 }
 
 /// Apply is needed when nothing is provisioned, when the backing cluster is
-/// gone/terminated but we still want it, or when the desired generation is
-/// ahead of what we last reconciled (spec changed).
-fn needs_apply(observed: Option<ClusterState>, generation: u64, observed_generation: u64) -> bool {
+/// gone/terminated but we still want it, or when the generation the cluster
+/// actually carries (`observed_generation`, read back — #40) is behind the
+/// desired one (spec changed and the cluster hasn't picked it up yet).
+/// Re-applying an in-flight roll (same generation, still Provisioning) is
+/// *not* needed: the cluster already carries the desired generation, so we
+/// wait and re-observe rather than churn the provider.
+fn needs_apply(
+    observed: Option<ClusterState>,
+    observed_generation: u64,
+    desired_generation: u64,
+) -> bool {
     match observed {
         None => true,
         Some(ClusterState::Terminated) | Some(ClusterState::Terminating) => true,
-        Some(_) => generation > observed_generation,
+        Some(_) => observed_generation < desired_generation,
     }
 }
 
@@ -237,13 +291,17 @@ mod tests {
 
     #[test]
     fn needs_apply_matrix() {
+        // Args are (observed_state, observed_generation, desired_generation).
         // Nothing provisioned yet.
-        assert!(needs_apply(None, 1, 0));
+        assert!(needs_apply(None, 0, 1));
         // Gone but wanted.
         assert!(needs_apply(Some(ClusterState::Terminated), 1, 1));
-        // Spec changed (generation ahead).
-        assert!(needs_apply(Some(ClusterState::Running), 2, 1));
-        // Steady state, up to date.
+        // Cluster carries an older generation than desired (spec changed,
+        // not yet picked up).
+        assert!(needs_apply(Some(ClusterState::Running), 1, 2));
+        // Steady state, cluster carries the desired generation.
         assert!(!needs_apply(Some(ClusterState::Running), 1, 1));
+        // Mid-roll at the desired generation → wait, don't re-apply/churn.
+        assert!(!needs_apply(Some(ClusterState::Provisioning), 2, 2));
     }
 }
