@@ -60,6 +60,13 @@ enum Command {
         /// Reconcile resync interval, seconds (with --kuberay-namespace).
         #[arg(long, default_value = "30")]
         reconcile_interval_secs: u64,
+        /// DEMO: mount the full cluster/service API backed by an in-memory
+        /// mock provisioner instead of KubeRay — no Kubernetes required.
+        /// For local testing / docker compose / dashboard development only;
+        /// nothing is actually provisioned. Ignored if --kuberay-namespace
+        /// is set.
+        #[arg(long)]
+        demo: bool,
     },
     /// Sign in via the OIDC device-code flow and store the token.
     Login {
@@ -112,6 +119,7 @@ async fn main() -> std::io::Result<()> {
             kuberay_namespace,
             db,
             reconcile_interval_secs,
+            demo,
         } => {
             let validator = match auth_config {
                 Some(path) => {
@@ -214,6 +222,29 @@ async fn main() -> std::io::Result<()> {
                                 .await;
                         });
                         tracing::info!(namespace = %ns, "cluster lifecycle controller + services enabled");
+                        Some(concrete)
+                    }
+                    // DEMO: full cluster/service API on an in-memory mock
+                    // provisioner — no Kubernetes (local testing / compose).
+                    None if demo => {
+                        let concrete = std::sync::Arc::new(mobula_controller::InMemoryStore::new());
+                        let provisioner =
+                            std::sync::Arc::new(mobula_provision::DemoProvisioner::new());
+                        service_provisioner = Some(provisioner.clone());
+                        let reconciler =
+                            mobula_controller::Reconciler::new(concrete.clone(), provisioner);
+                        // Snappy tick so created clusters show Running quickly.
+                        let interval = std::time::Duration::from_secs(2);
+                        tokio::spawn(async move {
+                            reconciler
+                                .run(interval, async {
+                                    let _ = tokio::signal::ctrl_c().await;
+                                })
+                                .await;
+                        });
+                        tracing::warn!(
+                            "DEMO mode: in-memory mock provisioner — nothing is actually provisioned"
+                        );
                         Some(concrete)
                     }
                     None => None,

@@ -5,9 +5,11 @@
 //! idempotency key so an HA failover mid-provision cannot double-provision
 //! (PLAN.md, review finding A4).
 
+pub mod demo;
 pub mod kuberay;
 #[cfg(feature = "kuberay")]
 pub mod kuberay_client;
+pub use demo::DemoProvisioner;
 #[cfg(feature = "kuberay")]
 pub use kuberay_client::KubeRayProvisioner;
 
