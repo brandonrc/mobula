@@ -60,7 +60,8 @@ is greenfield. Where the proposal changes existing behavior, §8 calls it out.
 
 The code's model (ADR-0009, `mobula-auth/src/lib.rs`) is **permission-sets**,
 not an ordinal rank: `PermissionType {Read, Write, Delete, Admin}` ×
-`Target {Job, Cluster}`, four built-in roles. Enforcement is flat in v0 (a
+`Target {Job, Cluster, Service, Pool}`, four built-in roles. Enforcement is
+flat in v0 (a
 role applies globally); cluster/project-scoped bindings land with the Phase 3
 `role_assignments` tables without changing the wire contract.
 
@@ -71,7 +72,12 @@ Effective v1 matrix (from `Role::grants`):
 | Any `GET` on cluster/registry/audit data | `Read` on the route's target | Viewer and above |
 | Cluster lifecycle mutations (create, patch, suspend, resume, terminate) | `Write`/`Delete` on `Target::Cluster` | Operator, Admin |
 | Job-surface mutations (submit, stop, delete via proxy) | `Write` on `Target::Job` | Developer, Admin |
+| Pool topology reads (`GET /api/v1/pools…`) | `Read` on `Target::Pool` | Viewer and above |
+| Pool/allocation mutations (`POST`/`DELETE /api/v1/pools…`) | `Write`/`Delete` on `Target::Pool` | Admin only |
 | Registry, audit, access-control surfaces | Admin | Admin only |
+
+Pools and allocations are **platform configuration** (capacity topology), not
+app lifecycle — hence Admin-only mutations where clusters are Operator+Admin.
 
 > **Delta vs ui-ux-spec §5.3:** the spec's persona table has *Developers*
 > creating clusters. Current code grants `Developer` only `Read` on
@@ -725,6 +731,134 @@ login flow is how you get one). In Nebari-native mode, Envoy/Keycloak may
 satisfy the browser-facing parts instead — the endpoints are the standalone
 mode contract. Dev mode uses `--dev-allow-unauthenticated` and needs none of
 this.
+
+### 5.12 Pools — `/api/v1/pools`
+
+Capacity pools and per-project allocations ([ADR-0010](adr/0010-pool-engine-kueue.md)
+— Kueue is the pool engine). **Implemented** (`pools.rs`) against the `Store`,
+with Kueue actuation (ResourceFlavor / ClusterQueue / Cohort / LocalQueue)
+applied by the pool reconcile loop when the Kueue CRDs are present — absent
+them, pools are in-process quota only (ADR-0010's fallback). Pools are
+platform configuration, not app lifecycle (§2.2): reads are Viewer+,
+mutations Admin-only.
+
+#### `GET /api/v1/pools`
+
+- **Auth:** `Read` on `Target::Pool` (Viewer+).
+- **Response 200:** `[PoolView]` — each item is
+  `{ name, generation, created_at, flavors, cohort, fair_sharing_weight,
+  elastic, total_nominal }`, where `total_nominal` sums each flavor's
+  resource quantities per resource key (a key whose quantity fails to parse
+  on any flavor is omitted — display math only; the spec stays
+  authoritative).
+
+#### `POST /api/v1/pools`
+
+- **Auth:** `Write` on `Target::Pool` (Admin only).
+- **Body:** `{ "spec": PoolSpec }`. Shape-validated by `PoolSpec::validate`
+  plus quantity-parse validation at the edge → 400 `invalid_spec`.
+- **Create-only in v0:** a pool that already exists is 409, never an upsert;
+  spec update arrives with a later PATCH.
+- **Response 201:** `{ "name": "gpu-pool", "generation": 1 }`.
+
+#### `GET /api/v1/pools/{name}` · `DELETE /api/v1/pools/{name}`
+
+- **Auth:** `Read` / `Delete` on `Target::Pool`.
+- **Responses:** 200 `PoolView`; 202 on delete; 404 when absent.
+
+#### `PUT /api/v1/pools/{name}/allocations/{project}`
+
+- **Auth:** `Write` on `Target::Pool` (Admin only).
+- **Body:** `AllocationSpec` minus `pool`/`project` — path params win; a
+  contradicting body is 400. The named pool must exist (404) and the
+  allocation must validate (400).
+- **Response 200:** `{ "pool": "gpu-pool", "project": "proj-a" }`.
+
+#### `GET /api/v1/pools/{name}/allocations` · `DELETE …/allocations/{project}`
+
+- **Auth:** `Read` / `Delete` on `Target::Pool`.
+- **Responses:** 200 `[AllocationSpec]`; 202 on delete; 404 when absent.
+
+#### `GET /api/v1/pools/{name}/usage` — live pool utilization (Slice 4)
+
+Point-in-time view built from the pool's latest stored Kueue observation
+(ClusterQueue + LocalQueue statuses) and the spec's nominal quotas. Not a
+timeseries — for history use §5.13's `/api/v1/usage`.
+
+- **Auth:** `Read` on `Target::Pool` (Viewer+).
+- **Response 200:** `PoolUsageView`:
+
+```json
+{
+  "pool": "gpu-pool",
+  "sampled_at": 1755280000,
+  "utilization": {
+    "cpu": { "allocated": 16.0, "nominal": 64.0, "pct": 25.0 }
+  },
+  "projects": { "proj-a": { "cpu": 10.0 } }
+}
+```
+
+- `sampled_at` is `null` until the pool reconcile loop has observed the pool.
+- `allocated` is Kueue's **reservation ledger** (what was admitted against
+  quota), not measured consumption — ADR-0010's documented divergence.
+  `pct` is `0.0` when `nominal` is 0.
+- **Errors:** 404 unknown pool.
+
+### 5.13 Usage — `/api/v1/usage` + `/api/v1/metrics` (Slice 4)
+
+The metering loop (`mobula-controller::Metering`) appends usage samples to
+the store on an interval (`--metering-interval-secs`, default 60). Sources:
+when Kueue is present, ClusterQueue/LocalQueue `status.flavorsUsage`
+(`source: kueue_ledger`); otherwise the min-demand baseline of Running
+cluster specs (`source: observed_spec`).
+
+#### `GET /api/v1/usage`
+
+Consumption **reporting**, so the permission is `Read` on `Target::Cluster`
+(Viewer+) — the same as reading cluster cost estimates — not
+`Target::Pool`.
+
+- **Query:** `project`, `pool` (filters), `from`, `to` (unix seconds;
+  defaults: `to` = now, `from` = `to − 86400`). `from < to` required → 400.
+- **Response 200:** `UsageReport` — `{ from, to, groups: [UsageGroup] }`,
+  one group per (project, pool):
+
+```json
+{
+  "from": 1755280000, "to": 1755366400,
+  "groups": [
+    {
+      "project": "proj-a", "pool": "gpu-pool",
+      "resource_hours": { "cpu": 4.667, "memory": 21.33 },
+      "cost_usd": 0.2933
+    }
+  ]
+}
+```
+
+- `resource_hours` integrates the sample series as a **step function** (a
+  sample's quantity holds until the next sample); the last sample
+  at-or-before `from` carries into the window. Sampler gaps hold the last
+  known state — the gap is visible in sample density, not papered over.
+- `cost_usd` is `null` unless a price sheet is configured (`PolicyConfig`).
+- `project: ""` marks the pool-level aggregate row (Kueue path only); it
+  OVERLAPS the per-project rows — never sum across project boundaries.
+  `pool: ""` means the project has no allocation.
+
+#### `GET /api/v1/metrics`
+
+Prometheus text exposition (no client library — one hand-rendered gauge):
+
+```
+# HELP mobula_pool_resource_usage Latest metered resource usage …
+# TYPE mobula_pool_resource_usage gauge
+mobula_pool_resource_usage{pool="gpu-pool",project="proj-a",resource="cpu"} 10
+```
+
+- **Auth:** `Read` on `Target::Cluster` (a scrape token is a Bearer JWT).
+- Values are the latest sample per (pool, project, resource) label set.
+
 
 ## 6. Endpoint × milestone summary
 

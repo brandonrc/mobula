@@ -14,7 +14,8 @@ use mobula_core::{ClusterState, DriftCondition};
 use mobula_provision::{ProvisionError, Provisioner};
 
 use crate::store::{
-    now_unix, params_fingerprint, DesiredState, IntentOutcome, Store, StoreError, StoredCluster,
+    now_unix, params_fingerprint, queue_assignment_for_project, DesiredState, IntentOutcome, Store,
+    StoreError, StoredCluster,
 };
 
 /// How long an `Applied` outbox row is retained before the run loop reaps it
@@ -210,6 +211,14 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
 
         // 2. Decide and actuate against *observed* reality. Track the
         //    drift/health condition to persist (#41/#47); every branch sets it.
+        //
+        // Resolve the Kueue queue assignment for the cluster's project
+        // (ADR-0010) from the store — the store is the transport between
+        // create_cluster's allocation lookup and actuation, so ClusterSpec's
+        // serialized form stays free of it. A queued cluster's `suspend` is
+        // owned by Kueue, so for queued clusters Suspended is admission
+        // queueing, not repairable drift (see needs_apply).
+        let queue = queue_assignment_for_project(self.store.as_ref(), &c.spec.project).await?;
         let new_condition: Option<DriftCondition>;
         let action = match c.desired {
             DesiredState::Running => {
@@ -223,7 +232,7 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                         cluster = %c.id, "observed Degraded while desired Running — raising alarm, not re-applying"
                     );
                     Action::Drift
-                } else if needs_apply(observed_state, observed_gen, c.generation) {
+                } else if needs_apply(observed_state, observed_gen, c.generation, queue.is_some()) {
                     // Global actuation budget (#43): if the token bucket is
                     // empty, defer this cluster to a later tick rather than
                     // exceed the provider-call rate. NoOp/observe passes don't
@@ -246,7 +255,7 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                         IntentOutcome::Proceed { replay } => {
                             let resp = self
                                 .provisioner
-                                .apply(&c.id, &c.spec, c.generation, &key)
+                                .apply(&c.id, &c.spec, c.generation, &key, queue.as_ref())
                                 .await?;
                             let resp_json = serde_json::to_string(&resp).unwrap_or_default();
                             self.store.complete_intent(&key, &resp_json).await?;
@@ -446,18 +455,26 @@ fn is_expired(c: &StoredCluster, now: u64) -> bool {
 /// Re-applying an in-flight roll (same generation, still Provisioning) is
 /// *not* needed: the cluster already carries the desired generation, so we
 /// wait and re-observe rather than churn the provider.
+///
+/// `queued` (the cluster has a Kueue queue assignment, ADR-0010) changes one
+/// case: Suspended is then Kueue holding an unadmitted workload pod-less
+/// (research doc §2 — Kueue owns `spec.suspend` for queued clusters), so
+/// re-applying would fight the queue. Leave it; admission unsuspends it.
+/// For queue-free clusters Suspended stays repairable drift (#47).
 fn needs_apply(
     observed: Option<ClusterState>,
     observed_generation: u64,
     desired_generation: u64,
+    queued: bool,
 ) -> bool {
     match observed {
         None => true,
         Some(ClusterState::Terminated) | Some(ClusterState::Terminating) => true,
         // #47: a Suspended cluster whose desired state is Running is
         // repairable drift — re-apply resumes it (to_raycluster owns
-        // spec.suspend=false, so the force-SSA re-apply clears it).
-        Some(ClusterState::Suspended) => true,
+        // spec.suspend=false, so the force-SSA re-apply clears it). Not so
+        // for queued clusters: Kueue legitimately holds them Suspended.
+        Some(ClusterState::Suspended) => !queued,
         Some(_) => observed_generation < desired_generation,
     }
 }
@@ -519,19 +536,219 @@ mod tests {
 
     #[test]
     fn needs_apply_matrix() {
-        // Args are (observed_state, observed_generation, desired_generation).
+        // Args are (observed_state, observed_generation, desired_generation,
+        // queued).
         // Nothing provisioned yet.
-        assert!(needs_apply(None, 0, 1));
+        assert!(needs_apply(None, 0, 1, false));
         // Gone but wanted.
-        assert!(needs_apply(Some(ClusterState::Terminated), 1, 1));
+        assert!(needs_apply(Some(ClusterState::Terminated), 1, 1, false));
         // Cluster carries an older generation than desired (spec changed,
         // not yet picked up).
-        assert!(needs_apply(Some(ClusterState::Running), 1, 2));
+        assert!(needs_apply(Some(ClusterState::Running), 1, 2, false));
         // Steady state, cluster carries the desired generation.
-        assert!(!needs_apply(Some(ClusterState::Running), 1, 1));
+        assert!(!needs_apply(Some(ClusterState::Running), 1, 1, false));
         // Mid-roll at the desired generation → wait, don't re-apply/churn.
-        assert!(!needs_apply(Some(ClusterState::Provisioning), 2, 2));
+        assert!(!needs_apply(Some(ClusterState::Provisioning), 2, 2, false));
         // #47: Suspended with desired Running is repairable → re-apply.
-        assert!(needs_apply(Some(ClusterState::Suspended), 1, 1));
+        assert!(needs_apply(Some(ClusterState::Suspended), 1, 1, false));
+        // ADR-0010: a QUEUED cluster's Suspended is Kueue admission
+        // queueing, not drift — re-applying would fight Kueue's suspend.
+        assert!(!needs_apply(Some(ClusterState::Suspended), 1, 1, true));
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_and_caps() {
+        assert_eq!(backoff_secs(1), 5);
+        assert_eq!(backoff_secs(2), 10);
+        assert_eq!(backoff_secs(3), 20);
+        // Capped at the ceiling…
+        assert_eq!(backoff_secs(10), 300);
+        // …and a saturated failure_count can't overflow the shift.
+        assert_eq!(backoff_secs(u32::MAX), 300);
+    }
+
+    /// A provisioner whose `observe` always fails with a backend error.
+    struct ErrProv;
+
+    #[async_trait::async_trait]
+    impl Provisioner for ErrProv {
+        async fn apply(
+            &self,
+            _id: &ClusterId,
+            _spec: &ClusterSpec,
+            generation: u64,
+            _key: &str,
+            _queue: Option<&mobula_provision::QueueAssignment>,
+        ) -> Result<mobula_provision::ApplyResponse, ProvisionError> {
+            Ok(mobula_provision::ApplyResponse {
+                generation,
+                api_base_url: None,
+            })
+        }
+        async fn terminate(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
+            Ok(())
+        }
+        async fn observe(
+            &self,
+            _id: &ClusterId,
+        ) -> Result<mobula_provision::ObservedCluster, ProvisionError> {
+            Err(ProvisionError::Backend("injected observe failure".into()))
+        }
+        async fn list(&self) -> Result<Vec<mobula_provision::ObservedCluster>, ProvisionError> {
+            Ok(vec![])
+        }
+    }
+
+    /// A provisioner that reports a converged cluster on the first observe of
+    /// each reconcile pass, then NotFound on the re-observe (the cluster
+    /// vanished mid-pass).
+    struct VanishingProv {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provisioner for VanishingProv {
+        async fn apply(
+            &self,
+            _id: &ClusterId,
+            _spec: &ClusterSpec,
+            generation: u64,
+            _key: &str,
+            _queue: Option<&mobula_provision::QueueAssignment>,
+        ) -> Result<mobula_provision::ApplyResponse, ProvisionError> {
+            Ok(mobula_provision::ApplyResponse {
+                generation,
+                api_base_url: None,
+            })
+        }
+        async fn terminate(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
+            Ok(())
+        }
+        async fn observe(
+            &self,
+            id: &ClusterId,
+        ) -> Result<mobula_provision::ObservedCluster, ProvisionError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n % 2 == 0 {
+                Ok(mobula_provision::ObservedCluster {
+                    id: id.clone(),
+                    state: ClusterState::Running,
+                    observed_generation: Some(1),
+                    spec_fingerprint: None,
+                    api_base_url: None,
+                })
+            } else {
+                Err(ProvisionError::NotFound(id.clone()))
+            }
+        }
+        async fn list(&self) -> Result<Vec<mobula_provision::ObservedCluster>, ProvisionError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn store_list_error_is_collected_not_fatal() {
+        use crate::store::testkit::FailingStore;
+        let store = Arc::new(FailingStore::new());
+        store.fail("list");
+        let rec = Reconciler::new(store, Arc::new(ErrProv));
+        let out = rec.reconcile_all_at(0).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "<list>");
+        assert!(out[0].1.is_err());
+    }
+
+    #[tokio::test]
+    async fn observe_backend_error_fails_the_cluster_pass() {
+        use crate::store::memory::InMemoryStore;
+        let store = Arc::new(InMemoryStore::new());
+        store
+            .upsert_desired(&ClusterId("c".into()), stored(None, 0, None).spec)
+            .await
+            .unwrap();
+        let rec = Reconciler::new(store, Arc::new(ErrProv));
+        let out = rec.reconcile_all_at(0).await;
+        assert!(matches!(out[0].1, Err(ReconcileError::Provision(_))));
+    }
+
+    #[tokio::test]
+    async fn cluster_vanishing_mid_pass_records_no_observation() {
+        // The re-observe after a NoOp decision returns NotFound: the stored
+        // observation is cleared (recorded as absent), not left stale.
+        use crate::store::memory::InMemoryStore;
+        let store = Arc::new(InMemoryStore::new());
+        let id = ClusterId("c".into());
+        store
+            .upsert_desired(&id, stored(None, 0, None).spec)
+            .await
+            .unwrap();
+        let rec = Reconciler::new(
+            store.clone(),
+            Arc::new(VanishingProv {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        let out = rec.reconcile_all_at(0).await;
+        assert_eq!(out[0].1.as_ref().unwrap(), &Action::NoOp);
+        let stored = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(stored.observed_state, None, "vanish mid-pass is recorded");
+        assert_eq!(stored.observed_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_restore_check_handles_absent_and_failing_clusters() {
+        use crate::store::memory::InMemoryStore;
+
+        // No clusters → no quarantine.
+        let store = Arc::new(InMemoryStore::new());
+        let rec = Reconciler::new(store.clone(), Arc::new(ErrProv));
+        assert!(!rec.detect_stale_restore().await.unwrap());
+
+        // A stored cluster whose backing resource is gone (NotFound) is
+        // skipped, not fatal.
+        store
+            .upsert_desired(&ClusterId("c".into()), stored(None, 0, None).spec)
+            .await
+            .unwrap();
+        let rec = Reconciler::new(
+            store.clone(),
+            Arc::new(VanishingProv {
+                calls: std::sync::atomic::AtomicUsize::new(1), // odd → NotFound first
+            }),
+        );
+        assert!(!rec.detect_stale_restore().await.unwrap());
+        assert!(!store.is_quarantined().await.unwrap());
+
+        // A backend error on observe propagates.
+        let rec = Reconciler::new(store, Arc::new(ErrProv));
+        assert!(matches!(
+            rec.detect_stale_restore().await,
+            Err(ReconcileError::Provision(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_loop_logs_pass_errors_and_stops_on_shutdown() {
+        // With a failing store, every tick logs reap/reconcile errors and
+        // keeps going; shutdown still stops the loop promptly.
+        use crate::store::testkit::FailingStore;
+        let store = Arc::new(FailingStore::new());
+        store.fail("list");
+        store.fail("reap_intents");
+        let rec = Reconciler::new(store, Arc::new(ErrProv));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            rec.run(Duration::from_millis(10), async {
+                let _ = rx.await;
+            })
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("loop should stop promptly on shutdown")
+            .unwrap();
     }
 }

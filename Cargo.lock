@@ -1523,6 +1523,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "mobula-core",
+ "mobula-policy",
  "mobula-provision",
  "serde",
  "serde_json",
@@ -1548,6 +1549,7 @@ version = "0.0.1"
 dependencies = [
  "mobula-core",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1559,6 +1561,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "mobula-core",
+ "mobula-policy",
  "rustls",
  "serde",
  "serde_json",

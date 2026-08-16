@@ -45,10 +45,10 @@ async fn provisions_observes_and_terminates() {
     let id = ClusterId("e2e-demo".into());
 
     // Idempotent apply (generation 1).
-    prov.apply(&id, &tiny_spec(), 1, "e2e/1")
+    prov.apply(&id, &tiny_spec(), 1, "e2e/1", None)
         .await
         .expect("apply");
-    prov.apply(&id, &tiny_spec(), 1, "e2e/1")
+    prov.apply(&id, &tiny_spec(), 1, "e2e/1", None)
         .await
         .expect("second apply is idempotent");
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
 # dev-stack.sh — bring up a full local Mobula stack for playing around and
-# stress-testing: a kind cluster with the KubeRay operator, the control-plane
-# API server, and (optionally) the dashboard.
+# stress-testing: a kind cluster with the KubeRay operator, (optionally) Kueue
+# for pools (ADR-0010), the control-plane API server, and (optionally) the
+# dashboard.
 #
-#   ./scripts/dev-stack.sh up       # kind + KubeRay operator + namespace (idempotent)
+#   ./scripts/dev-stack.sh up       # kind + KubeRay operator + Kueue + namespace (idempotent)
 #   ./scripts/dev-stack.sh serve    # run `mobula serve` against that cluster (foreground)
 #   ./scripts/dev-stack.sh ui       # run the mobula-ui dev server (foreground)
 #   ./scripts/dev-stack.sh smoke    # start serve, exercise the API, tear it down
@@ -20,6 +21,9 @@ set -euo pipefail
 CLUSTER_NAME="${MOBULA_DEV_CLUSTER:-mobula-dev}"        # kind cluster name
 NAMESPACE="${MOBULA_DEV_NAMESPACE:-mobula-dev}"         # namespace RayClusters live in
 KUBERAY_VERSION="${MOBULA_KUBERAY_VERSION:-1.4.0}"      # matches kuberay-e2e.yml
+KUEUE_VERSION="${MOBULA_KUEUE_VERSION:-v0.19.1}"        # matches kueue-e2e.yml (needs K8s ≥ 1.34)
+WITH_KUEUE="${MOBULA_WITH_KUEUE:-1}"                    # 0/false/no = skip Kueue install
+KIND_NODE_IMAGE="${MOBULA_KIND_NODE_IMAGE:-kindest/node:v1.34.0}"  # Kueue v0.19 needs K8s ≥ 1.34
 BIND="${MOBULA_BIND:-127.0.0.1:8484}"                  # must match mobula-ui's vite proxy
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DB="${MOBULA_DEV_DB:-$ROOT/.dev/mobula.db}"            # sqlite desired-state store
@@ -41,8 +45,8 @@ cmd_up() {
   if kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
     log "kind cluster '$CLUSTER_NAME' already exists"
   else
-    log "creating kind cluster '$CLUSTER_NAME'"
-    kind create cluster --name "$CLUSTER_NAME"
+    log "creating kind cluster '$CLUSTER_NAME' ($KIND_NODE_IMAGE)"
+    kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE"
   fi
   kubectl config use-context "$KUBECTX" >/dev/null
 
@@ -56,6 +60,22 @@ cmd_up() {
   kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
   kubectl wait --for=condition=Available deploy/kuberay-operator --timeout=180s
+
+  # Kueue is the pool engine (ADR-0010), but Mobula falls back to in-process
+  # quota without it — so a failed install (e.g. offline) warns and continues.
+  case "$WITH_KUEUE" in
+    0|false|no) log "MOBULA_WITH_KUEUE=$WITH_KUEUE — skipping Kueue install" ;;
+    *)
+      log "installing Kueue $KUEUE_VERSION (pool engine, ADR-0010)"
+      if kubectl apply --server-side -f \
+        "https://github.com/kubernetes-sigs/kueue/releases/download/${KUEUE_VERSION}/manifests.yaml"; then
+        kubectl wait --for=condition=Available deployment/kueue-controller-manager \
+          -n kueue-system --timeout=180s
+      else
+        warn "Kueue install failed — continuing without it (Mobula uses in-process quota fallback)"
+      fi
+      ;;
+  esac
   log "up. next: '$0 serve' (terminal 1) and '$0 ui' (terminal 2)"
 }
 
@@ -90,6 +110,13 @@ cmd_status() {
   echo "== rayclusters ($NAMESPACE) =="; kubectl get rayclusters -n "$NAMESPACE" -o wide 2>/dev/null || true
   echo "== rayservices ($NAMESPACE) =="; kubectl get rayservices -n "$NAMESPACE" -o wide 2>/dev/null || true
   echo "== pods ($NAMESPACE) =="; kubectl get pods -n "$NAMESPACE" -o wide 2>/dev/null || true
+  echo "== kueue (pool engine) =="
+  if kubectl get crd clusterqueues.kueue.x-k8s.io >/dev/null 2>&1; then
+    kubectl get clusterqueues,cohorts 2>/dev/null || true
+    kubectl get localqueues -n "$NAMESPACE" 2>/dev/null || true
+  else
+    echo "Kueue CRDs absent — pools use the in-process quota fallback (ADR-0010)"
+  fi
   echo "== control plane =="
   if curl -fsS "$BASE_URL/healthz" >/dev/null 2>&1; then
     echo "healthz: ok  version: $(curl -fsS "$BASE_URL/api/v1/version" 2>/dev/null)"
@@ -122,7 +149,7 @@ cmd_smoke() {
   log "starting serve in the background"
   "$bin" serve --bind "$BIND" --dev-allow-unauthenticated \
     --kuberay-namespace "$NAMESPACE" --db "$dbfile" \
-    --reconcile-interval-secs 5 >"$ROOT/.dev/smoke-serve.log" 2>&1 &
+    --reconcile-interval-secs 5 --metering-interval-secs 5 >"$ROOT/.dev/smoke-serve.log" 2>&1 &
   local serve_pid=$!
   # shellcheck disable=SC2064
   trap "kill $serve_pid 2>/dev/null || true" EXIT
@@ -139,6 +166,27 @@ cmd_smoke() {
   log "GET /api/v1/clusters"; curl -fsS "$BASE_URL/api/v1/clusters"; echo
 
   if [ "$full" -eq 1 ]; then
+    # Pool story (ADR-0010): when Kueue is installed, create a demo pool and
+    # give the smoke project an allocation before the cluster — the cluster
+    # then carries the kueue.x-k8s.io/queue-name label through admission.
+    local kueue=0
+    kubectl get crd clusterqueues.kueue.x-k8s.io >/dev/null 2>&1 && kueue=1
+    if [ "$kueue" -eq 1 ]; then
+      log "POST /api/v1/pools (demo pool with a small cpu flavor)"
+      curl -fsS -X POST "$BASE_URL/api/v1/pools" \
+        -H 'content-type: application/json' -d '{
+          "spec":{"name":"smoke-pool","flavors":[
+            {"name":"cpu","resources":{"cpu":"8","memory":"16Gi"},"node_labels":{},"taints":[]}],
+            "cohort":"smoke","fair_sharing_weight":1.0,"elastic":false}
+        }' >/dev/null && echo "pool created."
+      log "PUT /api/v1/pools/smoke-pool/allocations/dev"
+      curl -fsS -X PUT "$BASE_URL/api/v1/pools/smoke-pool/allocations/dev" \
+        -H 'content-type: application/json' -d '{
+          "namespace":"'"$NAMESPACE"'",
+          "nominal":{"cpu":"4","memory":"8Gi"},"borrowing_limit":{},"lending_limit":{}
+        }' >/dev/null && echo "allocation created."
+    fi
+
     log "POST /api/v1/clusters (real RayCluster — this pulls the Ray image, be patient)"
     curl -fsS -X POST "$BASE_URL/api/v1/clusters" \
       -H 'content-type: application/json' -d '{
@@ -166,6 +214,11 @@ cmd_smoke() {
       kubectl get raycluster -n "$NAMESPACE" smoke >/dev/null 2>&1 || { echo "  gone."; break; }
       sleep 5
     done
+
+    if [ "$kueue" -eq 1 ]; then
+      log "GET /api/v1/pools/smoke-pool/usage (the sharing story)"
+      curl -fsS "$BASE_URL/api/v1/pools/smoke-pool/usage"; echo
+    fi
   fi
 
   log "smoke passed ✅"
@@ -194,6 +247,7 @@ dev-stack.sh — a full local Mobula stack for playing around / stress-testing.
 
 First run: `up`, then `serve` (terminal 1) and `ui` (terminal 2), open the UI.
 Override via env: MOBULA_DEV_CLUSTER, MOBULA_DEV_NAMESPACE, MOBULA_KUBERAY_VERSION,
+MOBULA_KUEUE_VERSION, MOBULA_WITH_KUEUE (0 = no Kueue), MOBULA_KIND_NODE_IMAGE,
 MOBULA_BIND, MOBULA_DEV_DB, MOBULA_UI_DIR, MOBULA_RESYNC_SECS.
 USAGE
     ;;

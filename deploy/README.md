@@ -45,6 +45,13 @@ kind-based dev-stack instead: `./scripts/dev-stack.sh up` then `serve` + `ui`
 (see `docs/dev-stack.md`). This compose stack is purely for fast local UI/API
 iteration.
 
+**Pools:** pools/Kueue are optional here. Kueue is a Kubernetes component and
+this stack has no Kubernetes, so pools run in **in-process quota-only** mode
+(ADR-0010's fallback): the pools API, allocations, and usage screens all work,
+but nothing is enforced by Kueue ClusterQueues. For the full pool engine
+(cohort borrowing, gang admission, queue labels), use the dev-stack — it
+installs Kueue by default (`MOBULA_WITH_KUEUE=0` to skip).
+
 > Note: the dashboard's identity and registry screens are "UI-ahead" — their
 > endpoints aren't in the API yet, so they render a "not implemented" empty
 > state. Clusters, services, version, and health are fully live in demo mode.

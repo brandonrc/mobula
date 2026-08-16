@@ -52,6 +52,7 @@ impl Provisioner for DemoProvisioner {
         spec: &ClusterSpec,
         generation: u64,
         _idempotency_key: &str,
+        _queue: Option<&crate::kuberay::QueueAssignment>,
     ) -> Result<ApplyResponse, ProvisionError> {
         self.clusters.lock().unwrap().insert(
             id.0.clone(),
@@ -144,5 +145,117 @@ impl ServiceProvisioner for DemoProvisioner {
                 url: Some(format!("http://{name}.demo.local:8000")),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mobula_core::{UpgradeStrategy, WorkerGroup};
+
+    fn cluster_spec(name: &str) -> ClusterSpec {
+        ClusterSpec {
+            name: name.into(),
+            project: "demo".into(),
+            ray_version: "2.57.0".into(),
+            image: "img".into(),
+            head_cpu: "1".into(),
+            head_memory: "2Gi".into(),
+            worker_groups: vec![WorkerGroup {
+                name: "w".into(),
+                cpu: "1".into(),
+                memory: "2Gi".into(),
+                gpu: None,
+                min_replicas: 0,
+                max_replicas: 4,
+                replicas: 1,
+            }],
+            ttl_seconds: None,
+        }
+    }
+
+    fn service_spec(name: &str) -> ServiceSpec {
+        ServiceSpec {
+            name: name.into(),
+            project: "demo".into(),
+            ray_version: "2.57.0".into(),
+            image: "img".into(),
+            serve_config_v2: "applications: []".into(),
+            head_cpu: "1".into(),
+            head_memory: "2Gi".into(),
+            worker_replicas: 1,
+            worker_cpu: "1".into(),
+            worker_memory: "2Gi".into(),
+            upgrade: UpgradeStrategy::Canary,
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_lifecycle_is_faked_without_kubernetes() {
+        let p = DemoProvisioner::new();
+        let id = ClusterId("c1".into());
+
+        // Nothing applied yet → NotFound, like a real backend.
+        assert!(matches!(
+            p.observe(&id).await,
+            Err(ProvisionError::NotFound(_))
+        ));
+        assert!(Provisioner::list(&p).await.unwrap().is_empty());
+
+        // apply immediately reports Running with the generation and the
+        // owned-field fingerprint stamped (so #40/#41 reconcile logic sees
+        // the same shape as against KubeRay).
+        let resp = p
+            .apply(&id, &cluster_spec("c1"), 3, "c1/3", None)
+            .await
+            .unwrap();
+        assert_eq!(resp.generation, 3);
+        assert_eq!(
+            resp.api_base_url.as_deref(),
+            Some("http://c1.demo.local:8265")
+        );
+
+        let obs = p.observe(&id).await.unwrap();
+        assert_eq!(obs.state, ClusterState::Running);
+        assert_eq!(obs.observed_generation, Some(3));
+        assert_eq!(
+            obs.spec_fingerprint.as_deref(),
+            Some(owned_spec_fingerprint(&cluster_spec("c1")).as_str())
+        );
+
+        // terminate flips the observed state; the record is kept.
+        p.terminate(&id).await.unwrap();
+        assert_eq!(
+            p.observe(&id).await.unwrap().state,
+            ClusterState::Terminated
+        );
+        // Terminating an unknown id is a no-op, not an error.
+        p.terminate(&ClusterId("ghost".into())).await.unwrap();
+
+        // list reflects what was applied.
+        let all = Provisioner::list(&p).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, id);
+        assert_eq!(all[0].observed_generation, Some(3));
+    }
+
+    #[tokio::test]
+    async fn service_lifecycle_is_faked_without_kubernetes() {
+        let p = DemoProvisioner::new();
+        assert!(p.get("svc").await.unwrap().is_none());
+
+        p.deploy("svc", &service_spec("svc")).await.unwrap();
+        let svc = p.get("svc").await.unwrap().unwrap();
+        assert_eq!(svc.state, ClusterState::Running);
+        assert_eq!(svc.url.as_deref(), Some("http://svc.demo.local:8000"));
+
+        let all = ServiceProvisioner::list(&p).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "svc");
+
+        p.delete("svc").await.unwrap();
+        assert!(p.get("svc").await.unwrap().is_none());
+        // Deleting an unknown service is a no-op.
+        p.delete("svc").await.unwrap();
     }
 }

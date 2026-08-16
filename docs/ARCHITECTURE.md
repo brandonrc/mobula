@@ -33,6 +33,7 @@ flowchart LR
 
     subgraph dataplane [Data plane - one per cluster]
         kuberay["KubeRay operator"]
+        kueue["Kueue<br/>(pool engine)"]
         head["Ray head<br/>dashboard + job API<br/>static token auth"]
         workers["Ray workers"]
     end
@@ -47,6 +48,8 @@ flowchart LR
     api -->|"injects static<br/>Ray token"| head
     api --> db
     recon -->|RayCluster CRs| kuberay
+    recon -->|CQ/LQ/Flavor/Cohort CRs| kueue
+    kuberay -.->|gang admission| kueue
     kuberay --> head
     head --> workers
 ```
@@ -70,6 +73,13 @@ flowchart TD
 `mobula-core` is dependency-poor by rule (ADR-0002): cloud SDKs and
 Kubernetes clients live only behind the `Provisioner` trait in
 `mobula-provision`.
+
+Pools follow the same split (ADR-0010): pool topology (`PoolSpec`,
+flavors, allocations) lives in `mobula-core::pool`; translation to Kueue
+objects is pure in `mobula-provision::kueue` with the live client in
+`mobula-provision::kueue_client`; convergence (including the Kueue-absent
+fallback) is `mobula-controller::pool_reconcile`; usage attribution is
+`mobula-controller::metering` over `mobula-policy::usage`.
 
 ## Cluster lifecycle
 

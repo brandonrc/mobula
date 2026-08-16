@@ -5,7 +5,9 @@
 //! store lands in the next slice behind the same trait.
 
 use async_trait::async_trait;
-use mobula_core::{ClusterId, ClusterSpec, ClusterState, DriftCondition, JobRecord};
+use mobula_core::{
+    AllocationSpec, ClusterId, ClusterSpec, ClusterState, DriftCondition, JobRecord, PoolSpec,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -88,6 +90,35 @@ pub(crate) fn spec_changed(a: &ClusterSpec, b: &ClusterSpec) -> bool {
         })
 }
 
+/// A persisted pool (ADR-0004/ADR-0010): the pool spec plus a monotonic
+/// `generation` that bumps whenever the spec changes, plus the last
+/// Kueue observation (`observed_json`, opaque serialized
+/// [`mobula_provision::PoolObservation`]) recorded by the pool reconcile
+/// loop — the Slice 4 metering loop reads it from here.
+#[derive(Debug, Clone)]
+pub struct StoredPool {
+    pub name: String,
+    pub spec: PoolSpec,
+    pub generation: u64,
+    /// Last observed ClusterQueue status (opaque JSON), if the pool
+    /// reconcile loop has observed this pool. Never authoritative — pools
+    /// are level-triggered from the spec like clusters are.
+    pub observed_json: Option<String>,
+    /// When `observed_json` was recorded (unix seconds). `None` until the
+    /// first observation; surfaces as `sampled_at` on the pool-usage API.
+    pub observed_at: Option<u64>,
+    /// Unix seconds when the pool was first created.
+    pub created_at: u64,
+}
+
+/// Whether two pool specs differ in a way that should bump `generation`.
+/// `PoolSpec` is `PartialEq`, so this is a direct comparison; the helper
+/// exists to mirror the `spec_changed` convention and give every `Store`
+/// implementation one shared definition.
+pub(crate) fn pool_spec_changed(a: &PoolSpec, b: &PoolSpec) -> bool {
+    a != b
+}
+
 /// A canonical fingerprint of the actuation-relevant spec, used by the
 /// outbox to detect a *conflicting* re-use of an intent key (ADR-0007:
 /// stale-generation writes must be rejected). Two specs that produce the
@@ -97,6 +128,82 @@ pub(crate) fn spec_changed(a: &ClusterSpec, b: &ClusterSpec) -> bool {
 /// serialization is a stable fingerprint.
 pub(crate) fn params_fingerprint(spec: &ClusterSpec) -> String {
     serde_json::to_string(spec).unwrap_or_default()
+}
+
+/// Resolve the Kueue queue a project's clusters are admitted through
+/// (ADR-0010): the first allocation matching `project` across all pools,
+/// carrying the pool's `elastic` flag. `None` = the project has no
+/// allocation and its clusters stay queue-free. Derived from the store at
+/// apply time (the store is truth, ADR-0004), so the assignment never
+/// travels inside `ClusterSpec`'s serialized form — both the cluster
+/// reconciler and the create API resolve it through this helper.
+pub async fn queue_assignment_for_project<S: Store + ?Sized>(
+    store: &S,
+    project: &str,
+) -> Result<Option<mobula_provision::QueueAssignment>, StoreError> {
+    for pool in store.list_pools().await? {
+        for alloc in store.list_allocations(&pool.name).await? {
+            if alloc.project == project {
+                return Ok(Some(mobula_provision::QueueAssignment {
+                    queue_name: alloc.project,
+                    elastic: pool.spec.elastic,
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Where a usage sample came from (ADR-0010's documented divergence: Kueue's
+/// `flavorsUsage` is a *reservation* ledger, not measured consumption, so
+/// Mobula meters attribution itself and labels each sample's provenance).
+/// Serialized snake_case (`kueue_ledger` / `observed_spec`) in both JSON and
+/// the `usage_samples.source` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSource {
+    /// Kueue's ClusterQueue/LocalQueue `status.flavorsUsage` — reservation
+    /// ledger amounts (what Kueue admits against quota).
+    KueueLedger,
+    /// Mobula's own estimate from desired cluster specs (the min-demand
+    /// baseline), used when Kueue is absent.
+    ObservedSpec,
+}
+
+impl UsageSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsageSource::KueueLedger => "kueue_ledger",
+            UsageSource::ObservedSpec => "observed_spec",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, StoreError> {
+        match s {
+            "kueue_ledger" => Ok(UsageSource::KueueLedger),
+            "observed_spec" => Ok(UsageSource::ObservedSpec),
+            other => Err(StoreError::Backend(format!("bad usage source {other:?}"))),
+        }
+    }
+}
+
+/// One point-in-time usage reading (Slice 4 metering): `quantity` units of
+/// `resource` attributed to (`project`, `pool`) at `ts`. Append-only
+/// timeseries — no primary key, no updates; aggregation
+/// (`mobula_policy::resource_hours`) interprets the series as a step
+/// function. An empty `project` is the pool-level aggregate row (not
+/// attributable to a single project); an empty `pool` means the project has
+/// no allocation. Plain columns, no JSON — this table is query-facing.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UsageSample {
+    /// Unix seconds.
+    pub ts: u64,
+    pub project: String,
+    pub pool: String,
+    pub resource: String,
+    /// Amount in the resource key's natural unit (cores / GiB / devices).
+    pub quantity: f64,
+    pub source: UsageSource,
 }
 
 /// Lifecycle of an outbox intent (ADR-0007). A `Pending` row left behind by
@@ -212,6 +319,126 @@ pub trait Store: Send + Sync {
 
     /// List job history, most recently submitted first.
     async fn list_jobs(&self) -> Result<Vec<JobRecord>, StoreError>;
+
+    /// Create or update a pool's spec (ADR-0004: the store is truth; Kueue
+    /// objects are actuation). Returns the (possibly bumped) generation —
+    /// like clusters, generation only advances when the spec actually
+    /// changes.
+    async fn upsert_pool(&self, name: &str, spec: PoolSpec) -> Result<u64, StoreError>;
+
+    async fn get_pool(&self, name: &str) -> Result<Option<StoredPool>, StoreError>;
+    async fn list_pools(&self) -> Result<Vec<StoredPool>, StoreError>;
+
+    /// Hard-delete a pool (the Kueue teardown is driven by the pool
+    /// reconcile loop observing the pool's disappearance). Errors naming
+    /// the missing pool when it does not exist, mirroring
+    /// `delete_cluster`'s convention.
+    async fn delete_pool(&self, name: &str) -> Result<(), StoreError>;
+
+    /// Record the pool reconcile loop's last observation of a pool's Kueue
+    /// ClusterQueue status (opaque JSON — the store stays decoupled from
+    /// the observation type). Overwrites on every pass; `None`-able in
+    /// storage, recorded only when the observe succeeded.
+    async fn record_pool_observation(
+        &self,
+        name: &str,
+        observed_json: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Create or update a project's allocation within a pool (keyed by
+    /// (pool, project)). Allocations are part of the pool's desired state.
+    async fn upsert_allocation(&self, alloc: AllocationSpec) -> Result<(), StoreError>;
+
+    /// List the allocations of one pool.
+    async fn list_allocations(&self, pool: &str) -> Result<Vec<AllocationSpec>, StoreError>;
+
+    /// Delete one allocation. Errors naming the missing (pool, project)
+    /// when it does not exist.
+    async fn delete_allocation(&self, pool: &str, project: &str) -> Result<(), StoreError>;
+
+    /// Append usage samples (Slice 4 metering). Append-only timeseries —
+    /// the metering loop writes, nothing updates or deletes individual rows.
+    async fn record_usage_samples(&self, samples: &[UsageSample]) -> Result<(), StoreError>;
+
+    /// Read usage samples in `[from, to]` (unix seconds, inclusive),
+    /// ordered by `ts` ascending. `project`/`pool` filter when `Some`.
+    /// Callers wanting carry-in for aggregation should query from `0` and
+    /// let `mobula_policy::resource_hours` clamp — a sample before `from`
+    /// sets the level entering the window.
+    async fn usage_samples(
+        &self,
+        project: Option<&str>,
+        pool: Option<&str>,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<UsageSample>, StoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_source_round_trips_and_rejects_unknown() {
+        for s in [UsageSource::KueueLedger, UsageSource::ObservedSpec] {
+            assert_eq!(UsageSource::parse(s.as_str()).unwrap(), s);
+        }
+        let err = UsageSource::parse("bogus").unwrap_err().to_string();
+        assert!(err.contains("bad usage source"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn queue_assignment_resolves_first_matching_allocation() {
+        use mobula_core::FlavorSpec;
+        use std::collections::BTreeMap;
+
+        let store = memory::InMemoryStore::new();
+        // No pools at all → no assignment.
+        assert!(queue_assignment_for_project(&store, "p")
+            .await
+            .unwrap()
+            .is_none());
+
+        let pool_spec = |name: &str, elastic: bool| PoolSpec {
+            name: name.into(),
+            flavors: vec![FlavorSpec {
+                name: "cpu".into(),
+                resources: BTreeMap::from([("cpu".to_string(), "4".to_string())]),
+                node_labels: BTreeMap::new(),
+                taints: vec![],
+            }],
+            cohort: "research".into(),
+            fair_sharing_weight: 1.0,
+            elastic,
+        };
+        let alloc = |pool: &str, project: &str| AllocationSpec {
+            pool: pool.into(),
+            project: project.into(),
+            namespace: project.into(),
+            nominal: BTreeMap::new(),
+            borrowing_limit: BTreeMap::new(),
+            lending_limit: BTreeMap::new(),
+        };
+        store
+            .upsert_pool("gpu", pool_spec("gpu", true))
+            .await
+            .unwrap();
+        store.upsert_allocation(alloc("gpu", "p")).await.unwrap();
+
+        // The assignment carries the queue name (= project) and the pool's
+        // elastic flag.
+        let q = queue_assignment_for_project(&store, "p")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.queue_name, "p");
+        assert!(q.elastic);
+        // A project with no allocation stays queue-free.
+        assert!(queue_assignment_for_project(&store, "other")
+            .await
+            .unwrap()
+            .is_none());
+    }
 }
 
 pub mod memory {
@@ -227,6 +454,9 @@ pub mod memory {
         intents: Mutex<HashMap<String, IntentRecord>>,
         quarantined: AtomicBool,
         jobs: Mutex<HashMap<String, JobRecord>>,
+        pools: Mutex<HashMap<String, StoredPool>>,
+        allocations: Mutex<HashMap<(String, String), AllocationSpec>>,
+        usage: Mutex<Vec<UsageSample>>,
     }
 
     impl InMemoryStore {
@@ -235,6 +465,7 @@ pub mod memory {
         }
     }
 
+    use super::pool_spec_changed;
     use super::spec_changed;
 
     #[async_trait]
@@ -398,6 +629,302 @@ pub mod memory {
             let mut jobs: Vec<JobRecord> = self.jobs.lock().unwrap().values().cloned().collect();
             jobs.sort_by_key(|r| std::cmp::Reverse(r.submitted_at));
             Ok(jobs)
+        }
+
+        async fn upsert_pool(&self, name: &str, spec: PoolSpec) -> Result<u64, StoreError> {
+            let mut map = self.pools.lock().unwrap();
+            let existing = map.get(name);
+            let generation = match existing {
+                Some(p) if !pool_spec_changed(&p.spec, &spec) => p.generation,
+                Some(p) => p.generation + 1,
+                None => 1,
+            };
+            let record = StoredPool {
+                name: name.to_string(),
+                spec,
+                generation,
+                // Observations survive spec updates, like cluster observed state.
+                observed_json: existing.and_then(|p| p.observed_json.clone()),
+                observed_at: existing.and_then(|p| p.observed_at),
+                created_at: existing.map(|p| p.created_at).unwrap_or_else(now_unix),
+            };
+            map.insert(name.to_string(), record);
+            Ok(generation)
+        }
+
+        async fn get_pool(&self, name: &str) -> Result<Option<StoredPool>, StoreError> {
+            Ok(self.pools.lock().unwrap().get(name).cloned())
+        }
+
+        async fn list_pools(&self) -> Result<Vec<StoredPool>, StoreError> {
+            Ok(self.pools.lock().unwrap().values().cloned().collect())
+        }
+
+        async fn delete_pool(&self, name: &str) -> Result<(), StoreError> {
+            let mut map = self.pools.lock().unwrap();
+            if map.remove(name).is_none() {
+                return Err(StoreError::Backend(format!("no such pool {name}")));
+            }
+            Ok(())
+        }
+
+        async fn record_pool_observation(
+            &self,
+            name: &str,
+            observed_json: &str,
+        ) -> Result<(), StoreError> {
+            let mut map = self.pools.lock().unwrap();
+            if let Some(p) = map.get_mut(name) {
+                p.observed_json = Some(observed_json.to_string());
+                p.observed_at = Some(now_unix());
+            }
+            Ok(())
+        }
+
+        async fn upsert_allocation(&self, alloc: AllocationSpec) -> Result<(), StoreError> {
+            self.allocations
+                .lock()
+                .unwrap()
+                .insert((alloc.pool.clone(), alloc.project.clone()), alloc);
+            Ok(())
+        }
+
+        async fn list_allocations(&self, pool: &str) -> Result<Vec<AllocationSpec>, StoreError> {
+            Ok(self
+                .allocations
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|a| a.pool == pool)
+                .cloned()
+                .collect())
+        }
+
+        async fn delete_allocation(&self, pool: &str, project: &str) -> Result<(), StoreError> {
+            let mut map = self.allocations.lock().unwrap();
+            if map
+                .remove(&(pool.to_string(), project.to_string()))
+                .is_none()
+            {
+                return Err(StoreError::Backend(format!(
+                    "no such allocation {pool}/{project}"
+                )));
+            }
+            Ok(())
+        }
+
+        async fn record_usage_samples(&self, samples: &[UsageSample]) -> Result<(), StoreError> {
+            self.usage.lock().unwrap().extend_from_slice(samples);
+            Ok(())
+        }
+
+        async fn usage_samples(
+            &self,
+            project: Option<&str>,
+            pool: Option<&str>,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<UsageSample>, StoreError> {
+            let mut out: Vec<UsageSample> = self
+                .usage
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| {
+                    s.ts >= from
+                        && s.ts <= to
+                        && project.is_none_or(|p| s.project == p)
+                        && pool.is_none_or(|p| s.pool == p)
+                })
+                .cloned()
+                .collect();
+            out.sort_by_key(|s| s.ts);
+            Ok(out)
+        }
+    }
+}
+
+/// Test-only [`Store`] that delegates to [`memory::InMemoryStore`] but fails
+/// the named methods with an injected backend error — for exercising the
+/// reconcile/metering loops' per-tick error discipline (log, skip, never
+/// fatal).
+#[cfg(test)]
+pub(crate) mod testkit {
+    use super::memory::InMemoryStore;
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    pub(crate) struct FailingStore {
+        inner: InMemoryStore,
+        fail: Mutex<BTreeSet<&'static str>>,
+    }
+
+    impl FailingStore {
+        pub(crate) fn new() -> Self {
+            Self {
+                inner: InMemoryStore::new(),
+                fail: Mutex::new(BTreeSet::new()),
+            }
+        }
+
+        /// Make `method` (a `Store` method name) fail from now on.
+        pub(crate) fn fail(&self, method: &'static str) {
+            self.fail.lock().unwrap().insert(method);
+        }
+
+        fn check(&self, method: &'static str) -> Result<(), StoreError> {
+            if self.fail.lock().unwrap().contains(method) {
+                Err(StoreError::Backend(format!("injected {method} failure")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Store for FailingStore {
+        async fn upsert_desired(
+            &self,
+            id: &ClusterId,
+            spec: ClusterSpec,
+        ) -> Result<u64, StoreError> {
+            self.check("upsert_desired")?;
+            self.inner.upsert_desired(id, spec).await
+        }
+        async fn get(&self, id: &ClusterId) -> Result<Option<StoredCluster>, StoreError> {
+            self.check("get")?;
+            self.inner.get(id).await
+        }
+        async fn list(&self) -> Result<Vec<StoredCluster>, StoreError> {
+            self.check("list")?;
+            self.inner.list().await
+        }
+        async fn set_desired(
+            &self,
+            id: &ClusterId,
+            desired: DesiredState,
+        ) -> Result<(), StoreError> {
+            self.check("set_desired")?;
+            self.inner.set_desired(id, desired).await
+        }
+        async fn record_observation(
+            &self,
+            id: &ClusterId,
+            observed: Option<ClusterState>,
+            observed_generation: u64,
+        ) -> Result<(), StoreError> {
+            self.check("record_observation")?;
+            self.inner
+                .record_observation(id, observed, observed_generation)
+                .await
+        }
+        async fn set_condition(
+            &self,
+            id: &ClusterId,
+            condition: Option<DriftCondition>,
+        ) -> Result<(), StoreError> {
+            self.check("set_condition")?;
+            self.inner.set_condition(id, condition).await
+        }
+        async fn is_quarantined(&self) -> Result<bool, StoreError> {
+            self.check("is_quarantined")?;
+            self.inner.is_quarantined().await
+        }
+        async fn set_quarantine(&self, quarantined: bool) -> Result<(), StoreError> {
+            self.check("set_quarantine")?;
+            self.inner.set_quarantine(quarantined).await
+        }
+        async fn record_attempt(
+            &self,
+            id: &ClusterId,
+            failure_count: u32,
+            next_attempt_at: u64,
+        ) -> Result<(), StoreError> {
+            self.check("record_attempt")?;
+            self.inner
+                .record_attempt(id, failure_count, next_attempt_at)
+                .await
+        }
+        async fn begin_intent(
+            &self,
+            key: &str,
+            fingerprint: &str,
+        ) -> Result<IntentOutcome, StoreError> {
+            self.check("begin_intent")?;
+            self.inner.begin_intent(key, fingerprint).await
+        }
+        async fn complete_intent(&self, key: &str, response_json: &str) -> Result<(), StoreError> {
+            self.check("complete_intent")?;
+            self.inner.complete_intent(key, response_json).await
+        }
+        async fn get_intent(&self, key: &str) -> Result<Option<IntentRecord>, StoreError> {
+            self.check("get_intent")?;
+            self.inner.get_intent(key).await
+        }
+        async fn reap_intents(&self, applied_before: u64) -> Result<u64, StoreError> {
+            self.check("reap_intents")?;
+            self.inner.reap_intents(applied_before).await
+        }
+        async fn record_job(&self, job: JobRecord) -> Result<(), StoreError> {
+            self.check("record_job")?;
+            self.inner.record_job(job).await
+        }
+        async fn list_jobs(&self) -> Result<Vec<JobRecord>, StoreError> {
+            self.check("list_jobs")?;
+            self.inner.list_jobs().await
+        }
+        async fn upsert_pool(&self, name: &str, spec: PoolSpec) -> Result<u64, StoreError> {
+            self.check("upsert_pool")?;
+            self.inner.upsert_pool(name, spec).await
+        }
+        async fn get_pool(&self, name: &str) -> Result<Option<StoredPool>, StoreError> {
+            self.check("get_pool")?;
+            self.inner.get_pool(name).await
+        }
+        async fn list_pools(&self) -> Result<Vec<StoredPool>, StoreError> {
+            self.check("list_pools")?;
+            self.inner.list_pools().await
+        }
+        async fn delete_pool(&self, name: &str) -> Result<(), StoreError> {
+            self.check("delete_pool")?;
+            self.inner.delete_pool(name).await
+        }
+        async fn record_pool_observation(
+            &self,
+            name: &str,
+            observed_json: &str,
+        ) -> Result<(), StoreError> {
+            self.check("record_pool_observation")?;
+            self.inner
+                .record_pool_observation(name, observed_json)
+                .await
+        }
+        async fn upsert_allocation(&self, alloc: AllocationSpec) -> Result<(), StoreError> {
+            self.check("upsert_allocation")?;
+            self.inner.upsert_allocation(alloc).await
+        }
+        async fn list_allocations(&self, pool: &str) -> Result<Vec<AllocationSpec>, StoreError> {
+            self.check("list_allocations")?;
+            self.inner.list_allocations(pool).await
+        }
+        async fn delete_allocation(&self, pool: &str, project: &str) -> Result<(), StoreError> {
+            self.check("delete_allocation")?;
+            self.inner.delete_allocation(pool, project).await
+        }
+        async fn record_usage_samples(&self, samples: &[UsageSample]) -> Result<(), StoreError> {
+            self.check("record_usage_samples")?;
+            self.inner.record_usage_samples(samples).await
+        }
+        async fn usage_samples(
+            &self,
+            project: Option<&str>,
+            pool: Option<&str>,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<UsageSample>, StoreError> {
+            self.check("usage_samples")?;
+            self.inner.usage_samples(project, pool, from, to).await
         }
     }
 }

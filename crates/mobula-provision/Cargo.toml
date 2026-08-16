@@ -15,6 +15,7 @@ kuberay = ["dep:kube", "dep:k8s-openapi", "dep:tokio", "dep:tracing", "dep:rustl
 
 [dependencies]
 mobula-core.workspace = true
+mobula-policy.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

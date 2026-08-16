@@ -32,6 +32,7 @@ impl Provisioner for MockProvisioner {
         _: &ClusterSpec,
         generation: u64,
         _: &str,
+        _: Option<&mobula_provision::QueueAssignment>,
     ) -> Result<ApplyResponse, ProvisionError> {
         self.state
             .lock()

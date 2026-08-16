@@ -14,6 +14,23 @@ use mobula_core::{
 };
 use serde_json::{json, Value};
 
+use crate::kueue::{ELASTIC_JOB_ANNOTATION, QUEUE_LABEL};
+
+/// The Kueue queue a RayCluster is admitted through (ADR-0010): the
+/// allocation's LocalQueue name, plus whether the pool allows elastic
+/// resizing. Derived at apply time from the project→allocation lookup (not
+/// user input), so it is a parameter of [`to_raycluster`], never part of
+/// `ClusterSpec`'s serialized form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueAssignment {
+    /// LocalQueue name (= the allocation's project name).
+    pub queue_name: String,
+    /// Elastic pools stamp `kueue.x-k8s.io/elastic-job` and force the
+    /// in-tree autoscaler on — elastic mode (KEP-77 Workload Slices)
+    /// requires it (research doc §2).
+    pub elastic: bool,
+}
+
 pub const API_VERSION: &str = "ray.io/v1";
 pub const KIND: &str = "RayCluster";
 /// Server-side-apply field manager (ADR-0007): identifies Mobula's owned
@@ -30,31 +47,51 @@ pub const CLUSTER_ID_LABEL: &str = "mobula.dev/cluster-id";
 pub const GENERATION_ANNOTATION: &str = "mobula.dev/generation";
 
 /// Build the RayCluster manifest for `spec` at `generation`. `autoscaling`
-/// selects the field-ownership regime (ADR-0007).
+/// selects the field-ownership regime (ADR-0007). `queue` nominates the
+/// Kueue LocalQueue (ADR-0010): `None` (the default) produces a manifest
+/// byte-identical to the queue-free form; `Some` stamps the
+/// `kueue.x-k8s.io/queue-name` label, and an elastic assignment also stamps
+/// the `kueue.x-k8s.io/elastic-job` annotation and forces the in-tree
+/// autoscaler on regardless of `autoscaling` (KEP-77 requires it).
 pub fn to_raycluster(
     id: &ClusterId,
     spec: &ClusterSpec,
     autoscaling: bool,
     generation: u64,
+    queue: Option<&QueueAssignment>,
 ) -> Value {
+    // Elastic pools are always in-tree-autoscaled (research doc §2: elastic
+    // mode requires the autoscaler; a non-elastic queue leaves the flag as
+    // the operator set it). ADR-0007 still holds: with autoscaling on we
+    // never write `replicas`.
+    let autoscaling = autoscaling || queue.is_some_and(|q| q.elastic);
     let worker_specs: Vec<Value> = spec
         .worker_groups
         .iter()
         .map(|g| worker_group_spec(g, &spec.image, autoscaling, Some(generation)))
         .collect();
 
+    let mut labels = json!({
+        MANAGED_BY_LABEL: FIELD_MANAGER,
+        CLUSTER_ID_LABEL: id.0,
+    });
+    let mut annotations = json!({
+        GENERATION_ANNOTATION: generation.to_string(),
+    });
+    if let Some(q) = queue {
+        labels[QUEUE_LABEL] = json!(q.queue_name);
+        if q.elastic {
+            annotations[ELASTIC_JOB_ANNOTATION] = json!("true");
+        }
+    }
+
     json!({
         "apiVersion": API_VERSION,
         "kind": KIND,
         "metadata": {
             "name": id.0,
-            "labels": {
-                MANAGED_BY_LABEL: FIELD_MANAGER,
-                CLUSTER_ID_LABEL: id.0,
-            },
-            "annotations": {
-                GENERATION_ANNOTATION: generation.to_string(),
-            },
+            "labels": labels,
+            "annotations": annotations,
         },
         "spec": {
             "rayVersion": spec.ray_version,
@@ -63,6 +100,10 @@ pub fn to_raycluster(
             // clears an out-of-band `suspend: true` and resumes the cluster
             // (#47). Without this, our field manager never owns the field and
             // a Suspended cluster could never be repaired by re-applying.
+            // Note Kueue also drives `suspend` for admission (gang
+            // scheduling): it sets suspend=true on unadmitted workloads and
+            // false once admitted, so Mobula's desired false never fights
+            // Kueue — an admitted cluster converges to running pods.
             "suspend": false,
             "headGroupSpec": head_group_spec(spec, Some(generation)),
             "workerGroupSpecs": worker_specs,
@@ -371,6 +412,11 @@ mod tests {
             service_status_to_state(&json!({})),
             ClusterState::Provisioning
         );
+        // An unrecognized status string is not Running: still coming up.
+        assert_eq!(
+            service_status_to_state(&json!({"serviceStatus": "Preparing"})),
+            ClusterState::Provisioning
+        );
     }
 
     fn spec(autoscale_groups: &[(&str, u32, u32, u32)]) -> ClusterSpec {
@@ -404,6 +450,7 @@ mod tests {
             &spec(&[("cpu", 0, 4, 2)]),
             false,
             1,
+            None,
         );
         assert_eq!(m["apiVersion"], "ray.io/v1");
         assert_eq!(m["kind"], "RayCluster");
@@ -424,6 +471,7 @@ mod tests {
             &spec(&[("cpu", 0, 4, 2)]),
             false,
             1,
+            None,
         );
         let wg = &m["spec"]["workerGroupSpecs"][0];
         assert_eq!(m["spec"]["enableInTreeAutoscaling"], false);
@@ -445,6 +493,7 @@ mod tests {
             &spec(&[("cpu", 1, 8, 3)]),
             true,
             1,
+            None,
         );
         let wg = &m["spec"]["workerGroupSpecs"][0];
         assert_eq!(m["spec"]["enableInTreeAutoscaling"], true);
@@ -466,7 +515,7 @@ mod tests {
     fn gpu_workers_get_resource_limits() {
         let mut s = spec(&[("gpu", 0, 2, 1)]);
         s.worker_groups[0].gpu = Some("1".into());
-        let m = to_raycluster(&ClusterId("demo".into()), &s, false, 1);
+        let m = to_raycluster(&ClusterId("demo".into()), &s, false, 1, None);
         let res =
             &m["spec"]["workerGroupSpecs"][0]["template"]["spec"]["containers"][0]["resources"];
         assert_eq!(res["limits"]["nvidia.com/gpu"], "1");
@@ -482,6 +531,7 @@ mod tests {
             &spec(&[("cpu", 0, 4, 2)]),
             false,
             1,
+            None,
         );
         assert_eq!(m["spec"]["suspend"], serde_json::json!(false));
     }
@@ -492,7 +542,7 @@ mod tests {
         // equal the desired fingerprint, so an unedited cluster never looks
         // drifted.
         let s = spec(&[("cpu", 0, 4, 2)]);
-        let m = to_raycluster(&ClusterId("demo".into()), &s, false, 1);
+        let m = to_raycluster(&ClusterId("demo".into()), &s, false, 1, None);
         let from_cr = fingerprint_from_cr(&m["spec"]).expect("fingerprint from CR");
         assert_eq!(owned_spec_fingerprint(&s), from_cr);
     }
@@ -532,5 +582,55 @@ mod tests {
         );
         assert_eq!(status_to_state(&json!({})), ClusterState::Provisioning);
         assert_eq!(status_to_state(&Value::Null), ClusterState::Provisioning);
+    }
+
+    #[test]
+    fn no_queue_assignment_is_byte_identical_to_before() {
+        // The queue-free form must not change: no queue label, no elastic
+        // annotation, autoscaling flag exactly as passed.
+        let s = spec(&[("cpu", 0, 4, 2)]);
+        let m = to_raycluster(&ClusterId("demo".into()), &s, false, 1, None);
+        assert!(m["metadata"]["labels"].get(QUEUE_LABEL).is_none());
+        assert!(m["metadata"]["annotations"]
+            .get(ELASTIC_JOB_ANNOTATION)
+            .is_none());
+        assert_eq!(m["spec"]["enableInTreeAutoscaling"], false);
+    }
+
+    #[test]
+    fn queue_assignment_stamps_queue_label() {
+        let s = spec(&[("cpu", 0, 4, 2)]);
+        let q = QueueAssignment {
+            queue_name: "proj-a".into(),
+            elastic: false,
+        };
+        let m = to_raycluster(&ClusterId("demo".into()), &s, false, 1, Some(&q));
+        assert_eq!(m["metadata"]["labels"][QUEUE_LABEL], "proj-a");
+        // Non-elastic: no annotation, autoscaling flag untouched.
+        assert!(m["metadata"]["annotations"]
+            .get(ELASTIC_JOB_ANNOTATION)
+            .is_none());
+        assert_eq!(m["spec"]["enableInTreeAutoscaling"], false);
+        // replicas still owned by Mobula (ADR-0007 unchanged).
+        assert_eq!(m["spec"]["workerGroupSpecs"][0]["replicas"], 2);
+    }
+
+    #[test]
+    fn elastic_assignment_forces_autoscaling_and_annotation() {
+        let s = spec(&[("cpu", 0, 4, 2)]);
+        let q = QueueAssignment {
+            queue_name: "proj-a".into(),
+            elastic: true,
+        };
+        // autoscaling=false passed, but elastic mode requires the in-tree
+        // autoscaler — it must win (research doc §2).
+        let m = to_raycluster(&ClusterId("demo".into()), &s, false, 1, Some(&q));
+        assert_eq!(m["metadata"]["labels"][QUEUE_LABEL], "proj-a");
+        assert_eq!(m["metadata"]["annotations"][ELASTIC_JOB_ANNOTATION], "true");
+        assert_eq!(m["spec"]["enableInTreeAutoscaling"], true);
+        // ADR-0007 unaffected: with autoscaling on, Mobula never writes
+        // replicas (the autoscaler sidecar owns it).
+        assert!(m["spec"]["workerGroupSpecs"][0].get("replicas").is_none());
+        assert_eq!(m["spec"]["workerGroupSpecs"][0]["maxReplicas"], 4);
     }
 }

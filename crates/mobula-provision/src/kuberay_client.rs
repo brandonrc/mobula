@@ -16,6 +16,7 @@ use mobula_core::{ClusterId, ClusterSpec, ServiceSpec};
 use crate::kuberay::{
     self, CLUSTER_ID_LABEL, FIELD_MANAGER, GENERATION_ANNOTATION, MANAGED_BY_LABEL,
 };
+use crate::kueue;
 use crate::{
     ApplyResponse, ObservedCluster, ObservedService, ProvisionError, Provisioner,
     ServiceProvisioner,
@@ -101,16 +102,23 @@ impl Provisioner for KubeRayProvisioner {
         spec: &ClusterSpec,
         generation: u64,
         idempotency_key: &str,
+        queue: Option<&crate::kuberay::QueueAssignment>,
     ) -> Result<ApplyResponse, ProvisionError> {
-        let manifest = kuberay::to_raycluster(id, spec, self.autoscaling, generation);
+        let manifest = kuberay::to_raycluster(id, spec, self.autoscaling, generation, queue);
         // Wrap the manifest as a DynamicObject the dynamic Api can apply.
+        let mut labels = std::collections::BTreeMap::from([
+            (MANAGED_BY_LABEL.to_string(), FIELD_MANAGER.to_string()),
+            (CLUSTER_ID_LABEL.to_string(), id.0.clone()),
+        ]);
+        // The Kueue queue label must ride on the applied object's metadata
+        // (to_raycluster already carries it inside the manifest).
+        if let Some(q) = queue {
+            labels.insert(kueue::QUEUE_LABEL.to_string(), q.queue_name.clone());
+        }
         let mut obj = DynamicObject::new(&id.0, &raycluster_resource());
         obj.metadata = ObjectMeta {
             name: Some(id.0.clone()),
-            labels: Some(std::collections::BTreeMap::from([
-                (MANAGED_BY_LABEL.to_string(), FIELD_MANAGER.to_string()),
-                (CLUSTER_ID_LABEL.to_string(), id.0.clone()),
-            ])),
+            labels: Some(labels),
             // Stamp the generation on the CR so observe() reads it back
             // (ADR-0006, #40). The pod-template stamp lives inside the spec
             // (manifest["spec"]) and rolls pods on a bump.

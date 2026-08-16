@@ -7,6 +7,7 @@
 
 pub mod cluster;
 pub mod job;
+pub mod pool;
 pub mod registry;
 pub mod service;
 
@@ -14,5 +15,9 @@ pub use cluster::{
     ClusterId, ClusterSpec, ClusterState, DriftCondition, TransitionError, WorkerGroup,
 };
 pub use job::JobRecord;
+pub use pool::{
+    AllocationSpec, AllocationSpecError, FlavorSpec, FlavorSpecError, PoolSpec, PoolSpecError,
+    TaintSpec, TaintSpecError,
+};
 pub use registry::{ClusterEndpoint, ClusterRegistry, RegistryError};
 pub use service::{ServiceSpec, UpgradeStrategy};

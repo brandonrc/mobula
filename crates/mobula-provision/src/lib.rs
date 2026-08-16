@@ -9,11 +9,17 @@ pub mod demo;
 pub mod kuberay;
 #[cfg(feature = "kuberay")]
 pub mod kuberay_client;
+pub mod kueue;
+#[cfg(feature = "kuberay")]
+pub mod kueue_client;
 pub use demo::DemoProvisioner;
+pub use kuberay::QueueAssignment;
 #[cfg(feature = "kuberay")]
 pub use kuberay_client::KubeRayProvisioner;
+#[cfg(feature = "kuberay")]
+pub use kueue_client::KueueClient;
 
-use mobula_core::{ClusterId, ClusterSpec, ClusterState, ServiceSpec};
+use mobula_core::{AllocationSpec, ClusterId, ClusterSpec, ClusterState, PoolSpec, ServiceSpec};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
@@ -66,12 +72,15 @@ pub trait Provisioner: Send + Sync {
     /// duplicates. `generation` is stamped onto the backing resource so
     /// [`Provisioner::observe`] can read it back (ADR-0006, #40). Returns
     /// the [`ApplyResponse`] recorded in the outbox (ADR-0007, #39).
+    /// `queue` nominates the Kueue LocalQueue the workload is admitted
+    /// through (ADR-0010); `None` leaves the manifest queue-free.
     async fn apply(
         &self,
         id: &ClusterId,
         spec: &ClusterSpec,
         generation: u64,
         idempotency_key: &str,
+        queue: Option<&QueueAssignment>,
     ) -> Result<ApplyResponse, ProvisionError>;
 
     /// Begin teardown. Idempotent; succeeds if already gone.
@@ -91,6 +100,61 @@ pub struct ObservedService {
     pub state: ClusterState,
     /// The service's external Serve endpoint base URL, if ready.
     pub url: Option<String>,
+}
+
+/// A pool's quota ledger as read back from Kueue's ClusterQueue `.status`
+/// (ADR-0010 §5 of the research doc: the status *is* the ledger). All counts
+/// default to 0 when the CQ exists but Kueue hasn't populated status yet.
+/// Serializable: the controller persists it as opaque JSON on the pool row
+/// (`record_pool_observation`), and Slice 4's metering loop reads it back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PoolObservation {
+    pub admitted_workloads: u32,
+    pub reserving_workloads: u32,
+    pub pending_workloads: u32,
+    /// flavor → resource → quantity string (from `status.flavorsUsage`
+    /// `total` — the amounts Kueue admits against, not measured consumption).
+    pub flavors_usage:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// LocalQueue name → resource → quantity string, from each LocalQueue's
+    /// own `status.flavorsUsage` (summed across flavors; LQ status exists
+    /// since Kueue v0.9). This is the *per-project* attribution the CQ-level
+    /// `flavors_usage` lacks (a CQ is pool-scoped). Added in Slice 4:
+    /// `#[serde(default)]` so observations persisted by an older build
+    /// still deserialize (they parse with an empty map — a version note,
+    /// not a format break).
+    #[serde(default)]
+    pub queues_usage:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+/// Manages a pool's Kueue objects (Cohort / ResourceFlavors / ClusterQueue /
+/// LocalQueues). Defined here — next to [`Provisioner`] — rather than in
+/// mobula-controller so the live client can implement it without a crate
+/// cycle (the controller already depends on this crate); the controller's
+/// pool reconcile loop is generic over this trait and stays k8s-free.
+#[async_trait::async_trait]
+pub trait PoolProvisioner: Send + Sync {
+    /// Create or update all of a pool's Kueue objects (server-side apply:
+    /// idempotent for identical desired state).
+    async fn apply_pool(
+        &self,
+        spec: &PoolSpec,
+        allocs: &[AllocationSpec],
+    ) -> Result<(), ProvisionError>;
+
+    /// Delete every Kueue object of the named pool. Idempotent; succeeds
+    /// when already gone.
+    async fn delete_pool(&self, name: &str) -> Result<(), ProvisionError>;
+
+    /// Read the pool's quota ledger from its ClusterQueue status. `None`
+    /// when the ClusterQueue does not exist.
+    async fn observe_pool(&self, name: &str) -> Result<Option<PoolObservation>, ProvisionError>;
+
+    /// Whether the API server serves the Kueue CRDs. When false the pool
+    /// reconcile loop skips actuation entirely and pools remain in-process
+    /// quota only (ADR-0010 fallback). Cached per client.
+    async fn kueue_present(&self) -> bool;
 }
 
 /// Manages Ray Serve services (RayService CRs). Distinct from

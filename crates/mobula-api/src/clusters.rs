@@ -19,7 +19,7 @@ use mobula_core::{ClusterId, ClusterSpec};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use mobula_policy::{admit, cluster_demand, PriceSheet, ResourceVector};
+use mobula_policy::{admit, cluster_demand, PriceSheet, ResourceMap};
 use std::collections::HashMap;
 
 use crate::auth_layer::authorize;
@@ -30,7 +30,7 @@ use crate::auth_layer::authorize;
 #[derive(Clone, Default)]
 pub struct PolicyConfig {
     pub prices: Option<PriceSheet>,
-    pub quotas: HashMap<String, ResourceVector>,
+    pub quotas: HashMap<String, ResourceMap>,
 }
 
 #[derive(Clone)]
@@ -206,7 +206,7 @@ async fn create_cluster(
     // The guard is an OwnedMutexGuard so it stays alive past the `if let`,
     // covering the `upsert_desired` below; it drops at end of function.
     // Projects without a quota skip the lock entirely and stay concurrent.
-    let _admit_guard = if let Some(limit) = st.policy.quotas.get(&project).copied() {
+    let _admit_guard = if let Some(limit) = st.policy.quotas.get(&project).cloned() {
         // Fetch-or-insert this project's lock (brief std::Mutex hold, never
         // across an await), then acquire it.
         let lock = {
@@ -226,7 +226,7 @@ async fn create_cluster(
         // (review R2#2).
         let in_use = match st.store.list().await {
             Ok(clusters) => {
-                let mut acc = ResourceVector::default();
+                let mut acc = ResourceMap::default();
                 for c in clusters.iter().filter(|c| {
                     c.spec.project == project && c.id != id && c.desired == DesiredState::Running
                 }) {
@@ -270,6 +270,28 @@ async fn create_cluster(
                 action = "create_cluster", cluster = %id, generation,
                 "cluster upserted"
             );
+            // Pool admission (ADR-0010): resolve the project's Kueue queue
+            // assignment from the allocations in the store and record it in
+            // the audit log. The reconcile loop re-derives the assignment
+            // from the store at apply time (the store is the transport, so
+            // ClusterSpec's serialized form stays free of it); a project
+            // with no allocation creates a queue-free cluster, unchanged
+            // from before pools existed.
+            match mobula_controller::queue_assignment_for_project(st.store.as_ref(), &project).await
+            {
+                Ok(Some(q)) => tracing::info!(
+                    target: "mobula::audit",
+                    decision = "allow",
+                    subject = ident(&identity).map(|i| i.subject.as_str()).unwrap_or("-"),
+                    action = "queue_assign", cluster = %id, project = %project,
+                    queue = %q.queue_name, elastic = q.elastic,
+                    "cluster admitted to pool queue"
+                ),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, cluster = %id, "queue assignment lookup failed")
+                }
+            }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "id": id.0, "generation": generation })),

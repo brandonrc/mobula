@@ -7,7 +7,9 @@
 pub mod auth_layer;
 pub mod clusters;
 pub mod gateway;
+pub mod pools;
 pub mod services;
+pub mod usage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -37,6 +39,16 @@ use utoipa_swagger_ui::SwaggerUi;
         clusters::create_cluster,
         clusters::delete_cluster,
         clusters::list_jobs,
+        pools::list_pools,
+        pools::get_pool,
+        pools::create_pool,
+        pools::delete_pool,
+        pools::pool_usage,
+        pools::put_allocation,
+        pools::list_allocations,
+        pools::delete_allocation,
+        usage::usage_report,
+        usage::metrics,
         services::list_services,
         services::get_service,
         services::deploy_service,
@@ -48,6 +60,13 @@ use utoipa_swagger_ui::SwaggerUi;
             clusters::CreateCluster,
             clusters::ClusterView,
             clusters::JobView,
+            pools::CreatePool,
+            pools::PoolView,
+            pools::PoolUsageView,
+            pools::ResourceUtilization,
+            pools::PutAllocation,
+            usage::UsageReport,
+            usage::UsageGroup,
             services::DeployService,
             services::ServiceView,
             mobula_core::ClusterSpec,
@@ -55,6 +74,10 @@ use utoipa_swagger_ui::SwaggerUi;
             mobula_core::ClusterState,
             mobula_core::ServiceSpec,
             mobula_core::UpgradeStrategy,
+            mobula_core::PoolSpec,
+            mobula_core::FlavorSpec,
+            mobula_core::TaintSpec,
+            mobula_core::AllocationSpec,
         )
     ),
     modifiers(&BearerAuth),
@@ -68,6 +91,15 @@ use utoipa_swagger_ui::SwaggerUi;
          Deploy/update/delete need Write on the service target \
          (Developer or Admin — deploying is code); reads are open to any \
          authenticated role. KubeRay handles zero-downtime canary rollout."),
+        (name = "pools", description = "Capacity pools and per-project \
+         allocations (ADR-0010): platform configuration, not app lifecycle. \
+         Reads need any authenticated role; create/delete/allocation \
+         mutations are Admin-only. Mounted only when a store is configured."),
+        (name = "usage", description = "Usage metering (Slice 4): \
+         resource-hours reports and the Prometheus gauge over the metered \
+         samples. Reads need Read on the cluster target (Viewer+) — \
+         consumption reporting is cluster data, not pool topology. Mounted \
+         only when a store is configured."),
     ),
     info(
         title = "Mobula",
@@ -264,7 +296,11 @@ fn build_app_full_svc_inner(
         .route("/api/v1/authz/check", any(auth_layer::authz_check))
         .with_state(auth.clone());
     if let Some(store) = store {
-        app = app.merge(clusters::router(store, Arc::new(policy)));
+        let policy = Arc::new(policy);
+        app = app
+            .merge(clusters::router(store.clone(), policy.clone()))
+            .merge(pools::router(store.clone()))
+            .merge(usage::router(store, policy));
     }
     if let Some(services) = services {
         app = app.merge(services::router(services));
@@ -302,7 +338,8 @@ pub struct ServeOptions {
     /// Permit cluster tokens over cleartext http:// (registry validation).
     pub allow_insecure_transport: bool,
     /// Desired-state store; when present, the cluster lifecycle routes
-    /// (`/api/v1/clusters`) are mounted. The caller owns the reconcile loop.
+    /// (`/api/v1/clusters`) and capacity-pool routes (`/api/v1/pools`) are
+    /// mounted. The caller owns the reconcile loop.
     pub store: Option<Arc<dyn mobula_controller::Store>>,
     /// Cost/quota governance for the cluster routes (Phase 4). Default =
     /// no cost shown, no quota enforced.
@@ -450,6 +487,19 @@ mod tests {
         assert!(doc["components"]["schemas"]["ClusterView"].is_object());
         assert!(doc["components"]["schemas"]["ClusterSpec"].is_object());
         assert!(doc["components"]["schemas"]["WorkerGroup"].is_object());
+        // The capacity-pool contract (ADR-0010).
+        assert!(doc["paths"]["/api/v1/pools"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/pools"]["post"].is_object());
+        assert!(doc["paths"]["/api/v1/pools/{name}"]["delete"].is_object());
+        assert!(doc["paths"]["/api/v1/pools/{name}/allocations/{project}"]["put"].is_object());
+        assert!(doc["components"]["schemas"]["PoolView"].is_object());
+        assert!(doc["components"]["schemas"]["PoolSpec"].is_object());
+        // The usage/metering contract (Slice 4).
+        assert!(doc["paths"]["/api/v1/pools/{name}/usage"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/usage"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/metrics"]["get"].is_object());
+        assert!(doc["components"]["schemas"]["UsageReport"].is_object());
+        assert!(doc["components"]["schemas"]["PoolUsageView"].is_object());
         // Bearer security scheme is advertised for client codegen.
         assert_eq!(
             doc["components"]["securitySchemes"]["bearer"]["scheme"],

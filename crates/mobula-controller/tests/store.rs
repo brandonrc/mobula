@@ -5,7 +5,10 @@
 use mobula_controller::{
     DesiredState, InMemoryStore, IntentOutcome, IntentStatus, SqliteStore, Store,
 };
-use mobula_core::{ClusterId, ClusterSpec, ClusterState, WorkerGroup};
+use mobula_core::{
+    AllocationSpec, ClusterId, ClusterSpec, ClusterState, FlavorSpec, PoolSpec, WorkerGroup,
+};
+use std::collections::BTreeMap;
 
 fn spec(name: &str, replicas: u32) -> ClusterSpec {
     ClusterSpec {
@@ -187,6 +190,305 @@ async fn in_memory_store_conforms() {
 async fn sqlite_store_conforms() {
     let store = SqliteStore::in_memory().await.unwrap();
     conformance(&store).await;
+}
+
+fn pool_spec(name: &str, weight: f64) -> PoolSpec {
+    PoolSpec {
+        name: name.into(),
+        flavors: vec![FlavorSpec {
+            name: "a100".into(),
+            resources: BTreeMap::from([
+                ("cpu".to_string(), "64".to_string()),
+                ("nvidia.com/gpu".to_string(), "8".to_string()),
+            ]),
+            node_labels: BTreeMap::new(),
+            taints: vec![],
+        }],
+        cohort: "research".into(),
+        fair_sharing_weight: weight,
+        elastic: true,
+    }
+}
+
+fn alloc(pool: &str, project: &str) -> AllocationSpec {
+    AllocationSpec {
+        pool: pool.into(),
+        project: project.into(),
+        namespace: project.into(),
+        nominal: BTreeMap::from([("cpu".to_string(), "16".to_string())]),
+        borrowing_limit: BTreeMap::new(),
+        lending_limit: BTreeMap::new(),
+    }
+}
+
+/// Pool persistence conformance (ADR-0004/ADR-0010), run against BOTH impls.
+async fn pool_conformance(store: &dyn Store) {
+    // Upsert → get round-trip; first insert is generation 1.
+    assert_eq!(
+        store
+            .upsert_pool("gpu", pool_spec("gpu", 1.0))
+            .await
+            .unwrap(),
+        1
+    );
+    let got = store.get_pool("gpu").await.unwrap().unwrap();
+    assert_eq!(got.name, "gpu");
+    assert_eq!(got.generation, 1);
+    assert_eq!(got.spec, pool_spec("gpu", 1.0));
+    assert!(got.created_at > 0);
+
+    // Identical re-upsert keeps the generation stable.
+    assert_eq!(
+        store
+            .upsert_pool("gpu", pool_spec("gpu", 1.0))
+            .await
+            .unwrap(),
+        1
+    );
+    // A changed spec bumps it.
+    assert_eq!(
+        store
+            .upsert_pool("gpu", pool_spec("gpu", 2.0))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(store.get_pool("gpu").await.unwrap().unwrap().generation, 2);
+    // created_at survives updates.
+    assert_eq!(
+        store.get_pool("gpu").await.unwrap().unwrap().created_at,
+        got.created_at
+    );
+
+    // Pool observation (ADR-0010; the Slice 4 metering loop reads this):
+    // None until the pool reconcile loop records one, then round-trips and
+    // survives spec updates.
+    assert!(store
+        .get_pool("gpu")
+        .await
+        .unwrap()
+        .unwrap()
+        .observed_json
+        .is_none());
+    store
+        .record_pool_observation("gpu", "{\"admitted_workloads\":1}")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_pool("gpu")
+            .await
+            .unwrap()
+            .unwrap()
+            .observed_json
+            .as_deref(),
+        Some("{\"admitted_workloads\":1}")
+    );
+    assert!(
+        store
+            .get_pool("gpu")
+            .await
+            .unwrap()
+            .unwrap()
+            .observed_at
+            .is_some(),
+        "recording an observation stamps observed_at"
+    );
+    store
+        .upsert_pool("gpu", pool_spec("gpu", 3.0))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_pool("gpu")
+            .await
+            .unwrap()
+            .unwrap()
+            .observed_json
+            .is_some(),
+        "observation survives a spec update"
+    );
+
+    // list_pools sees all pools.
+    store
+        .upsert_pool("cpu", pool_spec("cpu", 1.0))
+        .await
+        .unwrap();
+    let mut names: Vec<String> = store
+        .list_pools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["cpu", "gpu"]);
+
+    // Missing pool reads as None; deleting a missing pool errors.
+    assert!(store.get_pool("ghost").await.unwrap().is_none());
+    let err = store.delete_pool("ghost").await.unwrap_err().to_string();
+    assert!(err.contains("no such pool ghost"), "{err}");
+
+    // Allocation upsert/list/delete, scoped per pool.
+    store
+        .upsert_allocation(alloc("gpu", "proj-a"))
+        .await
+        .unwrap();
+    store
+        .upsert_allocation(alloc("gpu", "proj-b"))
+        .await
+        .unwrap();
+    store
+        .upsert_allocation(alloc("cpu", "proj-c"))
+        .await
+        .unwrap();
+    // Re-upsert of the same key updates in place (no duplicate).
+    let mut updated = alloc("gpu", "proj-a");
+    updated
+        .nominal
+        .insert("memory".to_string(), "64Gi".to_string());
+    store.upsert_allocation(updated).await.unwrap();
+
+    let mut gpu_projects: Vec<String> = store
+        .list_allocations("gpu")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.project)
+        .collect();
+    gpu_projects.sort();
+    assert_eq!(gpu_projects, ["proj-a", "proj-b"]);
+    // Scoped per pool: proj-c lives under "cpu" only.
+    assert_eq!(store.list_allocations("cpu").await.unwrap().len(), 1);
+    assert!(store.list_allocations("ghost").await.unwrap().is_empty());
+
+    store.delete_allocation("gpu", "proj-a").await.unwrap();
+    let remaining: Vec<String> = store
+        .list_allocations("gpu")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.project)
+        .collect();
+    assert_eq!(remaining, ["proj-b"]);
+    let err = store
+        .delete_allocation("gpu", "proj-a")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no such allocation gpu/proj-a"), "{err}");
+
+    // Hard delete removes the pool.
+    store.delete_pool("cpu").await.unwrap();
+    assert!(store.get_pool("cpu").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn in_memory_store_pool_conforms() {
+    pool_conformance(&InMemoryStore::new()).await;
+}
+
+/// Usage-sample timeseries conformance (Slice 4), run against BOTH impls.
+async fn usage_conformance(store: &dyn Store) {
+    use mobula_controller::{UsageSample, UsageSource};
+    let sample = |ts: u64, project: &str, pool: &str, resource: &str, qty: f64| UsageSample {
+        ts,
+        project: project.into(),
+        pool: pool.into(),
+        resource: resource.into(),
+        quantity: qty,
+        source: if pool.is_empty() {
+            UsageSource::ObservedSpec
+        } else {
+            UsageSource::KueueLedger
+        },
+    };
+
+    // Append in non-chronological order; reads come back ts-ordered.
+    store
+        .record_usage_samples(&[
+            sample(300, "proj-a", "gpu", "cpu", 8.0),
+            sample(100, "proj-a", "gpu", "cpu", 4.0),
+            sample(200, "proj-a", "gpu", "cpu", 6.0),
+            sample(150, "proj-b", "gpu", "cpu", 2.0),
+            sample(150, "proj-a", "gpu", "memory", 16.0),
+            sample(150, "proj-a", "cpu-pool", "cpu", 1.0),
+            sample(150, "proj-c", "", "cpu", 3.0), // no allocation → pool ""
+        ])
+        .await
+        .unwrap();
+
+    // Full range, no filters: everything, ordered by ts.
+    let all = store.usage_samples(None, None, 0, u64::MAX).await.unwrap();
+    assert_eq!(all.len(), 7);
+    let ts: Vec<u64> = all.iter().map(|s| s.ts).collect();
+    assert_eq!(ts, [100, 150, 150, 150, 150, 200, 300]);
+
+    // Range query is inclusive on both ends.
+    let window = store.usage_samples(None, None, 150, 200).await.unwrap();
+    assert_eq!(window.len(), 5);
+
+    // Project filter.
+    let a = store
+        .usage_samples(Some("proj-a"), None, 0, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(a.len(), 5);
+    assert!(a.iter().all(|s| s.project == "proj-a"));
+
+    // Pool filter.
+    let gpu = store
+        .usage_samples(None, Some("gpu"), 0, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(gpu.len(), 5);
+    assert!(gpu.iter().all(|s| s.pool == "gpu"));
+
+    // Both filters + range, and the source enum round-trips.
+    let one = store
+        .usage_samples(Some("proj-a"), Some("gpu"), 100, 100)
+        .await
+        .unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].quantity, 4.0);
+    assert_eq!(one[0].source, UsageSource::KueueLedger);
+    assert_eq!(
+        store
+            .usage_samples(Some("proj-c"), None, 0, u64::MAX)
+            .await
+            .unwrap()[0]
+            .source,
+        UsageSource::ObservedSpec
+    );
+
+    // Empty range / no match.
+    assert!(store
+        .usage_samples(None, None, 1000, 2000)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .usage_samples(Some("ghost"), None, 0, u64::MAX)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn in_memory_store_usage_conforms() {
+    usage_conformance(&InMemoryStore::new()).await;
+}
+
+#[tokio::test]
+async fn sqlite_store_usage_conforms() {
+    let store = SqliteStore::in_memory().await.unwrap();
+    usage_conformance(&store).await;
+}
+
+#[tokio::test]
+async fn sqlite_store_pool_conforms() {
+    let store = SqliteStore::in_memory().await.unwrap();
+    pool_conformance(&store).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -37,6 +37,9 @@ pub enum Target {
     Cluster,
     /// Ray Serve services — deploying/updating a Serve app is "code".
     Service,
+    /// Capacity pools and their allocations (ADR-0010) — platform
+    /// configuration, not app lifecycle, so mutations are Admin-only.
+    Pool,
 }
 
 /// Built-in v0 roles (ADR-0003). Roles are permission-sets over
@@ -63,14 +66,18 @@ impl Role {
             // Viewer: read-only, any target.
             (Role::Viewer, _) => action == Read,
             // Developer: full job + service access (both are "code"),
-            // read-only clusters.
+            // read-only clusters and pools.
             (Role::Developer, Job) | (Role::Developer, Service) => {
                 matches!(action, Read | Write | Delete)
             }
-            (Role::Developer, Cluster) => action == Read,
-            // Operator: full cluster lifecycle, read-only code surfaces.
+            (Role::Developer, Cluster) | (Role::Developer, Pool) => action == Read,
+            // Operator: full cluster lifecycle, read-only code surfaces and
+            // pool topology (pools are platform config — mutations are
+            // Admin-only).
             (Role::Operator, Cluster) => matches!(action, Read | Write | Delete),
-            (Role::Operator, Job) | (Role::Operator, Service) => action == Read,
+            (Role::Operator, Job) | (Role::Operator, Service) | (Role::Operator, Pool) => {
+                action == Read
+            }
         }
     }
 }
@@ -447,6 +454,16 @@ mod tests {
         // Services are code: Developer deploys, Operator read-only.
         assert!(Role::Developer.grants(Write, Service));
         assert!(!Role::Operator.grants(Write, Service));
+        // Pools are platform config: everyone reads, only Admin mutates
+        // (tripwire mirroring "developer denied cluster-create").
+        assert!(!Role::Developer.grants(Write, Pool));
+        assert!(Role::Developer.grants(Read, Pool));
+        assert!(Role::Operator.grants(Read, Pool));
+        assert!(!Role::Operator.grants(Write, Pool));
+        assert!(!Role::Operator.grants(Delete, Pool));
+        assert!(Role::Admin.grants(Write, Pool) && Role::Admin.grants(Delete, Pool));
+        assert!(Role::Viewer.grants(Read, Pool));
+        assert!(!Role::Viewer.grants(Write, Pool));
         // Viewer: read-only everywhere.
         assert!(Role::Viewer.grants(Read, Cluster));
         assert!(!Role::Viewer.grants(Write, Job));

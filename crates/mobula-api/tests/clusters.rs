@@ -99,6 +99,64 @@ impl Store for SlowListStore {
     async fn list_jobs(&self) -> Result<Vec<mobula_core::JobRecord>, StoreError> {
         self.inner.list_jobs().await
     }
+    async fn upsert_pool(
+        &self,
+        name: &str,
+        spec: mobula_core::PoolSpec,
+    ) -> Result<u64, StoreError> {
+        self.inner.upsert_pool(name, spec).await
+    }
+    async fn get_pool(
+        &self,
+        name: &str,
+    ) -> Result<Option<mobula_controller::StoredPool>, StoreError> {
+        self.inner.get_pool(name).await
+    }
+    async fn list_pools(&self) -> Result<Vec<mobula_controller::StoredPool>, StoreError> {
+        self.inner.list_pools().await
+    }
+    async fn delete_pool(&self, name: &str) -> Result<(), StoreError> {
+        self.inner.delete_pool(name).await
+    }
+    async fn record_pool_observation(
+        &self,
+        name: &str,
+        observed_json: &str,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .record_pool_observation(name, observed_json)
+            .await
+    }
+    async fn upsert_allocation(
+        &self,
+        alloc: mobula_core::AllocationSpec,
+    ) -> Result<(), StoreError> {
+        self.inner.upsert_allocation(alloc).await
+    }
+    async fn list_allocations(
+        &self,
+        pool: &str,
+    ) -> Result<Vec<mobula_core::AllocationSpec>, StoreError> {
+        self.inner.list_allocations(pool).await
+    }
+    async fn delete_allocation(&self, pool: &str, project: &str) -> Result<(), StoreError> {
+        self.inner.delete_allocation(pool, project).await
+    }
+    async fn record_usage_samples(
+        &self,
+        samples: &[mobula_controller::UsageSample],
+    ) -> Result<(), StoreError> {
+        self.inner.record_usage_samples(samples).await
+    }
+    async fn usage_samples(
+        &self,
+        project: Option<&str>,
+        pool: Option<&str>,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<mobula_controller::UsageSample>, StoreError> {
+        self.inner.usage_samples(project, pool, from, to).await
+    }
 }
 
 fn create_body(id: &str) -> serde_json::Value {
@@ -135,7 +193,7 @@ fn create_body_sized(id: &str, cpu: &str, replicas: u32) -> serde_json::Value {
 #[tokio::test]
 async fn quota_admission_rejects_over_limit_with_409() {
     use mobula_api::clusters::PolicyConfig;
-    use mobula_policy::ResourceVector;
+    use mobula_policy::ResourceMap;
 
     let idp = spawn_idp().await;
     let store = Arc::new(InMemoryStore::new());
@@ -143,11 +201,7 @@ async fn quota_admission_rejects_over_limit_with_409() {
     // demo project capped at 5 CPU.
     quotas.insert(
         "demo".to_string(),
-        ResourceVector {
-            cpu: 5.0,
-            gpu: 0.0,
-            mem_gib: 100.0,
-        },
+        ResourceMap::from_iter([("cpu".to_string(), 5.0), ("memory".to_string(), 100.0)]),
     );
     let policy = PolicyConfig {
         prices: None,
@@ -189,7 +243,7 @@ async fn quota_admission_rejects_over_limit_with_409() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_creates_cannot_over_admit_quota() {
     use mobula_api::clusters::PolicyConfig;
-    use mobula_policy::ResourceVector;
+    use mobula_policy::ResourceMap;
 
     let idp = spawn_idp().await;
     let inner = Arc::new(InMemoryStore::new());
@@ -201,11 +255,7 @@ async fn concurrent_creates_cannot_over_admit_quota() {
     // demo project capped at 5 CPU; two 4-CPU creates together need 8 > 5.
     quotas.insert(
         "demo".to_string(),
-        ResourceVector {
-            cpu: 5.0,
-            gpu: 0.0,
-            mem_gib: 100.0,
-        },
+        ResourceMap::from_iter([("cpu".to_string(), 5.0), ("memory".to_string(), 100.0)]),
     );
     let policy = PolicyConfig {
         prices: None,
@@ -368,6 +418,78 @@ async fn get_single_cluster_and_not_found() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn create_with_pool_allocation_assigns_queue() {
+    // ADR-0010 (Slice 3): with a pool + allocation seeded for the cluster's
+    // project, create succeeds and the queue assignment the reconciler will
+    // stamp onto the RayCluster is derivable from the store. (The label
+    // itself is covered by mobula-provision's to_raycluster tests and the
+    // controller's queue_assignment_flows_from_allocation_to_apply test —
+    // no provisioner is reachable from the API tests.)
+    use mobula_core::{AllocationSpec, FlavorSpec, PoolSpec};
+    use std::collections::BTreeMap;
+
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    store
+        .upsert_pool(
+            "gpu",
+            PoolSpec {
+                name: "gpu".into(),
+                flavors: vec![FlavorSpec {
+                    name: "cpu".into(),
+                    resources: BTreeMap::from([("cpu".to_string(), "4".to_string())]),
+                    node_labels: BTreeMap::new(),
+                    taints: vec![],
+                }],
+                cohort: "research".into(),
+                fair_sharing_weight: 1.0,
+                elastic: true,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_allocation(AllocationSpec {
+            pool: "gpu".into(),
+            project: "demo".into(),
+            namespace: "demo".into(),
+            nominal: BTreeMap::new(),
+            borrowing_limit: BTreeMap::new(),
+            lending_limit: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    let app = authed_app_with_store(&idp, store.clone()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body("c1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(store.get(&ClusterId("c1".into())).await.unwrap().is_some());
+
+    // The store carries what the reconciler needs: the allocation-derived
+    // assignment (queue = the allocation's LocalQueue name, elastic = the
+    // pool's flag).
+    let q = mobula_controller::queue_assignment_for_project(store.as_ref(), "demo")
+        .await
+        .unwrap();
+    assert_eq!(
+        q,
+        Some(mobula_provision::QueueAssignment {
+            queue_name: "demo".into(),
+            elastic: true,
+        })
+    );
 }
 
 #[tokio::test]

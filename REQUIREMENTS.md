@@ -140,6 +140,16 @@ cannot serve bearer-token clients.
 - Cost model: per-cluster and per-job cost estimation from provider price sheets
   (pluggable; static price file acceptable at v0).
 
+*Pool model (annotation, 2026-08-16):* implemented per **ADR-0010** — a Mobula
+`ResourcePool` translates to Kueue objects (ResourceFlavor / ClusterQueue /
+Cohort / LocalQueue); Kueue is the pool engine, Mobula owns pool topology,
+admission UX, and attribution. Version floors: Kueue ≥ v0.19.x recommended
+(elastic Workload Slices beta since v0.18, cohort borrowing/lending GA v0.17),
+Kubernetes ≥ 1.34, KubeRay ≥ 1.1. Two accepted divergences from Kueue
+semantics: Mobula admission is **reject-fast** (409 on over-quota create)
+where Kueue queues, and Kueue's `flavorsUsage` is a *reservation* ledger, so
+Mobula meters real attribution itself via `usage_samples`.
+
 ### 3.3 Jobs
 - Submit, queue, monitor, cancel batch jobs against managed clusters (wraps the Ray
   Job Submission API); jobs may target an existing cluster or request an ephemeral

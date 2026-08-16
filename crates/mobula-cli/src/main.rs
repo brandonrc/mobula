@@ -60,6 +60,12 @@ enum Command {
         /// Reconcile resync interval, seconds (with --kuberay-namespace).
         #[arg(long, default_value = "30")]
         reconcile_interval_secs: u64,
+        /// Usage metering interval, seconds (Slice 4). The metering loop
+        /// samples Kueue ledger usage (or observed-spec estimates when
+        /// Kueue is absent) into the store for /api/v1/usage and
+        /// /api/v1/metrics. Off when no store is configured.
+        #[arg(long, default_value = "60")]
+        metering_interval_secs: u64,
         /// DEMO: mount the full cluster/service API backed by an in-memory
         /// mock provisioner instead of KubeRay — no Kubernetes required.
         /// For local testing / docker compose / dashboard development only;
@@ -119,6 +125,7 @@ async fn main() -> std::io::Result<()> {
             kuberay_namespace,
             db,
             reconcile_interval_secs,
+            metering_interval_secs,
             demo,
         } => {
             let validator = match auth_config {
@@ -221,6 +228,41 @@ async fn main() -> std::io::Result<()> {
                                 })
                                 .await;
                         });
+                        // ADR-0010: pool reconcile loop — converges each
+                        // pool's Kueue objects (Cohort/ResourceFlavor/
+                        // ClusterQueue/LocalQueue) and records ClusterQueue
+                        // status observations. Inert when the Kueue CRDs are
+                        // absent (pools stay in-process quota only).
+                        let kueue = std::sync::Arc::new(
+                            mobula_provision::KueueClient::connect()
+                                .await
+                                .map_err(|e| std::io::Error::other(e.to_string()))?,
+                        );
+                        let pool_reconciler =
+                            mobula_controller::PoolReconciler::new(concrete.clone(), kueue.clone());
+                        tokio::spawn(async move {
+                            pool_reconciler
+                                .run(interval, async {
+                                    let _ = tokio::signal::ctrl_c().await;
+                                })
+                                .await;
+                        });
+                        // Slice 4: usage metering — samples the Kueue
+                        // reservation ledger (ClusterQueue + LocalQueue
+                        // flavorsUsage) into the store for /api/v1/usage and
+                        // /api/v1/metrics.
+                        let metering = mobula_controller::Metering::new(
+                            concrete.clone(),
+                            Some(kueue),
+                            std::time::Duration::from_secs(metering_interval_secs),
+                        );
+                        tokio::spawn(async move {
+                            metering
+                                .run(async {
+                                    let _ = tokio::signal::ctrl_c().await;
+                                })
+                                .await;
+                        });
                         tracing::info!(namespace = %ns, "cluster lifecycle controller + services enabled");
                         Some(concrete)
                     }
@@ -291,6 +333,22 @@ async fn main() -> std::io::Result<()> {
                         tokio::spawn(async move {
                             reconciler
                                 .run(interval, async {
+                                    let _ = tokio::signal::ctrl_c().await;
+                                })
+                                .await;
+                        });
+                        // Slice 4: usage metering without Kubernetes — the
+                        // Kueue-absent path meters the min-demand baseline of
+                        // desired cluster specs, so the demo's usage endpoints
+                        // have data.
+                        let metering = mobula_controller::Metering::new(
+                            concrete.clone(),
+                            None,
+                            std::time::Duration::from_secs(metering_interval_secs),
+                        );
+                        tokio::spawn(async move {
+                            metering
+                                .run(async {
                                     let _ = tokio::signal::ctrl_c().await;
                                 })
                                 .await;

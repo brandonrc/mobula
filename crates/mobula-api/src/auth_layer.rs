@@ -52,7 +52,8 @@ fn required_permission(method: &Method) -> PermissionType {
 /// must be derived from the path — a Developer has Write on `Job`/`Service`
 /// but only Read on `Cluster`, and an Operator is the reverse. These prefixes
 /// MUST stay in sync with the router prefixes in `clusters.rs`
-/// (`/api/v1/clusters`) and `services.rs` (`/api/v1/services`).
+/// (`/api/v1/clusters`), `services.rs` (`/api/v1/services`), and `pools.rs`
+/// (`/api/v1/pools`).
 ///
 /// Matching is on segment boundaries — an exact match or a `<prefix>/…`
 /// child — so `/api/v1/clusters-evil` is NOT a cluster path and falls through
@@ -64,6 +65,8 @@ fn target_for_path(path: &str) -> Target {
         Target::Cluster
     } else if is_under("/api/v1/services") {
         Target::Service
+    } else if is_under("/api/v1/pools") {
+        Target::Pool
     } else {
         Target::Job
     }
@@ -279,6 +282,11 @@ mod tests {
         assert_eq!(target_for_path("/api/v1/clusters"), Target::Cluster);
         assert_eq!(target_for_path("/api/v1/clusters/abc"), Target::Cluster);
         assert_eq!(target_for_path("/api/v1/services/x"), Target::Service);
+        assert_eq!(target_for_path("/api/v1/pools"), Target::Pool);
+        assert_eq!(
+            target_for_path("/api/v1/pools/gpu/allocations/p"),
+            Target::Pool
+        );
         assert_eq!(target_for_path("/api/jobs/"), Target::Job);
         // Segment boundary, not naive prefix: `clusters-evil` is not clusters.
         assert_eq!(target_for_path("/api/v1/clusters-evil"), Target::Job);

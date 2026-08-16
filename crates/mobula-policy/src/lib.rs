@@ -3,43 +3,84 @@
 //! reconciler and API call in; nothing here touches Kubernetes or a live
 //! autoscaler (Ray owns scaling; we shape bounds and enforce quota,
 //! per ADR-0007 and the literature audit's "quota is admission control").
+//!
+//! Resource accounting is keyed by arbitrary Kubernetes resource names
+//! (ADR-0010): pools and Kueue quota any resource name, so the fixed
+//! cpu/gpu/memory vector generalizes to [`ResourceMap`]. The well-known
+//! keys are `cpu` (cores), `memory` (**GiB**, not bytes — the map keeps
+//! the old `mem_gib` semantics under the K8s resource name), and
+//! `nvidia.com/gpu` (devices).
 
 pub mod quantity;
+pub mod usage;
 
 use mobula_core::ClusterSpec;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
-/// A multi-resource demand/quota vector.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct ResourceVector {
-    pub cpu: f64,
-    pub gpu: f64,
-    pub mem_gib: f64,
-}
+/// Well-known resource keys (any other K8s resource name is equally valid).
+pub const CPU: &str = "cpu";
+pub const MEMORY: &str = "memory";
+pub const GPU: &str = "nvidia.com/gpu";
 
-impl std::ops::Add for ResourceVector {
-    type Output = ResourceVector;
-    fn add(self, o: ResourceVector) -> ResourceVector {
-        ResourceVector {
-            cpu: self.cpu + o.cpu,
-            gpu: self.gpu + o.gpu,
-            mem_gib: self.mem_gib + o.mem_gib,
+/// A multi-resource demand/quota map: resource name → amount.
+///
+/// Amounts are plain `f64` in the key's natural unit (cores for `cpu`,
+/// GiB for `memory`, devices for `nvidia.com/gpu`). A missing key means
+/// zero — maps are sparse, so demand for a resource a quota doesn't
+/// mention is rejected by [`ResourceMap::fits_within`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResourceMap(pub BTreeMap<String, f64>);
+
+impl std::ops::Add for ResourceMap {
+    type Output = ResourceMap;
+    /// Union of keys; shared keys sum.
+    fn add(self, o: ResourceMap) -> ResourceMap {
+        let mut m = self.0;
+        for (k, v) in o.0 {
+            *m.entry(k).or_insert(0.0) += v;
         }
+        ResourceMap(m)
     }
 }
 
-impl ResourceVector {
-    pub fn scale(self, n: f64) -> ResourceVector {
-        ResourceVector {
-            cpu: self.cpu * n,
-            gpu: self.gpu * n,
-            mem_gib: self.mem_gib * n,
-        }
+impl FromIterator<(String, f64)> for ResourceMap {
+    fn from_iter<I: IntoIterator<Item = (String, f64)>>(it: I) -> ResourceMap {
+        ResourceMap(it.into_iter().collect())
+    }
+}
+
+impl ResourceMap {
+    pub fn scale(&self, n: f64) -> ResourceMap {
+        ResourceMap(self.0.iter().map(|(k, v)| (k.clone(), v * n)).collect())
     }
 
-    /// True when every component is <= `limit`'s.
-    pub fn fits_within(self, limit: ResourceVector) -> bool {
-        self.cpu <= limit.cpu && self.gpu <= limit.gpu && self.mem_gib <= limit.mem_gib
+    /// True when every key in `self` is <= `limit`'s value for that key.
+    /// A key missing from `limit` counts as 0, so any demand for an
+    /// unlisted resource does not fit.
+    pub fn fits_within(&self, limit: &ResourceMap) -> bool {
+        self.0
+            .iter()
+            .all(|(k, v)| *v <= *limit.0.get(k).unwrap_or(&0.0))
+    }
+
+    /// Cores under the well-known `cpu` key (0 when absent).
+    pub fn cpu(&self) -> f64 {
+        self.get(CPU)
+    }
+
+    /// Devices under the well-known `nvidia.com/gpu` key (0 when absent).
+    pub fn gpu(&self) -> f64 {
+        self.get(GPU)
+    }
+
+    /// GiB under the well-known `memory` key (0 when absent).
+    pub fn mem_gib(&self) -> f64 {
+        self.get(MEMORY)
+    }
+
+    fn get(&self, key: &str) -> f64 {
+        *self.0.get(key).unwrap_or(&0.0)
     }
 }
 
@@ -49,29 +90,47 @@ pub enum PolicyError {
     Quantity(String),
 }
 
-fn worker_unit(g: &mobula_core::WorkerGroup) -> Result<ResourceVector, PolicyError> {
-    Ok(ResourceVector {
-        cpu: quantity::cpu_cores(&g.cpu).map_err(PolicyError::Quantity)?,
-        gpu: quantity::gpu_count(g.gpu.as_deref()).map_err(PolicyError::Quantity)?,
-        mem_gib: quantity::mem_gib(&g.memory).map_err(PolicyError::Quantity)?,
-    })
+fn worker_unit(g: &mobula_core::WorkerGroup) -> Result<ResourceMap, PolicyError> {
+    let mut m = BTreeMap::from([
+        (
+            CPU.to_string(),
+            quantity::cpu_cores(&g.cpu).map_err(PolicyError::Quantity)?,
+        ),
+        (
+            MEMORY.to_string(),
+            quantity::mem_gib(&g.memory).map_err(PolicyError::Quantity)?,
+        ),
+    ]);
+    let gpu = quantity::gpu_count(g.gpu.as_deref()).map_err(PolicyError::Quantity)?;
+    if gpu > 0.0 {
+        m.insert(GPU.to_string(), gpu);
+    }
+    Ok(ResourceMap(m))
 }
 
-fn head_unit(spec: &ClusterSpec) -> Result<ResourceVector, PolicyError> {
-    Ok(ResourceVector {
-        cpu: quantity::cpu_cores(&spec.head_cpu).map_err(PolicyError::Quantity)?,
-        gpu: 0.0,
-        mem_gib: quantity::mem_gib(&spec.head_memory).map_err(PolicyError::Quantity)?,
-    })
+fn head_unit(spec: &ClusterSpec) -> Result<ResourceMap, PolicyError> {
+    Ok(ResourceMap(BTreeMap::from([
+        (
+            CPU.to_string(),
+            quantity::cpu_cores(&spec.head_cpu).map_err(PolicyError::Quantity)?,
+        ),
+        (
+            MEMORY.to_string(),
+            quantity::mem_gib(&spec.head_memory).map_err(PolicyError::Quantity)?,
+        ),
+    ])))
 }
 
 /// The resource demand of a cluster at its minimum and maximum size. Min =
 /// head + Σ(worker_unit × min_replicas); max = head + Σ(worker_unit ×
 /// max_replicas). Quota admits against `max` (worst case, conservative —
 /// Borg oversells at low priority; that refinement is future work).
-pub fn cluster_demand(spec: &ClusterSpec) -> Result<(ResourceVector, ResourceVector), PolicyError> {
+///
+/// Emits exactly the keys `cpu` and `memory` (GiB), plus `nvidia.com/gpu`
+/// when a worker group requests GPUs.
+pub fn cluster_demand(spec: &ClusterSpec) -> Result<(ResourceMap, ResourceMap), PolicyError> {
     let head = head_unit(spec)?;
-    let mut min = head;
+    let mut min = head.clone();
     let mut max = head;
     for g in &spec.worker_groups {
         // A group with min > max is nonsensical and would make the
@@ -90,13 +149,14 @@ pub fn cluster_demand(spec: &ClusterSpec) -> Result<(ResourceVector, ResourceVec
     Ok((min, max))
 }
 
-/// Per-resource hourly prices (pluggable; a static sheet is fine at v0).
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub struct PriceSheet {
-    pub cpu_core_hour: f64,
-    pub gpu_hour: f64,
-    pub mem_gib_hour: f64,
-}
+/// Hourly price per unit of each resource key (pluggable; a static sheet
+/// is fine at v0). Deserialized from config as a flat map of resource name
+/// → price: `cpu` = $/core-hour, `memory` = $/GiB-hour, `nvidia.com/gpu`
+/// = $/GPU-hour. Keys absent from the sheet price at 0 — an unpriced
+/// resource is free for estimation purposes, never an error.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct PriceSheet(pub BTreeMap<String, f64>);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostEstimate {
@@ -105,16 +165,18 @@ pub struct CostEstimate {
 }
 
 impl PriceSheet {
-    fn price(&self, v: ResourceVector) -> f64 {
-        v.cpu * self.cpu_core_hour + v.gpu * self.gpu_hour + v.mem_gib * self.mem_gib_hour
+    fn price(&self, v: &ResourceMap) -> f64 {
+        v.0.iter()
+            .map(|(k, amount)| amount * self.0.get(k).copied().unwrap_or(0.0))
+            .sum()
     }
 
     /// Estimated $/hr at the cluster's min and max size.
     pub fn estimate(&self, spec: &ClusterSpec) -> Result<CostEstimate, PolicyError> {
         let (min, max) = cluster_demand(spec)?;
         Ok(CostEstimate {
-            min_hourly: self.price(min),
-            max_hourly: self.price(max),
+            min_hourly: self.price(&min),
+            max_hourly: self.price(&max),
         })
     }
 }
@@ -126,22 +188,23 @@ impl PriceSheet {
 )]
 pub struct QuotaExceeded {
     pub project: String,
-    pub requested: ResourceVector,
-    pub in_use: ResourceVector,
-    pub limit: ResourceVector,
+    pub requested: ResourceMap,
+    pub in_use: ResourceMap,
+    pub limit: ResourceMap,
 }
 
 /// Admission check (Borg: quota is admission control). `in_use` is the
 /// summed max-demand of the project's *other* clusters; `requested` is the
 /// max-demand of the cluster being created/updated. Admits iff the total
-/// fits within `limit`.
+/// fits within `limit` on every resource key.
 pub fn admit(
     project: &str,
-    limit: ResourceVector,
-    in_use: ResourceVector,
-    requested: ResourceVector,
+    limit: ResourceMap,
+    in_use: ResourceMap,
+    requested: ResourceMap,
 ) -> Result<(), QuotaExceeded> {
-    if (in_use + requested).fits_within(limit) {
+    let fits = (in_use.clone() + requested.clone()).fits_within(&limit);
+    if fits {
         Ok(())
     } else {
         Err(QuotaExceeded {
@@ -179,42 +242,80 @@ mod tests {
         }
     }
 
+    fn map(pairs: &[(&str, f64)]) -> ResourceMap {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    }
+
     #[test]
     fn demand_min_and_max() {
         let (min, max) = cluster_demand(&spec(1, 3, None)).unwrap();
         // head(1cpu,2Gi) + 1 worker(2cpu,4Gi)
-        assert_eq!(
-            min,
-            ResourceVector {
-                cpu: 3.0,
-                gpu: 0.0,
-                mem_gib: 6.0
-            }
-        );
+        assert_eq!(min, map(&[("cpu", 3.0), ("memory", 6.0)]));
         // head + 3 workers
-        assert_eq!(
-            max,
-            ResourceVector {
-                cpu: 7.0,
-                gpu: 0.0,
-                mem_gib: 14.0
-            }
-        );
+        assert_eq!(max, map(&[("cpu", 7.0), ("memory", 14.0)]));
     }
 
     #[test]
     fn gpu_demand_counted() {
         let (_, max) = cluster_demand(&spec(0, 2, Some("1"))).unwrap();
-        assert_eq!(max.gpu, 2.0);
+        assert_eq!(max.gpu(), 2.0);
+        // The well-known helpers read the well-known keys.
+        assert_eq!(max.cpu(), 5.0); // head 1 + 2×2
+        assert_eq!(max.mem_gib(), 10.0); // head 2 + 2×4
+    }
+
+    #[test]
+    fn no_gpu_key_without_gpu_workers() {
+        // Sparse maps: no GPU request means no key at all, so a quota
+        // sheet without a GPU entry still admits GPU-free clusters.
+        let (_, max) = cluster_demand(&spec(0, 2, None)).unwrap();
+        assert!(!max.0.contains_key(GPU));
+    }
+
+    #[test]
+    fn add_is_key_union() {
+        let a = map(&[("cpu", 1.0), ("nvidia.com/gpu", 2.0)]);
+        let b = map(&[("cpu", 3.0), ("example.com/license", 1.0)]);
+        assert_eq!(
+            a + b,
+            map(&[
+                ("cpu", 4.0),
+                ("nvidia.com/gpu", 2.0),
+                ("example.com/license", 1.0)
+            ])
+        );
+    }
+
+    #[test]
+    fn fits_within_treats_missing_limit_key_as_zero() {
+        // Any demand for a resource the limit doesn't list must reject.
+        let demand = map(&[("cpu", 1.0), ("example.com/license", 1.0)]);
+        let limit = map(&[("cpu", 10.0)]);
+        assert!(!demand.fits_within(&limit));
+        // Zero demand for an unlisted resource fits.
+        let demand = map(&[("cpu", 1.0)]);
+        assert!(demand.fits_within(&limit));
+    }
+
+    #[test]
+    fn extended_resource_keys_in_demand_maps() {
+        // Demand maps are constructed directly with arbitrary K8s resource
+        // names (MIG slices, custom licenses) — no hard-coded key list.
+        let demand = map(&[("nvidia.com/mig-1g.10gb", 7.0), ("cpu", 4.0)]);
+        let limit = map(&[("nvidia.com/mig-1g.10gb", 7.0), ("cpu", 8.0)]);
+        assert!(demand.fits_within(&limit));
+        let scaled = demand.scale(2.0);
+        assert_eq!(scaled.0["nvidia.com/mig-1g.10gb"], 14.0);
+        assert!(!scaled.fits_within(&limit));
     }
 
     #[test]
     fn cost_estimate_min_below_max() {
-        let prices = PriceSheet {
-            cpu_core_hour: 0.04,
-            gpu_hour: 2.0,
-            mem_gib_hour: 0.005,
-        };
+        let prices = PriceSheet(BTreeMap::from([
+            ("cpu".to_string(), 0.04),
+            ("nvidia.com/gpu".to_string(), 2.0),
+            ("memory".to_string(), 0.005),
+        ]));
         let est = prices.estimate(&spec(1, 3, None)).unwrap();
         assert!(est.min_hourly < est.max_hourly);
         // max = 7cpu*0.04 + 0 + 14*0.005 = 0.28 + 0.07 = 0.35
@@ -222,20 +323,28 @@ mod tests {
     }
 
     #[test]
+    fn price_sheet_ignores_unknown_keys() {
+        // A resource with no price entry contributes 0, never an error.
+        let prices = PriceSheet(BTreeMap::from([("cpu".to_string(), 0.04)]));
+        let demand = map(&[("cpu", 2.0), ("example.com/license", 5.0)]);
+        assert!((prices.price(&demand) - 0.08).abs() < 1e-9);
+    }
+
+    #[test]
+    fn price_sheet_deserializes_from_flat_config_map() {
+        let sheet: PriceSheet =
+            serde_json::from_str(r#"{"cpu": 0.04, "nvidia.com/gpu": 2.0, "memory": 0.005}"#)
+                .unwrap();
+        assert!((sheet.0["nvidia.com/gpu"] - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn quota_admits_and_rejects() {
-        let limit = ResourceVector {
-            cpu: 10.0,
-            gpu: 0.0,
-            mem_gib: 20.0,
-        };
-        let in_use = ResourceVector {
-            cpu: 4.0,
-            gpu: 0.0,
-            mem_gib: 8.0,
-        };
+        let limit = map(&[("cpu", 10.0), ("memory", 20.0)]);
+        let in_use = map(&[("cpu", 4.0), ("memory", 8.0)]);
         // requested max for spec(1,3): 7cpu/14Gi → 4+7=11 > 10 → reject.
         let (_, req) = cluster_demand(&spec(1, 3, None)).unwrap();
-        assert!(admit("p", limit, in_use, req).is_err());
+        assert!(admit("p", limit.clone(), in_use.clone(), req).is_err());
         // Smaller cluster fits.
         let (_, small) = cluster_demand(&spec(0, 1, None)).unwrap();
         assert!(admit("p", limit, in_use, small).is_ok());
@@ -243,13 +352,9 @@ mod tests {
 
     #[test]
     fn gpu_quota_enforced_independently() {
-        let limit = ResourceVector {
-            cpu: 100.0,
-            gpu: 1.0,
-            mem_gib: 100.0,
-        };
+        let limit = map(&[("cpu", 100.0), ("nvidia.com/gpu", 1.0), ("memory", 100.0)]);
         let (_, req) = cluster_demand(&spec(0, 2, Some("1"))).unwrap(); // 2 GPUs
-        assert!(admit("p", limit, ResourceVector::default(), req).is_err());
+        assert!(admit("p", limit, ResourceMap::default(), req).is_err());
     }
 
     #[test]
@@ -257,5 +362,17 @@ mod tests {
         let mut s = spec(1, 1, None);
         s.head_cpu = "banana".into();
         assert!(matches!(cluster_demand(&s), Err(PolicyError::Quantity(_))));
+    }
+
+    #[test]
+    fn min_replicas_above_max_is_rejected() {
+        // A group with min > max would make "max" demand smaller than the
+        // min — quota admits against max, so this is rejected, not
+        // silently mischarged (review R2#4).
+        let err = cluster_demand(&spec(3, 1, None)).unwrap_err();
+        assert!(
+            matches!(&err, PolicyError::Quantity(m) if m.contains("min_replicas (3) > max_replicas (1)")),
+            "{err}"
+        );
     }
 }

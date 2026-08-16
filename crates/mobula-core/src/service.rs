@@ -42,3 +42,40 @@ pub struct ServiceSpec {
 fn default_upgrade() -> UpgradeStrategy {
     UpgradeStrategy::Canary
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_defaults_to_canary_when_omitted() {
+        // serve_config_v2 passes through verbatim; upgrade has a serde
+        // default so older clients can omit it.
+        let v = serde_json::json!({
+            "name": "svc",
+            "project": "p",
+            "ray_version": "2.57.0",
+            "image": "img",
+            "serve_config_v2": "applications: []",
+            "head_cpu": "1",
+            "head_memory": "2Gi",
+            "worker_replicas": 2,
+            "worker_cpu": "1",
+            "worker_memory": "2Gi"
+        });
+        let spec: ServiceSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(spec.upgrade, UpgradeStrategy::Canary);
+    }
+
+    #[test]
+    fn upgrade_round_trips_snake_case() {
+        assert_eq!(
+            serde_json::to_value(UpgradeStrategy::InPlace).unwrap(),
+            serde_json::json!("in_place")
+        );
+        assert_eq!(
+            serde_json::from_value::<UpgradeStrategy>(serde_json::json!("canary")).unwrap(),
+            UpgradeStrategy::Canary
+        );
+    }
+}

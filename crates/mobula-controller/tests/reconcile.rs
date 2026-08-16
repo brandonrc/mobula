@@ -31,6 +31,8 @@ struct MockProvisioner {
     /// (e.g. Terminated) so #43 backoff can be exercised.
     apply_result: Mutex<Option<ClusterState>>,
     apply_keys: Mutex<Vec<String>>,
+    /// Queue assignment each apply call received (ADR-0010 wiring check).
+    apply_queues: Mutex<Vec<Option<mobula_provision::QueueAssignment>>>,
     terminate_calls: Mutex<Vec<String>>,
 }
 
@@ -65,8 +67,10 @@ impl Provisioner for MockProvisioner {
         _spec: &ClusterSpec,
         generation: u64,
         idempotency_key: &str,
+        queue: Option<&mobula_provision::QueueAssignment>,
     ) -> Result<ApplyResponse, ProvisionError> {
         self.apply_keys.lock().unwrap().push(idempotency_key.into());
+        self.apply_queues.lock().unwrap().push(queue.cloned());
         // Applying leaves the cluster in the configured result state
         // (Running by default; a failing provisioner leaves it Terminated).
         let result = self
@@ -218,6 +222,87 @@ async fn spec_change_bumps_generation_and_reapplies_with_new_key() {
 }
 
 #[tokio::test]
+async fn queue_assignment_flows_from_allocation_to_apply() {
+    // ADR-0010: a project with a pool allocation gets its cluster admitted
+    // through the allocation's LocalQueue; the reconciler derives the
+    // assignment from the store (never from ClusterSpec) and hands it to
+    // the provisioner. A queued cluster observed Suspended is Kueue
+    // admission queueing — NOT re-applied (#47's suspend repair is
+    // suspended for queued clusters, research doc §2).
+    let (store, prov, rec) = setup();
+    use mobula_core::{AllocationSpec, FlavorSpec, PoolSpec};
+    use std::collections::BTreeMap;
+    store
+        .upsert_pool(
+            "gpu",
+            PoolSpec {
+                name: "gpu".into(),
+                flavors: vec![FlavorSpec {
+                    name: "cpu".into(),
+                    resources: BTreeMap::from([("cpu".to_string(), "4".to_string())]),
+                    node_labels: BTreeMap::new(),
+                    taints: vec![],
+                }],
+                cohort: "research".into(),
+                fair_sharing_weight: 1.0,
+                elastic: true,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_allocation(AllocationSpec {
+            pool: "gpu".into(),
+            project: "demo".into(),
+            namespace: "demo".into(),
+            nominal: BTreeMap::new(),
+            borrowing_limit: BTreeMap::new(),
+            lending_limit: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    rec.reconcile_all().await;
+    let queues = prov.apply_queues.lock().unwrap().clone();
+    assert_eq!(
+        queues.as_slice(),
+        [Some(mobula_provision::QueueAssignment {
+            queue_name: "demo".into(),
+            elastic: true,
+        })],
+        "apply must receive the allocation-derived queue assignment"
+    );
+
+    // A queued cluster held Suspended by Kueue is left alone (no re-apply).
+    prov.set_state("demo", ClusterState::Suspended);
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::NoOp);
+    assert_eq!(
+        prov.apply_count(),
+        1,
+        "Kueue-owned suspension is not repaired"
+    );
+}
+
+#[tokio::test]
+async fn queue_free_cluster_behaves_as_before() {
+    // No allocation for the project → apply gets no assignment, and
+    // Suspended stays repairable drift (#47).
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    rec.reconcile_all().await;
+    assert_eq!(prov.apply_queues.lock().unwrap().as_slice(), [None]);
+
+    prov.set_state("demo", ClusterState::Suspended);
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Applied);
+    assert_eq!(prov.apply_count(), 2, "queue-free suspension is repaired");
+}
+
+#[tokio::test]
 async fn idempotent_apply_uses_stable_key_across_passes() {
     let (store, prov, rec) = setup();
     let id = ClusterId("demo".into());
@@ -336,6 +421,7 @@ impl Provisioner for LaggingProvisioner {
         _spec: &ClusterSpec,
         generation: u64,
         _key: &str,
+        _queue: Option<&mobula_provision::QueueAssignment>,
     ) -> Result<mobula_provision::ApplyResponse, ProvisionError> {
         *self.applies.lock().unwrap() += 1;
         Ok(mobula_provision::ApplyResponse {

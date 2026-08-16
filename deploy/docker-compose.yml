@@ -12,8 +12,10 @@ services:
       dockerfile: Dockerfile
     image: mobula:demo
     # Full cluster/service API on the in-memory mock provisioner (no k8s),
-    # unauthenticated on all interfaces (dev only).
-    command: ["serve", "--bind", "0.0.0.0:8484", "--demo", "--dev-allow-unauthenticated"]
+    # unauthenticated on all interfaces (dev only). Fast metering so the
+    # usage screens populate during a short demo.
+    command: ["serve", "--bind", "0.0.0.0:8484", "--demo", "--dev-allow-unauthenticated",
+              "--metering-interval-secs", "5"]
     ports:
       - "8484:8484"
     restart: unless-stopped

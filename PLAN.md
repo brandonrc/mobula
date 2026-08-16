@@ -202,6 +202,26 @@ that converges a cluster with no manual reconcile then stops on shutdown.
 > deploy/delete) unit-tested via a mock provisioner; OpenAPI + committed
 > contract updated. 97 tests, 91.9%. Next: spot-strategy annotations,
 > Autopilot cost function as scale-policy baseline; Postgres Store.
+>
+> Slices 3–5 (2026-08-16): **pools — Kueue as the pool engine (ADR-0010)**.
+> `mobula-core::pool` holds the pool domain (`PoolSpec`/`FlavorSpec`/
+> `AllocationSpec`, validated) and `mobula-provision::kueue` translates a
+> ResourcePool to Kueue objects **purely** (ResourceFlavor per flavor,
+> ClusterQueue per pool, Cohort per shared envelope, LocalQueue per project
+> allocation); `kueue_client` is the live counterpart with CRD-presence
+> detection. Pools are platform configuration: store + `/api/v1/pools` API
+> with a new RBAC `Target::Pool` — Viewer+ reads, Admin-only mutations.
+> `mobula-controller::pool_reconcile` converges the Kueue objects and falls
+> back to in-process quota when the CRDs are absent. Admission wiring stamps
+> `kueue.x-k8s.io/queue-name` on clusters whose project has an allocation;
+> elastic mode forces in-tree autoscaling, and Kueue-queued Suspended
+> clusters are not treated as drift. `mobula-controller::metering` +
+> `mobula-policy::usage` record `usage_samples` (Kueue ledger when present,
+> observed-spec baseline otherwise) behind `/api/v1/pools/{name}/usage`,
+> `/api/v1/usage`, and `/api/v1/metrics`; a gated `kueue-e2e.yml` workflow
+> (Kueue v0.19.1, KubeRay 1.4.0, kind node v1.34.0) proves quota admission
+> on a real kind cluster — **not yet run in CI**, so the live Kueue path is
+> reviewed-but-unproven there. 194 tests.
 - Autoscaler policy engine (spot strategy, fair share, cost model), ephemeral
   per-job clusters, Ray Serve service management (canary/rollback).
 

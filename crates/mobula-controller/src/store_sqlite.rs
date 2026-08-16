@@ -5,15 +5,15 @@
 //! Postgres (the SQL is standard); a Postgres impl reuses this shape.
 
 use async_trait::async_trait;
-use mobula_core::{ClusterId, ClusterSpec, ClusterState, DriftCondition};
+use mobula_core::{AllocationSpec, ClusterId, ClusterSpec, ClusterState, DriftCondition, PoolSpec};
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
 use mobula_core::JobRecord;
 
 use crate::store::{
-    now_unix, spec_changed, DesiredState, IntentOutcome, IntentRecord, IntentStatus, Store,
-    StoreError, StoredCluster,
+    now_unix, pool_spec_changed, spec_changed, DesiredState, IntentOutcome, IntentRecord,
+    IntentStatus, Store, StoreError, StoredCluster, StoredPool, UsageSample, UsageSource,
 };
 
 impl From<sqlx::Error> for StoreError {
@@ -62,6 +62,38 @@ CREATE TABLE IF NOT EXISTS jobs (
     duration_secs INTEGER,
     submitted_at  INTEGER NOT NULL
 );
+-- Capacity pools (ADR-0010): the store is truth; Kueue objects are
+-- actuation. Spec as JSON text so the SQL ports to Postgres unchanged.
+-- observed_json holds the pool reconcile loop's last ClusterQueue status
+-- observation (opaque JSON).
+CREATE TABLE IF NOT EXISTS pools (
+    name          TEXT PRIMARY KEY,
+    spec_json     TEXT NOT NULL,
+    generation    INTEGER NOT NULL,
+    observed_json TEXT,
+    created_at    INTEGER NOT NULL DEFAULT 0
+);
+-- Per-project allocations within a pool (ADR-0010), keyed by (pool, project).
+CREATE TABLE IF NOT EXISTS allocations (
+    pool      TEXT NOT NULL,
+    project   TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    PRIMARY KEY (pool, project)
+);
+-- Usage metering timeseries (Slice 4): append-only, no primary key. Plain
+-- columns (query-facing, unlike the spec tables) with standard SQL that
+-- ports to Postgres unchanged. `project = ''` is the pool-level aggregate
+-- row; `pool = ''` means the project has no allocation. `source` is
+-- 'kueue_ledger' or 'observed_spec' (UsageSource).
+CREATE TABLE IF NOT EXISTS usage_samples (
+    ts       INTEGER NOT NULL,
+    project  TEXT NOT NULL,
+    pool     TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    source   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS usage_samples_project_ts ON usage_samples (project, ts);
 "#;
 
 /// Additive column migrations for databases created by an older schema (#39
@@ -77,6 +109,8 @@ const COLUMN_MIGRATIONS: &[&str] = &[
     "ALTER TABLE clusters ADD COLUMN condition TEXT",
     "ALTER TABLE clusters ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE clusters ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE pools ADD COLUMN observed_json TEXT",
+    "ALTER TABLE pools ADD COLUMN observed_at INTEGER",
 ];
 
 pub struct SqliteStore {
@@ -167,6 +201,21 @@ fn row_to_cluster(row: SqliteRow) -> Result<StoredCluster, StoreError> {
         condition,
         failure_count: row.try_get::<i64, _>("failure_count")? as u32,
         next_attempt_at: row.try_get::<i64, _>("next_attempt_at")? as u64,
+        created_at: row.try_get::<i64, _>("created_at")? as u64,
+    })
+}
+
+fn row_to_pool(row: SqliteRow) -> Result<StoredPool, StoreError> {
+    let spec_json: String = row.try_get("spec_json")?;
+    let spec: PoolSpec = serde_json::from_str(&spec_json).map_err(json_err)?;
+    Ok(StoredPool {
+        name: row.try_get::<String, _>("name")?,
+        spec,
+        generation: row.try_get::<i64, _>("generation")? as u64,
+        observed_json: row.try_get::<Option<String>, _>("observed_json")?,
+        observed_at: row
+            .try_get::<Option<i64>, _>("observed_at")?
+            .map(|v| v as u64),
         created_at: row.try_get::<i64, _>("created_at")? as u64,
     })
 }
@@ -472,5 +521,318 @@ impl Store for SqliteStore {
                 })
             })
             .collect()
+    }
+
+    async fn upsert_pool(&self, name: &str, spec: PoolSpec) -> Result<u64, StoreError> {
+        // Same BEGIN IMMEDIATE discipline as upsert_desired (#42): two
+        // concurrent pool updates serialize, each seeing the other's bump.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<u64, StoreError> = async {
+            let existing = sqlx::query("SELECT spec_json, generation FROM pools WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&mut *conn)
+                .await?;
+
+            let generation: u64 = match existing {
+                Some(row) => {
+                    let cur_json: String = row.try_get("spec_json")?;
+                    let cur: PoolSpec = serde_json::from_str(&cur_json).map_err(json_err)?;
+                    let gen: i64 = row.try_get("generation")?;
+                    if pool_spec_changed(&cur, &spec) {
+                        gen as u64 + 1
+                    } else {
+                        gen as u64
+                    }
+                }
+                None => 1,
+            };
+
+            let spec_json = serde_json::to_string(&spec).map_err(json_err)?;
+            // Keep created_at on update; set it on insert.
+            sqlx::query(
+                r#"
+                INSERT INTO pools (name, spec_json, generation, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    spec_json = excluded.spec_json,
+                    generation = excluded.generation
+                "#,
+            )
+            .bind(name)
+            .bind(&spec_json)
+            .bind(generation as i64)
+            .bind(now_unix() as i64)
+            .execute(&mut *conn)
+            .await?;
+            Ok(generation)
+        }
+        .await;
+
+        match result {
+            Ok(generation) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(generation)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn get_pool(&self, name: &str) -> Result<Option<StoredPool>, StoreError> {
+        let row = sqlx::query("SELECT * FROM pools WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_pool).transpose()
+    }
+
+    async fn list_pools(&self) -> Result<Vec<StoredPool>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM pools")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_pool).collect()
+    }
+
+    async fn delete_pool(&self, name: &str) -> Result<(), StoreError> {
+        let affected = sqlx::query("DELETE FROM pools WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::Backend(format!("no such pool {name}")));
+        }
+        Ok(())
+    }
+
+    async fn record_pool_observation(
+        &self,
+        name: &str,
+        observed_json: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE pools SET observed_json = ?, observed_at = ? WHERE name = ?")
+            .bind(observed_json)
+            .bind(now_unix() as i64)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn upsert_allocation(&self, alloc: AllocationSpec) -> Result<(), StoreError> {
+        let spec_json = serde_json::to_string(&alloc).map_err(json_err)?;
+        sqlx::query(
+            r#"
+            INSERT INTO allocations (pool, project, spec_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(pool, project) DO UPDATE SET spec_json = excluded.spec_json
+            "#,
+        )
+        .bind(&alloc.pool)
+        .bind(&alloc.project)
+        .bind(&spec_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_allocations(&self, pool: &str) -> Result<Vec<AllocationSpec>, StoreError> {
+        let rows = sqlx::query("SELECT spec_json FROM allocations WHERE pool = ?")
+            .bind(pool)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let spec_json: String = row.try_get("spec_json")?;
+                serde_json::from_str::<AllocationSpec>(&spec_json).map_err(json_err)
+            })
+            .collect()
+    }
+
+    async fn delete_allocation(&self, pool: &str, project: &str) -> Result<(), StoreError> {
+        let affected = sqlx::query("DELETE FROM allocations WHERE pool = ? AND project = ?")
+            .bind(pool)
+            .bind(project)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::Backend(format!(
+                "no such allocation {pool}/{project}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn record_usage_samples(&self, samples: &[UsageSample]) -> Result<(), StoreError> {
+        // One transaction per batch so a tick's samples land atomically.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result: Result<(), StoreError> = async {
+            for s in samples {
+                sqlx::query(
+                    "INSERT INTO usage_samples (ts, project, pool, resource, quantity, source) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(s.ts as i64)
+                .bind(&s.project)
+                .bind(&s.pool)
+                .bind(&s.resource)
+                .bind(s.quantity)
+                .bind(s.source.as_str())
+                .execute(&mut *conn)
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn usage_samples(
+        &self,
+        project: Option<&str>,
+        pool: Option<&str>,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<UsageSample>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT ts, project, pool, resource, quantity, source FROM usage_samples \
+             WHERE ts >= ? AND ts <= ? \
+             AND (? IS NULL OR project = ?) \
+             AND (? IS NULL OR pool = ?) \
+             ORDER BY ts ASC",
+        )
+        // Clamp into i64 range: u64::MAX ("unbounded") must not wrap negative.
+        .bind(from.min(i64::MAX as u64) as i64)
+        .bind(to.min(i64::MAX as u64) as i64)
+        .bind(project)
+        .bind(project)
+        .bind(pool)
+        .bind(pool)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok::<_, StoreError>(UsageSample {
+                    ts: row.try_get::<i64, _>("ts")? as u64,
+                    project: row.try_get::<String, _>("project")?,
+                    pool: row.try_get::<String, _>("pool")?,
+                    resource: row.try_get::<String, _>("resource")?,
+                    quantity: row.try_get::<f64, _>("quantity")?,
+                    source: UsageSource::parse(&row.try_get::<String, _>("source")?)?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mobula_core::WorkerGroup;
+
+    fn spec(name: &str) -> ClusterSpec {
+        ClusterSpec {
+            name: name.into(),
+            project: "demo".into(),
+            ray_version: "2.57.0".into(),
+            image: "img".into(),
+            head_cpu: "1".into(),
+            head_memory: "2Gi".into(),
+            worker_groups: vec![WorkerGroup {
+                name: "w".into(),
+                cpu: "1".into(),
+                memory: "2Gi".into(),
+                gpu: None,
+                min_replicas: 0,
+                max_replicas: 4,
+                replicas: 1,
+            }],
+            ttl_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_spec_json_is_a_store_error_not_a_panic() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let id = ClusterId("demo".into());
+        store.upsert_desired(&id, spec("demo")).await.unwrap();
+        sqlx::query("UPDATE clusters SET spec_json = 'not json' WHERE id = ?")
+            .bind(&id.0)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let err = store.get(&id).await.unwrap_err().to_string();
+        assert!(err.contains("serialization"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unknown_desired_value_is_a_store_error() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let id = ClusterId("demo".into());
+        store.upsert_desired(&id, spec("demo")).await.unwrap();
+        sqlx::query("UPDATE clusters SET desired = 'bogus' WHERE id = ?")
+            .bind(&id.0)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let err = store.get(&id).await.unwrap_err().to_string();
+        assert!(err.contains("bad desired state"), "{err}");
+        // list() hits the same row-mapping error.
+        assert!(store.list().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn backend_errors_are_wrapped_not_panicked() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        sqlx::query("DROP TABLE jobs")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let err = store.list_jobs().await.unwrap_err().to_string();
+        assert!(err.contains("store backend error"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unexpected_migration_failure_surfaces() {
+        // A "duplicate column name" migration error is ignored (fresh DBs
+        // already have the column); anything else must fail init — e.g. a
+        // pre-existing VIEW squatting on the pools table name makes the
+        // ALTER fail with a different message.
+        let dir = std::env::temp_dir().join(format!("mobula-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.db");
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query("CREATE VIEW pools AS SELECT 'x' AS name")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let err = match SqliteStore::connect(&url).await {
+            Ok(_) => panic!("init must fail when a migration errors unexpectedly"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("store backend error"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

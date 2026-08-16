@@ -33,10 +33,10 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Coverage gate (90% lines, CLI shim excluded)
+      - name: Coverage gate (90% lines, CLI shim and live kube clients excluded)
         run: >
           cargo llvm-cov --workspace
-          --ignore-filename-regex 'mobula-cli/src/main\.rs|mobula-provision/src/kuberay_client\.rs'
+          --ignore-filename-regex 'mobula-cli/src/main\.rs|mobula-provision/src/kuberay_client\.rs|mobula-provision/src/kueue_client\.rs'
           --fail-under-lines 90
 
   deny:
