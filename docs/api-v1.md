@@ -757,6 +757,11 @@ mutations Admin-only.
 - **Auth:** `Write` on `Target::Pool` (Admin only).
 - **Body:** `{ "spec": PoolSpec }`. Shape-validated by `PoolSpec::validate`
   plus quantity-parse validation at the edge → 400 `invalid_spec`.
+- **Cover every resource a workload requests.** Kueue refuses admission when
+  a pod requests a resource the ClusterQueue doesn't quota (e.g.
+  `resource memory unavailable`), and Ray pods always request `memory` — a
+  pool that quotas only `cpu` admits nothing. (Found by the kueue-e2e
+  workflow.)
 - **Create-only in v0:** a pool that already exists is 409, never an upsert;
   spec update arrives with a later PATCH.
 - **Response 201:** `{ "name": "gpu-pool", "generation": 1 }`.

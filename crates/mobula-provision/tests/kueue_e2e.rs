@@ -21,8 +21,16 @@ fn pool() -> PoolSpec {
         flavors: vec![FlavorSpec {
             name: "cpu".into(),
             // Nominal 4 CPU; each cluster below demands 3 (head 1 + worker
-            // 2), so the first admits and the second must queue.
-            resources: BTreeMap::from([("cpu".to_string(), "4".to_string())]),
+            // 2), so the first admits and the second must queue. Memory must
+            // be covered too — Kueue refuses admission when a workload
+            // requests a resource the ClusterQueue doesn't quota
+            // ("resource memory unavailable"), and Ray pods always request
+            // memory. 8Gi leaves headroom for both clusters (~3.5Gi each)
+            // so cpu stays the binding constraint.
+            resources: BTreeMap::from([
+                ("cpu".to_string(), "4".to_string()),
+                ("memory".to_string(), "8Gi".to_string()),
+            ]),
             node_labels: BTreeMap::new(),
             taints: vec![],
         }],
