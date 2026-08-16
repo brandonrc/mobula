@@ -30,10 +30,12 @@ mobula-proxy = { path = "crates/mobula-proxy" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
-jsonwebtoken = "9"
+# v11 made the crypto backend pluggable; pick the pure-Rust provider (no C
+# toolchain — matches the UBI9/STIG-minimal images and the rustls stack).
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-tokio-tungstenite = "0.26"
-toml = "0.9"
+tokio-tungstenite = "0.29"
+toml = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

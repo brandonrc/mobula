@@ -15,12 +15,16 @@ allow = [
 [advisories]
 yanked = "deny"
 ignore = [
-    # Marvin Attack timing sidechannel in the `rsa` crate (no fixed
-    # version upstream). rsa is a dev-dependency only — tests use it to
-    # mint RSA keys for mock-OIDC JWT signing. It is not compiled into
-    # any shipped binary; runtime JWT verification uses jsonwebtoken's
-    # verify path, not `rsa`.
-    { id = "RUSTSEC-2023-0071", reason = "dev-dependency only (test JWT signing), not in shipped binaries" },
+    # Marvin Attack: a timing sidechannel in the `rsa` crate's PKCS#1 v1.5
+    # *private-key decryption* (no fixed version upstream). As of
+    # jsonwebtoken 11 with the pure-Rust `rust_crypto` provider, `rsa` is a
+    # RUNTIME dependency (chosen over `aws_lc_rs` because the latter needs a C
+    # toolchain, which breaks the UBI9/STIG-minimal images). Mobula only uses
+    # it for RS256 signature *verification* with OIDC public keys — it never
+    # performs RSA decryption or signing with a private key, so the vulnerable
+    # code path is not exercised. Revisit if a fixed `rsa` ships or if we ever
+    # switch the provider to `aws_lc_rs`.
+    { id = "RUSTSEC-2023-0071", reason = "runtime via jsonwebtoken/rust_crypto, but only RS256 public-key verification — the Marvin private-key decryption path is never used" },
 ]
 
 [bans]
