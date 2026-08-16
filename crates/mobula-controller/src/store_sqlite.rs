@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS clusters (
     observed_state        TEXT,
     observed_generation   INTEGER NOT NULL DEFAULT 0,
     condition             TEXT,
+    failure_count         INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at       INTEGER NOT NULL DEFAULT 0,
     created_at            INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS intents (
@@ -61,6 +63,8 @@ const COLUMN_MIGRATIONS: &[&str] = &[
     "ALTER TABLE intents ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE intents ADD COLUMN completed_at INTEGER",
     "ALTER TABLE clusters ADD COLUMN condition TEXT",
+    "ALTER TABLE clusters ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE clusters ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0",
 ];
 
 pub struct SqliteStore {
@@ -149,6 +153,8 @@ fn row_to_cluster(row: SqliteRow) -> Result<StoredCluster, StoreError> {
         observed_state,
         observed_generation: row.try_get::<i64, _>("observed_generation")? as u64,
         condition,
+        failure_count: row.try_get::<i64, _>("failure_count")? as u32,
+        next_attempt_at: row.try_get::<i64, _>("next_attempt_at")? as u64,
         created_at: row.try_get::<i64, _>("created_at")? as u64,
     })
 }
@@ -305,6 +311,21 @@ impl Store for SqliteStore {
         .bind(if quarantined { "true" } else { "false" })
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn record_attempt(
+        &self,
+        id: &ClusterId,
+        failure_count: u32,
+        next_attempt_at: u64,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE clusters SET failure_count = ?, next_attempt_at = ? WHERE id = ?")
+            .bind(failure_count as i64)
+            .bind(next_attempt_at as i64)
+            .bind(&id.0)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

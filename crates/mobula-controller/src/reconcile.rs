@@ -7,7 +7,7 @@
 //! crash — repeating an actuation with the same desired generation is a
 //! no-op at the provider.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mobula_core::{ClusterState, DriftCondition};
@@ -22,6 +22,61 @@ use crate::store::{
 /// recovery can still inspect recent intents, but bounded so the table can't
 /// grow one row per (cluster, generation) forever.
 const INTENT_RETENTION_SECS: u64 = 3600;
+
+/// Exponential-backoff base and ceiling for a no-progress cluster (#43).
+const BACKOFF_BASE_SECS: u64 = 5;
+const BACKOFF_CEIL_SECS: u64 = 300;
+
+/// Delay before re-actuating a cluster that has made no progress for
+/// `failure_count` consecutive attempts (#43): `base * 2^(n-1)`, capped.
+fn backoff_secs(failure_count: u32) -> u64 {
+    let shift = failure_count.saturating_sub(1).min(20);
+    BACKOFF_BASE_SECS
+        .saturating_mul(1u64 << shift)
+        .min(BACKOFF_CEIL_SECS)
+}
+
+/// Global actuation rate limit across all clusters (ADR-0006 token bucket,
+/// #43): a burst of failing clusters can't exceed the provider-call budget.
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimits {
+    /// Maximum actuations available in a burst.
+    pub capacity: f64,
+    /// Tokens replenished per second.
+    pub refill_per_sec: f64,
+}
+
+/// Time-based token bucket keyed on the reconcile `now` (unix secs), so it is
+/// deterministic in tests. Only *actuating* passes (apply) take a token.
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    last: u64,
+}
+
+impl TokenBucket {
+    fn new(limits: RateLimits, now: u64) -> Self {
+        Self {
+            tokens: limits.capacity,
+            capacity: limits.capacity,
+            refill_per_sec: limits.refill_per_sec,
+            last: now,
+        }
+    }
+
+    fn try_take(&mut self, now: u64) -> bool {
+        let elapsed = now.saturating_sub(self.last) as f64;
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -49,21 +104,59 @@ pub enum Action {
     /// out-of-band spec edit) — raised as an alarm, not silently converged
     /// (ADR-0004, #41/#47). A drift condition is persisted.
     Drift,
+    /// Skipped actuation this pass: the cluster is inside its backoff window
+    /// or the global rate-limit budget is exhausted (#43). Retried next tick.
+    Backoff,
 }
 
 pub struct Reconciler<S, P> {
     store: Arc<S>,
     provisioner: Arc<P>,
+    /// Global actuation token bucket (#43); `None` = unlimited.
+    limits: Option<Mutex<TokenBucket>>,
 }
 
 impl<S: Store, P: Provisioner> Reconciler<S, P> {
+    /// Unlimited (no global rate cap). Per-cluster backoff still applies.
     pub fn new(store: Arc<S>, provisioner: Arc<P>) -> Self {
-        Self { store, provisioner }
+        Self {
+            store,
+            provisioner,
+            limits: None,
+        }
     }
 
-    /// Reconcile every known cluster once. Errors on individual clusters
-    /// are collected, not fatal — one bad cluster must not stall the loop.
+    /// With a global actuation rate limit (#43).
+    pub fn with_limits(store: Arc<S>, provisioner: Arc<P>, limits: RateLimits) -> Self {
+        Self {
+            store,
+            provisioner,
+            limits: Some(Mutex::new(TokenBucket::new(limits, 0))),
+        }
+    }
+
+    /// Take one actuation token, or `true` when unlimited. `false` means the
+    /// budget is exhausted this pass — skip actuating (retry next tick).
+    fn take_token(&self, now: u64) -> bool {
+        match &self.limits {
+            None => true,
+            Some(b) => b.lock().unwrap().try_take(now),
+        }
+    }
+
+    /// Reconcile every known cluster once at the current wall-clock time.
     pub async fn reconcile_all(&self) -> Vec<(String, Result<Action, ReconcileError>)> {
+        self.reconcile_all_at(now_unix()).await
+    }
+
+    /// Reconcile every known cluster once at time `now` (unix secs). `now` is
+    /// injected so backoff/rate-limit decisions (#43) are deterministic in
+    /// tests. Errors on individual clusters are collected, not fatal — one
+    /// bad cluster must not stall the loop.
+    pub async fn reconcile_all_at(
+        &self,
+        now: u64,
+    ) -> Vec<(String, Result<Action, ReconcileError>)> {
         let clusters = match self.store.list().await {
             Ok(c) => c,
             Err(e) => return vec![("<list>".into(), Err(e.into()))],
@@ -71,12 +164,20 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
         let mut out = Vec::with_capacity(clusters.len());
         for c in clusters {
             let id = c.id.to_string();
-            out.push((id, self.reconcile_one(&c).await));
+            out.push((id, self.reconcile_one(&c, now).await));
         }
         out
     }
 
-    async fn reconcile_one(&self, c: &StoredCluster) -> Result<Action, ReconcileError> {
+    async fn reconcile_one(&self, c: &StoredCluster, now: u64) -> Result<Action, ReconcileError> {
+        // Backoff gate (#43): a Running-desired cluster that has made no
+        // progress is left untouched — not even observed — until its
+        // next-attempt time, so a permanently-failing cluster can't hammer
+        // the provider every tick.
+        if matches!(c.desired, DesiredState::Running) && now < c.next_attempt_at {
+            return Ok(Action::Backoff);
+        }
+
         // 1. Observe: reconstruct actual state (ADR-0006). A NotFound means
         //    nothing is provisioned yet — model that as no observed state.
         //    `observed_generation` is the generation the cluster actually
@@ -123,6 +224,13 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                     );
                     Action::Drift
                 } else if needs_apply(observed_state, observed_gen, c.generation) {
+                    // Global actuation budget (#43): if the token bucket is
+                    // empty, defer this cluster to a later tick rather than
+                    // exceed the provider-call rate. NoOp/observe passes don't
+                    // take a token, so only real actuation is capped.
+                    if !self.take_token(now) {
+                        return Ok(Action::Backoff);
+                    }
                     // None/Terminated/Terminating/Suspended(#47)/generation-
                     // behind → (re)apply. Transactional outbox (ADR-0007, #39):
                     // open the intent before the call; a same-params re-open
@@ -191,6 +299,40 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
             .await?;
         if new_condition != c.condition {
             self.store.set_condition(&c.id, new_condition).await?;
+        }
+
+        // 4. Backoff accounting (#43): after actuating a Running cluster, did
+        //    it make progress? A cluster observed back at None/Terminated/
+        //    Terminating after an apply is not coming up → bump the failure
+        //    count and push out next_attempt_at. Progress (or a converged
+        //    NoOp) clears the backoff.
+        let progressed: Option<bool> = match action {
+            Action::Applied => Some(!matches!(
+                final_state,
+                None | Some(ClusterState::Terminated) | Some(ClusterState::Terminating)
+            )),
+            Action::NoOp if matches!(c.desired, DesiredState::Running) => Some(true),
+            _ => None,
+        };
+        match progressed {
+            Some(false) => {
+                let failure_count = c.failure_count.saturating_add(1);
+                let next_attempt_at = now.saturating_add(backoff_secs(failure_count));
+                self.store
+                    .record_attempt(&c.id, failure_count, next_attempt_at)
+                    .await?;
+                tracing::warn!(
+                    target: "mobula::audit",
+                    cluster = %c.id, failure_count, retry_in_secs = backoff_secs(failure_count),
+                    "cluster made no progress — backing off"
+                );
+            }
+            Some(true) => {
+                if c.failure_count != 0 || c.next_attempt_at != 0 {
+                    self.store.record_attempt(&c.id, 0, 0).await?;
+                }
+            }
+            None => {}
         }
 
         Ok(action)
@@ -346,6 +488,8 @@ mod tests {
             observed_state: observed,
             observed_generation: 1,
             condition: None,
+            failure_count: 0,
+            next_attempt_at: 0,
             created_at,
         }
     }

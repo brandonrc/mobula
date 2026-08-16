@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use mobula_controller::{
-    Action, DesiredState, InMemoryStore, ReconcileError, Reconciler, SqliteStore, Store,
+    Action, DesiredState, InMemoryStore, RateLimits, ReconcileError, Reconciler, SqliteStore, Store,
 };
 use mobula_core::{ClusterId, ClusterSpec, ClusterState, WorkerGroup};
 use mobula_provision::{ApplyResponse, ObservedCluster, ProvisionError, Provisioner};
@@ -26,6 +26,10 @@ struct MockProvisioner {
     /// never looks drifted); `set_fingerprint` overrides it to simulate an
     /// out-of-band edit.
     fp: Mutex<HashMap<String, Option<String>>>,
+    /// The state `apply` leaves a cluster in. `None` = Running (healthy
+    /// default); `Some(s)` simulates an apply that never brings the cluster up
+    /// (e.g. Terminated) so #43 backoff can be exercised.
+    apply_result: Mutex<Option<ClusterState>>,
     apply_keys: Mutex<Vec<String>>,
     terminate_calls: Mutex<Vec<String>>,
 }
@@ -33,6 +37,9 @@ struct MockProvisioner {
 impl MockProvisioner {
     fn set_state(&self, id: &str, s: ClusterState) {
         self.state.lock().unwrap().insert(id.into(), s);
+    }
+    fn set_apply_result(&self, s: Option<ClusterState>) {
+        *self.apply_result.lock().unwrap() = s;
     }
     fn set_fingerprint(&self, id: &str, fp: Option<String>) {
         self.fp.lock().unwrap().insert(id.into(), fp);
@@ -60,11 +67,14 @@ impl Provisioner for MockProvisioner {
         idempotency_key: &str,
     ) -> Result<ApplyResponse, ProvisionError> {
         self.apply_keys.lock().unwrap().push(idempotency_key.into());
-        // Applying makes it Running at the applied generation.
-        self.state
+        // Applying leaves the cluster in the configured result state
+        // (Running by default; a failing provisioner leaves it Terminated).
+        let result = self
+            .apply_result
             .lock()
             .unwrap()
-            .insert(id.0.clone(), ClusterState::Running);
+            .unwrap_or(ClusterState::Running);
+        self.state.lock().unwrap().insert(id.0.clone(), result);
         self.gen.lock().unwrap().insert(id.0.clone(), generation);
         // A freshly-applied cluster reports the fingerprint of what we
         // applied, so it never looks drifted until something edits it.
@@ -556,6 +566,103 @@ async fn quarantined_store_observes_but_does_not_actuate() {
     let r = rec.reconcile_all().await;
     assert_eq!(r[0].1.as_ref().unwrap(), &Action::NoOp);
     assert_eq!(prov.apply_count(), 0, "quarantined: must not actuate");
+}
+
+#[tokio::test]
+async fn permanently_failing_cluster_backs_off() {
+    // #43: a cluster whose apply never brings it up must not re-apply every
+    // tick — exponential backoff throttles it.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    prov.set_apply_result(Some(ClusterState::Terminated)); // never comes up
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+
+    for now in 0..10 {
+        rec.reconcile_all_at(now).await;
+    }
+    // Without backoff this would be 10; with base=5s backoff it applies at
+    // t=0 and t=5 only.
+    assert!(
+        prov.apply_count() <= 3,
+        "backoff must throttle a permanently-failing cluster, got {}",
+        prov.apply_count()
+    );
+}
+
+#[tokio::test]
+async fn backoff_skips_within_window() {
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    prov.set_apply_result(Some(ClusterState::Terminated));
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+
+    rec.reconcile_all_at(0).await; // applies, sets next_attempt_at = 5
+    let after_first = prov.apply_count();
+    let r = rec.reconcile_all_at(0).await; // still inside the backoff window
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Backoff);
+    assert_eq!(
+        prov.apply_count(),
+        after_first,
+        "must not re-apply within the window"
+    );
+}
+
+#[tokio::test]
+async fn backoff_resets_after_recovery() {
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    prov.set_apply_result(Some(ClusterState::Terminated));
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+
+    rec.reconcile_all_at(0).await; // fail → failure_count 1, next 5
+    rec.reconcile_all_at(5).await; // fail → failure_count 2, next 15
+                                   // Cluster recovers: apply now brings it up.
+    prov.set_apply_result(None);
+    rec.reconcile_all_at(15).await; // success → reset
+    let stored = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.failure_count, 0, "success resets failure count");
+    assert_eq!(stored.next_attempt_at, 0, "success clears backoff");
+
+    // A subsequent out-of-band drift is repaired immediately (no stale gate).
+    prov.set_state("demo", ClusterState::Terminated);
+    let applies = prov.apply_count();
+    let r = rec.reconcile_all_at(16).await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Applied);
+    assert_eq!(
+        prov.apply_count(),
+        applies + 1,
+        "reset means immediate repair"
+    );
+}
+
+#[tokio::test]
+async fn token_bucket_caps_actuations_per_pass() {
+    // #43: a burst of failing clusters cannot exceed the global actuation
+    // budget in a single pass.
+    let store = Arc::new(InMemoryStore::new());
+    let prov = Arc::new(MockProvisioner::default());
+    prov.set_apply_result(Some(ClusterState::Terminated));
+    let rec = Reconciler::with_limits(
+        store.clone(),
+        prov.clone(),
+        RateLimits {
+            capacity: 5.0,
+            refill_per_sec: 0.0,
+        },
+    );
+    for i in 0..50 {
+        let id = ClusterId(format!("c{i}"));
+        store
+            .upsert_desired(&id, spec(&format!("c{i}"), 1))
+            .await
+            .unwrap();
+    }
+    rec.reconcile_all_at(0).await;
+    assert!(
+        prov.apply_count() <= 5,
+        "token bucket (capacity 5) must cap actuations, got {}",
+        prov.apply_count()
+    );
 }
 
 #[tokio::test]

@@ -180,8 +180,19 @@ async fn main() -> std::io::Result<()> {
                         // The same provisioner backs both the reconcile loop
                         // (clusters) and the Serve-service routes.
                         service_provisioner = Some(provisioner.clone());
-                        let reconciler =
-                            mobula_controller::Reconciler::new(concrete.clone(), provisioner);
+                        // Global actuation rate limit (#43): cap provider
+                        // apply calls so a burst of failing clusters can't
+                        // hammer the Kubernetes API. Generous enough for
+                        // normal ops (per-cluster exponential backoff is the
+                        // primary throttle); this is defense-in-depth.
+                        let reconciler = mobula_controller::Reconciler::with_limits(
+                            concrete.clone(),
+                            provisioner,
+                            mobula_controller::RateLimits {
+                                capacity: 20.0,
+                                refill_per_sec: 5.0,
+                            },
+                        );
                         // ADR-0007 restore quarantine (#41): before actuating,
                         // check whether the store was restored behind reality
                         // (a backing cluster newer than the DB). If so, the
