@@ -38,6 +38,43 @@ curl -s localhost:8484/api/v1/clusters/demo1   # observed_state → "running"
 
 Then open the dashboard and you'll see it in the cluster list.
 
+## Authenticated variant (local Keycloak)
+
+To exercise the **auth** path — real OIDC login, per-role RBAC (401/403),
+audit events with real subjects — bring up the auth overlay instead:
+
+```bash
+./deploy/up.sh auth          # stops the plain demo, starts Keycloak + authed API
+./deploy/up.sh auth down     # tear down (add -v to re-import the realm)
+```
+
+- **Keycloak:** http://localhost:8090 (admin console `admin`/`admin`), realm
+  `mobula`, imported from `deploy/keycloak/mobula-realm.json`
+- **Test users** (password = username): `admin` (/platform-admins),
+  `operator` (/sre), `developer` (/ml-eng), `viewer` (/observers)
+- **Sign in to the dashboard:** http://localhost:8088/login — paste a token:
+
+```bash
+curl -s localhost:8090/realms/mobula/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=mobula \
+  -d username=viewer -d password=viewer | jq -r .access_token
+```
+
+- **CLI device flow:** `mobula login --issuer http://localhost:8090/realms/mobula --client-id mobula`
+- **Service account:** `mobula token --issuer http://localhost:8090/realms/mobula --client-id mobula-service --client-secret mobula-service-secret`
+
+Expected matrix: no token → 401 everywhere; viewer → reads 200, mutations
+403; developer → services/jobs write, cluster lifecycle 403; operator →
+cluster lifecycle; admin → pools/registry/audit. Every decision lands in
+`GET /api/v1/audit` (Admin) with the caller's Keycloak subject.
+
+How it works: Keycloak's hostname is pinned to `http://localhost:8090` and
+the `mobula` container shares Keycloak's network namespace, so the OIDC
+issuer string is identical from your shell, the container, and the token's
+`iss` claim (see the comment in `docker-compose.auth.yml`). The auth config
+is `deploy/keycloak/auth.toml`; cleartext HTTP is accepted because this is a
+local demo only (`--allow-insecure-transport`).
+
 ## Real clusters
 
 For **real** KubeRay provisioning (create a cluster → real Ray pods), use the
@@ -52,6 +89,7 @@ but nothing is enforced by Kueue ClusterQueues. For the full pool engine
 (cohort borrowing, gang admission, queue labels), use the dev-stack — it
 installs Kueue by default (`MOBULA_WITH_KUEUE=0` to skip).
 
-> Note: the dashboard's identity and registry screens are "UI-ahead" — their
-> endpoints aren't in the API yet, so they render a "not implemented" empty
-> state. Clusters, services, version, and health are fully live in demo mode.
+> Note: the dashboard's identity, registry, and audit screens are all live
+> (registry + audit endpoints landed 2026-08-16; sign in via `/login` when
+> using the auth variant). Clusters, services, pools, and usage are fully
+> live in demo mode.

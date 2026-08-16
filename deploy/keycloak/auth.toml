@@ -1,0 +1,14 @@
+# Mobula auth config for the local Keycloak demo (deploy/docker-compose.auth.yml).
+# The issuer string must be identical everywhere: host (CLI/curl), the mobula
+# container (discovery + JWKS), and Keycloak's pinned hostname (the iss claim).
+# That is why Keycloak is pinned to http://localhost:8090 and the mobula
+# container shares Keycloak's network namespace in the overlay.
+issuer = "http://localhost:8090/realms/mobula"
+audience = "mobula"
+groups_claim = "groups"
+
+[roles]
+admin = ["/platform-admins"]
+operator = ["/sre"]
+developer = ["/ml-eng"]
+viewer = ["/observers"]

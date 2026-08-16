@@ -7,6 +7,9 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        # docker-compose.auth.yml uses the Compose-spec `!reset` tag,
+        # which is not portable YAML (safe_load rejects it).
+        exclude: ^deploy/docker-compose\.auth\.yml$
       - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files

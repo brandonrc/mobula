@@ -4,6 +4,8 @@
 #
 #   ./deploy/up.sh              # build + start, streaming logs
 #   ./deploy/up.sh -d           # detached
+#   ./deploy/up.sh auth         # authenticated variant: local Keycloak +
+#                               # OIDC-enforced control plane (detached)
 #   ./deploy/up.sh down         # tear down
 #
 # Generates the OpenAPI spec from the Rust source and the typed TS client
@@ -23,6 +25,24 @@ need docker; need cargo
 # `down` / passthrough for compose subcommands that don't need a rebuild.
 if [ "${1:-}" = "down" ]; then
   exec docker compose -f "$COMPOSE" down "${@:2}"
+fi
+
+# `auth`: the authenticated variant — local Keycloak (realm `mobula`, test
+# users admin/operator/developer/viewer, passwords = usernames) plus the
+# control plane with real OIDC enforcement. Stops the plain demo first
+# (both want host port 8484). No spec/client regen: only the mobula
+# service's config changes, so the existing images are reused.
+#   ./deploy/up.sh auth        # start the authenticated stack (detached)
+#   ./deploy/up.sh auth down   # tear down; add -v to re-import the realm next time
+if [ "${1:-}" = "auth" ]; then
+  shift
+  if [ "${1:-}" = "down" ]; then
+    shift
+    exec docker compose -f "$COMPOSE" -f "$ROOT/deploy/docker-compose.auth.yml" --profile auth down "$@"
+  fi
+  docker compose -f "$COMPOSE" down >/dev/null
+  echo "▶ starting the authenticated stack (Keycloak on :8090, API on :8484, UI on :8088)"
+  exec docker compose -f "$COMPOSE" -f "$ROOT/deploy/docker-compose.auth.yml" --profile auth up -d "$@"
 fi
 
 [ -d "$UI" ] || { echo "mobula-ui not found at $UI (set MOBULA_UI_DIR)" >&2; exit 1; }
