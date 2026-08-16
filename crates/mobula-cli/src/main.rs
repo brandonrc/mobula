@@ -227,7 +227,60 @@ async fn main() -> std::io::Result<()> {
                     // DEMO: full cluster/service API on an in-memory mock
                     // provisioner — no Kubernetes (local testing / compose).
                     None if demo => {
+                        use mobula_controller::Store as _;
                         let concrete = std::sync::Arc::new(mobula_controller::InMemoryStore::new());
+                        // Seed cross-cluster job history so the dashboard's
+                        // Jobs screen has data (incl. a record whose cluster
+                        // no longer exists, showing history outlives clusters).
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        for (id, cluster, submitter, status, duration_secs, ago) in [
+                            (
+                                "raysubmit_a1b2",
+                                "demo-alpha",
+                                "alice@example.com",
+                                "SUCCEEDED",
+                                Some(742u64),
+                                3600u64,
+                            ),
+                            (
+                                "raysubmit_c3d4",
+                                "demo-alpha",
+                                "bob@example.com",
+                                "RUNNING",
+                                None,
+                                120,
+                            ),
+                            (
+                                "raysubmit_e5f6",
+                                "retired-beta",
+                                "alice@example.com",
+                                "FAILED",
+                                Some(51),
+                                7200,
+                            ),
+                            (
+                                "raysubmit_g7h8",
+                                "demo-gamma",
+                                "carol@example.com",
+                                "STOPPED",
+                                Some(310),
+                                1800,
+                            ),
+                        ] {
+                            let _ = concrete
+                                .record_job(mobula_core::JobRecord {
+                                    id: id.into(),
+                                    cluster: cluster.into(),
+                                    submitter: submitter.into(),
+                                    status: status.into(),
+                                    duration_secs,
+                                    submitted_at: now.saturating_sub(ago),
+                                })
+                                .await;
+                        }
                         let provisioner =
                             std::sync::Arc::new(mobula_provision::DemoProvisioner::new());
                         service_provisioner = Some(provisioner.clone());

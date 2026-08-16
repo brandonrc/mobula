@@ -320,6 +320,52 @@ async fn delete_cluster(
     }
 }
 
+/// A job in the persistent, cross-cluster history (Phase 3, spec §5.5).
+#[derive(Serialize, ToSchema)]
+pub struct JobView {
+    pub id: String,
+    pub cluster: String,
+    pub submitter: String,
+    /// Ray job status (PENDING | RUNNING | SUCCEEDED | FAILED | STOPPED).
+    pub status: String,
+    /// Wall-clock seconds once terminal; null while running.
+    pub duration_secs: Option<u64>,
+    pub submitted_at: u64,
+}
+
+impl From<mobula_core::JobRecord> for JobView {
+    fn from(j: mobula_core::JobRecord) -> Self {
+        Self {
+            id: j.id,
+            cluster: j.cluster,
+            submitter: j.submitter,
+            status: j.status,
+            duration_secs: j.duration_secs,
+            submitted_at: j.submitted_at,
+        }
+    }
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/jobs", tag = "jobs",
+    responses((status = 200, description = "Persistent job history, newest first", body = [JobView]),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Read on job")),
+    security(("bearer" = []))
+)]
+async fn list_jobs(
+    State(st): State<ClusterApiState>,
+    identity: Option<Extension<Identity>>,
+) -> Response {
+    if let Some(deny) = authorize(ident(&identity), PermissionType::Read, Target::Job) {
+        return deny;
+    }
+    match st.store.list_jobs().await {
+        Ok(jobs) => Json(jobs.into_iter().map(JobView::from).collect::<Vec<_>>()).into_response(),
+        Err(e) => store_err(e),
+    }
+}
+
 pub fn router(store: Arc<dyn Store>, policy: Arc<PolicyConfig>) -> Router {
     Router::new()
         .route("/api/v1/clusters", get(list_clusters).post(create_cluster))
@@ -327,6 +373,7 @@ pub fn router(store: Arc<dyn Store>, policy: Arc<PolicyConfig>) -> Router {
             "/api/v1/clusters/{id}",
             get(get_cluster).delete(delete_cluster),
         )
+        .route("/api/v1/jobs", get(list_jobs))
         .with_state(ClusterApiState {
             store,
             policy,
