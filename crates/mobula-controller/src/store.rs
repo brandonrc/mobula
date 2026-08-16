@@ -396,7 +396,7 @@ pub mod memory {
 
         async fn list_jobs(&self) -> Result<Vec<JobRecord>, StoreError> {
             let mut jobs: Vec<JobRecord> = self.jobs.lock().unwrap().values().cloned().collect();
-            jobs.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
+            jobs.sort_by_key(|r| std::cmp::Reverse(r.submitted_at));
             Ok(jobs)
         }
     }
