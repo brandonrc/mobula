@@ -12,7 +12,7 @@ TLS; Mobula supplies everything identity-shaped that involves a bearer token.
 
 ```mermaid
 flowchart LR
-    subgraph clients [Clients]
+    subgraph clients ["Clients"]
         browser["Browser<br/>(dashboards, UI)"]
         rayjob["ray job submit /<br/>JobSubmissionClient"]
         cli["mobula CLI"]
@@ -24,14 +24,14 @@ flowchart LR
         operator["nebari-operator<br/>NebariApp reconcilers"]
     end
 
-    subgraph mobula [Mobula control plane]
+    subgraph mobula ["Mobula control plane"]
         api["mobula-api<br/>REST + job gateway"]
         authz["authz endpoint<br/>(ext_authz target)"]
         recon["reconcilers<br/>clusters + pools + metering"]
         db[("Postgres / SQLite<br/>desired state, job history,<br/>usage samples")]
     end
 
-    subgraph dataplane [Data plane - one per cluster]
+    subgraph dataplane ["Data plane — one per cluster"]
         kuberay["KubeRay operator"]
         kueue["Kueue<br/>(pool engine)"]
         head["Ray head<br/>dashboard + job API<br/>static token auth"]
@@ -225,12 +225,12 @@ sequenceDiagram
     Note over R: every tick, observation-first (ADR-0006)
     R->>Q: pool reconcile — apply Cohort/CQ/Flavors/LQs
     R->>K: cluster reconcile — apply RayCluster with queue-name label
-    Q->>K: webhook holds RayCluster suspended; Workload created
+    Q->>K: webhook holds RayCluster suspended, Workload created
     alt quota available (nominal, or borrowed from the cohort)
         Q->>K: admit Workload, unsuspend
         K->>K: create head + worker pods
     else pool exhausted
-        Q->>Q: Workload pends; cluster stays Suspended
+        Q->>Q: Workload pends, cluster stays Suspended
         Note over R: queued is not drift — the reconciler must not repair it
     end
 ```
@@ -246,7 +246,7 @@ flowchart TB
         kueue --> sched["kube-scheduler<br/>owns pod-to-node placement"]
         sched -->|unschedulable pods| ca["cluster-autoscaler / Karpenter<br/>owns nodes/VMs"]
     end
-    mob["Mobula"] -.->|min/max bounds only — never replicas (ADR-0007)| rayas
+    mob["Mobula"] -.->|"min/max bounds only — never replicas (ADR-0007)"| rayas
     mob -.->|pool topology + allocations| kueue
     kueue -.->|status ledger sampled| mob
 ```
@@ -272,7 +272,7 @@ flowchart LR
     lq --> meter
     spec --> meter
     meter -->|append| samples
-    samples -->|step-integral with carry-in<br/>mobula-policy::usage| usage
+    samples -->|"step-integral with carry-in<br/>mobula-policy::usage"| usage
     meter -->|latest observation| poolu
     meter -->|latest sample| prom
 ```
