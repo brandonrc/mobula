@@ -438,3 +438,68 @@ async fn ext_authz_check_endpoint_matrix() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }
+
+/// ext_authz derives its target from the forwarded path, not a hardcoded
+/// `Target::Job` (#46). Build a check request whose x-forwarded-* headers
+/// describe the proxied request.
+fn authz_check_req(fwd_method: &str, fwd_uri: &str, token: &str) -> Request<Body> {
+    Request::post("/api/v1/authz/check")
+        .header(header::HOST, "mobula.example.com")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("x-forwarded-method", fwd_method)
+        .header("x-forwarded-uri", fwd_uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn ext_authz_forwarded_cluster_path_denies_developer() {
+    let idp = spawn_idp().await;
+    let (app, _) = authed_app(&idp).await;
+    // Developer has Write on Job but only Read on Cluster → POST cluster = 403.
+    let dev = idp.token(&["/ml-eng"], "mobula", 300);
+    let res = app
+        .oneshot(authz_check_req("POST", "/api/v1/clusters", &dev))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn ext_authz_forwarded_cluster_path_allows_operator() {
+    let idp = spawn_idp().await;
+    let (app, _) = authed_app(&idp).await;
+    // Operator has Write on Cluster → POST cluster = 200 with subject header.
+    let operator = idp.token(&["/sre"], "mobula", 300);
+    let res = app
+        .oneshot(authz_check_req("POST", "/api/v1/clusters", &operator))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get("x-mobula-subject").unwrap(), "user-123");
+}
+
+#[tokio::test]
+async fn ext_authz_forwarded_service_path_respects_service_target() {
+    let idp = spawn_idp().await;
+    let (app, _) = authed_app(&idp).await;
+    // Service is a "code" surface: Developer has Write, Operator only Read.
+    let operator = idp.token(&["/sre"], "mobula", 300);
+    let res = app
+        .clone()
+        .oneshot(authz_check_req("POST", "/api/v1/services", &operator))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "operator cannot deploy"
+    );
+
+    let dev = idp.token(&["/ml-eng"], "mobula", 300);
+    let res = app
+        .oneshot(authz_check_req("POST", "/api/v1/services", &dev))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "developer can deploy");
+}
