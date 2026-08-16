@@ -1302,6 +1302,7 @@ dependencies = [
  "axum",
  "futures",
  "jsonwebtoken",
+ "mobula-api",
  "mobula-auth",
  "mobula-controller",
  "mobula-core",

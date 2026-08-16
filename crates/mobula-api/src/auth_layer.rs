@@ -36,12 +36,36 @@ fn is_public(path: &str) -> bool {
 /// DELETE on the proxied Ray surface is job deletion — a Developer action,
 /// not cluster lifecycle — so it maps to `Write`, not `Delete`. Mobula's
 /// own lifecycle/admin routes (Phase 3) will require permissions per route
-/// against a cluster/project target, not by HTTP method.
+/// against a cluster/project target, not by HTTP method. This picks the
+/// verb only; the target is derived separately (see [`target_for_path`],
+/// whose prefixes must stay in sync with clusters.rs/services.rs).
 fn required_permission(method: &Method) -> PermissionType {
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
         PermissionType::Read
     } else {
         PermissionType::Write
+    }
+}
+
+/// Which permission target a forwarded control-plane path maps to. Roles are
+/// permission-sets over (verb, target), not an ordinal rank, so the target
+/// must be derived from the path — a Developer has Write on `Job`/`Service`
+/// but only Read on `Cluster`, and an Operator is the reverse. These prefixes
+/// MUST stay in sync with the router prefixes in `clusters.rs`
+/// (`/api/v1/clusters`) and `services.rs` (`/api/v1/services`).
+///
+/// Matching is on segment boundaries — an exact match or a `<prefix>/…`
+/// child — so `/api/v1/clusters-evil` is NOT a cluster path and falls through
+/// to `Job` (the safe default for the proxied Ray surface).
+fn target_for_path(path: &str) -> Target {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let is_under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
+    if is_under("/api/v1/clusters") {
+        Target::Cluster
+    } else if is_under("/api/v1/services") {
+        Target::Service
+    } else {
+        Target::Job
     }
 }
 
@@ -98,6 +122,8 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
     // check its own target (e.g. cluster lifecycle needs Cluster, not Job).
     if host_is_cluster {
         let required = required_permission(req.method());
+        // Target::Job is correct here: cluster-host traffic is the proxied
+        // Ray job surface, guarded by host_is_cluster above.
         if !identity.permits(required, Target::Job) {
             tracing::info!(
                 target: "mobula::audit",
@@ -141,6 +167,12 @@ pub fn authorize(
 /// original request's method and headers; 2xx allows, anything else
 /// denies. Returns the resolved identity in response headers so Envoy
 /// can propagate it upstream if configured.
+///
+/// The authorization target is derived from the forwarded path via
+/// [`target_for_path`], not hardcoded — so pointing ext_authz at a cluster
+/// or service path enforces the right (verb, target) permission. Its path
+/// prefixes MUST stay in sync with the router prefixes in `clusters.rs` and
+/// `services.rs`.
 pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response {
     let Some(validator) = &st.validator else {
         return (StatusCode::NOT_IMPLEMENTED, "authn not configured").into_response();
@@ -180,11 +212,12 @@ pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response 
         }
     };
     let required = required_permission(&method);
-    if identity.permits(required, Target::Job) {
+    let target = target_for_path(&path);
+    if identity.permits(required, target) {
         tracing::info!(
             target: "mobula::audit",
             decision = "allow", subject = %identity.subject,
-            %method, path = %path, "ext_authz"
+            target = ?target, %method, path = %path, "ext_authz"
         );
         (
             StatusCode::OK,
@@ -196,7 +229,7 @@ pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response 
         tracing::info!(
             target: "mobula::audit",
             decision = "deny", reason = "insufficient_permission",
-            subject = %identity.subject, required = ?required,
+            subject = %identity.subject, required = ?required, target = ?target,
             granted = ?identity.roles, %method, path = %path, "ext_authz"
         );
         (StatusCode::FORBIDDEN, "insufficient permission").into_response()
@@ -239,5 +272,17 @@ mod tests {
         assert_eq!(required_permission(&Method::POST), PermissionType::Write);
         assert_eq!(required_permission(&Method::PUT), PermissionType::Write);
         assert_eq!(required_permission(&Method::DELETE), PermissionType::Write);
+    }
+
+    #[test]
+    fn target_for_path_maps_prefixes() {
+        assert_eq!(target_for_path("/api/v1/clusters"), Target::Cluster);
+        assert_eq!(target_for_path("/api/v1/clusters/abc"), Target::Cluster);
+        assert_eq!(target_for_path("/api/v1/services/x"), Target::Service);
+        assert_eq!(target_for_path("/api/jobs/"), Target::Job);
+        // Segment boundary, not naive prefix: `clusters-evil` is not clusters.
+        assert_eq!(target_for_path("/api/v1/clusters-evil"), Target::Job);
+        // Query strings are stripped before matching.
+        assert_eq!(target_for_path("/api/v1/clusters?x=1"), Target::Cluster);
     }
 }

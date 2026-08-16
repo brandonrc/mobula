@@ -26,8 +26,19 @@ tower-http = { workspace = true }
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
 
+[features]
+# Re-exports the dev/test-only router constructors (build_router/build_app/
+# build_app_full/build_app_full_svc) that default validator=None. These
+# bypass the fail-closed guard, so they must never be reachable in a
+# production build (#45); they exist only for tests and embedded fixtures.
+test-util = []
+
 [dev-dependencies]
 async-trait.workspace = true
 jsonwebtoken.workspace = true
 rsa = { version = "0.9", features = ["pem"] }
 rand = "0.8"
+# Enable `test-util` for this crate's own integration tests (which are a
+# separate crate and would not otherwise see the feature) without forcing
+# it on downstream consumers.
+mobula-api = { path = ".", features = ["test-util"] }

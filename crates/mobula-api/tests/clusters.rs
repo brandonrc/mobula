@@ -10,8 +10,52 @@ use axum::http::{header, Request, StatusCode};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-use mobula_controller::{InMemoryStore, Store};
-use mobula_core::ClusterId;
+use mobula_controller::{DesiredState, InMemoryStore, Store, StoreError, StoredCluster};
+use mobula_core::{ClusterId, ClusterSpec, ClusterState};
+
+/// Store decorator that widens the quota check->write window: `list()` reads
+/// the real snapshot, then sleeps before returning it. That makes the TOCTOU
+/// bug in quota admission (#44) deterministic under cooperative scheduling —
+/// without the per-project lock both concurrent creates capture the same
+/// pre-insert snapshot and both admit; with the lock the second create blocks
+/// until the first commits, then reads the fresh row and is 409'd.
+struct SlowListStore {
+    inner: Arc<InMemoryStore>,
+}
+
+#[async_trait::async_trait]
+impl Store for SlowListStore {
+    async fn upsert_desired(&self, id: &ClusterId, spec: ClusterSpec) -> Result<u64, StoreError> {
+        self.inner.upsert_desired(id, spec).await
+    }
+    async fn get(&self, id: &ClusterId) -> Result<Option<StoredCluster>, StoreError> {
+        self.inner.get(id).await
+    }
+    async fn list(&self) -> Result<Vec<StoredCluster>, StoreError> {
+        // Read the snapshot first, then sleep before returning it: both
+        // concurrent creates thus observe the same pre-insert view unless
+        // serialized by the admission lock.
+        let snapshot = self.inner.list().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        snapshot
+    }
+    async fn set_desired(&self, id: &ClusterId, desired: DesiredState) -> Result<(), StoreError> {
+        self.inner.set_desired(id, desired).await
+    }
+    async fn record_observation(
+        &self,
+        id: &ClusterId,
+        observed: Option<ClusterState>,
+        observed_generation: u64,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .record_observation(id, observed, observed_generation)
+            .await
+    }
+    async fn record_intent(&self, key: &str) -> Result<bool, StoreError> {
+        self.inner.record_intent(key).await
+    }
+}
 
 fn create_body(id: &str) -> serde_json::Value {
     serde_json::json!({
@@ -95,6 +139,74 @@ async fn quota_admission_rejects_over_limit_with_409() {
         res.status(),
         StatusCode::CONFLICT,
         "over-quota create must 409"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_creates_cannot_over_admit_quota() {
+    use mobula_api::clusters::PolicyConfig;
+    use mobula_policy::ResourceVector;
+
+    let idp = spawn_idp().await;
+    let inner = Arc::new(InMemoryStore::new());
+    let store: Arc<dyn Store> = Arc::new(SlowListStore {
+        inner: inner.clone(),
+    });
+
+    let mut quotas = std::collections::HashMap::new();
+    // demo project capped at 5 CPU; two 4-CPU creates together need 8 > 5.
+    quotas.insert(
+        "demo".to_string(),
+        ResourceVector {
+            cpu: 5.0,
+            gpu: 0.0,
+            mem_gib: 100.0,
+        },
+    );
+    let policy = PolicyConfig {
+        prices: None,
+        quotas,
+    };
+    let app = authed_app_with_policy(&idp, store, policy).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    // Each create = head 1 + 3×1cpu workers = 4 CPU.
+    let req_a = post_json(
+        "/api/v1/clusters",
+        "mobula.example.com",
+        &admin,
+        create_body_sized("a", "1", 3),
+    );
+    let req_b = post_json(
+        "/api/v1/clusters",
+        "mobula.example.com",
+        &admin,
+        create_body_sized("b", "1", 3),
+    );
+
+    let (ra, rb) = tokio::join!(app.clone().oneshot(req_a), app.clone().oneshot(req_b),);
+    let (sa, sb) = (ra.unwrap().status(), rb.unwrap().status());
+
+    // Exactly one admitted (201), one rejected (409) — never both admitted.
+    let mut statuses = [sa, sb];
+    statuses.sort_by_key(|s| s.as_u16());
+    assert_eq!(
+        statuses,
+        [StatusCode::CREATED, StatusCode::CONFLICT],
+        "expected exactly one 201 and one 409, got {sa} and {sb}"
+    );
+
+    // Only one Running cluster committed in project demo.
+    let running = inner
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.spec.project == "demo" && c.desired == DesiredState::Running)
+        .count();
+    assert_eq!(
+        running, 1,
+        "quota over-admission left extra clusters running"
     );
 }
 
