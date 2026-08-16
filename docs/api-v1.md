@@ -908,23 +908,52 @@ registry even without a store).
   entries automatically; dynamic registration is a follow-up (security
   review #2 treats the dynamic registry as an SSRF surface).
 
+### 5.15 Local auth — `/api/v1/auth/*` (ADR-0011)
 
+IdP-free authentication: username/password login issuing **opaque** tokens
+(`mob_<prefix>_<hex>`, bcrypt-hashed at rest — Mobula stores credentials,
+never signs them). **Implemented** (`local_auth.rs`) behind
+`serve --local-auth`. OIDC remains the production path; when both are
+configured, JWT-shaped bearers go to the OIDC validator and everything else
+to the token store.
+
+- `POST /api/v1/auth/login` — **public**. `{username, password}` → 200
+  `{token, token_type: "bearer", expires_at, identity: {subject, roles}}`.
+  Every failure (unknown user, wrong password, locked, disabled) is the same
+  401 `invalid_credentials`; the distinction lives only in the audit trail.
+  Five failures lock the account for 300s.
+- `GET /api/v1/auth/providers` — **public**. `{local: bool, oidc: {issuer} | null}`
+  so the login page knows which form(s) to render.
+- `POST /api/v1/auth/tokens` — any authenticated identity; `{label,
+  expires_in_days}` (≤ 90) → 201 with the full token **shown once**.
+  `GET /api/v1/auth/tokens` lists the caller's own (hashes never serialize);
+  `DELETE /api/v1/auth/tokens/{prefix}` revokes own only (404 otherwise — no
+  ownership probing). `POST /api/v1/auth/logout` revokes the caller's PAT.
+- Local users carry one of the four built-in roles as a column, resolved per
+  request — role changes apply live, nothing is stamped into tokens.
+- Bootstrap: first `--local-auth` boot with an empty user table creates
+  `admin` with a random password written 0600 to
+  `<db-dir>/local-admin-password` (or `MOBULA_LOCAL_ADMIN_PASSWORD` for
+  demos).
+- CLI: `mobula login --local --username X --password-stdin`; `mobula logout`
+  revokes the PAT server-side before dropping the local credentials file.
 
 ## 6. Endpoint × milestone summary
 
 | Endpoint | Milestone | Backs (ui-ux-spec) | Status in code |
 |---|---|---|---|
 | `GET /api/v1/identity` | **A** | shell, §5.8 | new, trivial |
-| `GET /api/v1/registry/clusters` | **A** | §5.6 (read-only, D5) | new |
+| `GET /api/v1/registry/clusters` | **A** | §5.6 (read-only, D5) | **exists** (registry.rs, Admin-only) |
 | `GET /api/v1/clusters` (registry-backed) | **A** | §5.2 | new fallback path; store-backed exists |
 | `GET /api/v1/clusters/{id}` | B | §5.4 | exists (+ ✱ fields) |
 | `POST /api/v1/clusters` | B | §5.3 | exists (incl. quota admission) |
 | `PATCH /api/v1/clusters/{id}` | B | §5.3/§5.4 edit | new |
 | `POST …/suspend` `/resume` `/terminate` | B | §5.4 actions | new (DELETE exists) |
 | `GET /api/v1/overview` | B | §5.1 | new |
-| `GET /api/v1/audit` | B | §5.7 | new |
+| `GET /api/v1/audit` | B | §5.7 | **exists** (audit.rs, persisted + CSV) |
 | `GET /api/v1/access/roles` | B | §5.8 | new |
-| PKCE auth endpoints | B | §5.10 | new, critical path |
+| PKCE auth endpoints | B | §5.10 | UI does SPA-direct PKCE; backend endpoints still new |
+| Local auth (`/api/v1/auth/*`) | B | §5.10 | **exists** (local_auth.rs, ADR-0011) |
 | `GET /api/v1/clusters/{id}/nodes` | B/C | §5.4 nodes tab | new |
 | `/api/v1/clusters/{id}/jobs…` proxy + WS tail | C | §5.4 jobs/logs | new (southbound exists in gateway) |
 | `GET /api/v1/jobs[/{job_id}]` | C | §5.5 | new |

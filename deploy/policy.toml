@@ -1,0 +1,14 @@
+# Demo governance config (serve --policy). Prices feed the cost estimates on
+# cluster cards and the usage page; quotas gate cluster creation per project
+# (409 on exceed). Numbers are plausible-ish cloud list prices, not real.
+
+[prices]
+cpu = 0.048               # $/core-hour
+memory = 0.006            # $/GiB-hour
+"nvidia.com/gpu" = 2.80   # $/GPU-hour (A100-ish)
+
+[quotas]
+dev = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
+ml-team = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
+genai = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
+research = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }

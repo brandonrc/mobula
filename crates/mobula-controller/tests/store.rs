@@ -656,6 +656,189 @@ async fn sqlite_store_audit_conforms() {
     audit_conformance(&store).await;
 }
 
+/// Local-auth conformance (ADR-0011): user CRUD, lockout counters, and
+/// token lifecycle — run against BOTH impls.
+async fn local_auth_conformance(store: &dyn Store) {
+    use mobula_core::{ApiTokenRecord, LocalRole};
+
+    // Create → get → list round-trip; the hash stays inside the record.
+    store
+        .create_local_user(
+            "alice",
+            Some("alice@x.io"),
+            "$2b$hash-a",
+            LocalRole::Developer,
+        )
+        .await
+        .unwrap();
+    store
+        .create_local_user("bob", None, "$2b$hash-b", LocalRole::Viewer)
+        .await
+        .unwrap();
+    let alice = store.get_local_user("alice").await.unwrap().unwrap();
+    assert_eq!(alice.email.as_deref(), Some("alice@x.io"));
+    assert_eq!(alice.role, LocalRole::Developer);
+    assert_eq!(alice.password_hash, "$2b$hash-a");
+    assert!(!alice.disabled);
+    assert!(alice.created_at > 0);
+    assert_eq!(alice.failed_logins, 0);
+    assert_eq!(alice.locked_until, None);
+
+    // Duplicate username errors; unknown user reads as None.
+    assert!(store
+        .create_local_user("alice", None, "x", LocalRole::Viewer)
+        .await
+        .is_err());
+    assert!(store.get_local_user("ghost").await.unwrap().is_none());
+
+    // list is username-ordered.
+    let names: Vec<String> = store
+        .list_local_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|u| u.username)
+        .collect();
+    assert_eq!(names, ["alice", "bob"]);
+
+    // Password/role/disabled updates round-trip and error on missing users.
+    store
+        .set_local_user_password("alice", "$2b$hash-a2")
+        .await
+        .unwrap();
+    store
+        .set_local_user_role("alice", LocalRole::Admin)
+        .await
+        .unwrap();
+    store.set_local_user_disabled("bob", true).await.unwrap();
+    let alice = store.get_local_user("alice").await.unwrap().unwrap();
+    assert_eq!(alice.password_hash, "$2b$hash-a2");
+    assert_eq!(alice.role, LocalRole::Admin);
+    assert!(store.get_local_user("bob").await.unwrap().unwrap().disabled);
+    for r in [
+        store.set_local_user_password("ghost", "x").await,
+        store.set_local_user_role("ghost", LocalRole::Viewer).await,
+        store.set_local_user_disabled("ghost", false).await,
+    ] {
+        assert!(r.is_err());
+    }
+
+    // Lockout state machine (5 failures → locked; success clears).
+    for _ in 0..4 {
+        store.record_login_failure("alice").await.unwrap();
+    }
+    let alice = store.get_local_user("alice").await.unwrap().unwrap();
+    assert_eq!(alice.failed_logins, 4);
+    assert_eq!(alice.locked_until, None);
+    store.record_login_failure("alice").await.unwrap();
+    let alice = store.get_local_user("alice").await.unwrap().unwrap();
+    assert_eq!(alice.failed_logins, 0, "counter resets when the lock trips");
+    let locked_until = alice.locked_until.expect("5th failure locks");
+    let now = mobula_controller::now_unix();
+    assert!(
+        locked_until >= now + mobula_controller::LOCKOUT_SECS - 5
+            && locked_until <= now + mobula_controller::LOCKOUT_SECS + 5,
+        "locked_until ≈ now + 300, got {locked_until} at {now}"
+    );
+    // (While locked the authenticator short-circuits before calling
+    // record_login_failure, so the store never sees failures-under-lock.)
+    store.record_login_success("alice").await.unwrap();
+    let alice = store.get_local_user("alice").await.unwrap().unwrap();
+    assert_eq!(alice.failed_logins, 0);
+    assert_eq!(alice.locked_until, None);
+    assert!(store.record_login_failure("ghost").await.is_err());
+
+    // Token lifecycle: create → lookup → list → touch → revoke.
+    let token = |prefix: &str, username: &str| ApiTokenRecord {
+        prefix: prefix.into(),
+        token_hash: format!("$2b$hash-{prefix}"),
+        username: username.into(),
+        label: "ci".into(),
+        created_at: 100,
+        expires_at: 200,
+        revoked: false,
+        last_used_at: None,
+    };
+    store
+        .create_api_token(token("aaaa1111", "alice"))
+        .await
+        .unwrap();
+    store
+        .create_api_token(token("bbbb2222", "alice"))
+        .await
+        .unwrap();
+    store
+        .create_api_token(token("cccc3333", "bob"))
+        .await
+        .unwrap();
+    // Prefix collision errors.
+    assert!(store
+        .create_api_token(token("aaaa1111", "alice"))
+        .await
+        .is_err());
+
+    let got = store
+        .get_api_token_by_prefix("aaaa1111")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.token_hash, "$2b$hash-aaaa1111");
+    assert_eq!(got.username, "alice");
+    assert_eq!(got.expires_at, 200);
+    assert!(!got.revoked);
+    assert_eq!(got.last_used_at, None);
+    assert!(store
+        .get_api_token_by_prefix("zzzz9999")
+        .await
+        .unwrap()
+        .is_none());
+
+    // list is owner-scoped and newest-first.
+    let alice_tokens = store.list_api_tokens("alice").await.unwrap();
+    assert_eq!(alice_tokens.len(), 2);
+    assert!(alice_tokens.iter().all(|t| t.username == "alice"));
+    assert!(store.list_api_tokens("ghost").await.unwrap().is_empty());
+
+    // touch stamps last_used_at.
+    store.touch_api_token("aaaa1111", 150).await.unwrap();
+    assert_eq!(
+        store
+            .get_api_token_by_prefix("aaaa1111")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(150)
+    );
+
+    // Revoke is owner-scoped: bob cannot revoke alice's token (same error
+    // as a nonexistent prefix — no ownership probing).
+    assert!(store.revoke_api_token("bbbb2222", "bob").await.is_err());
+    assert!(store.revoke_api_token("zzzz9999", "bob").await.is_err());
+    store.revoke_api_token("bbbb2222", "alice").await.unwrap();
+    assert!(
+        store
+            .get_api_token_by_prefix("bbbb2222")
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
+    // Idempotent re-revoke of one's own token.
+    store.revoke_api_token("bbbb2222", "alice").await.unwrap();
+}
+
+#[tokio::test]
+async fn in_memory_store_local_auth_conforms() {
+    local_auth_conformance(&InMemoryStore::new()).await;
+}
+
+#[tokio::test]
+async fn sqlite_store_local_auth_conforms() {
+    let store = SqliteStore::in_memory().await.unwrap();
+    local_auth_conformance(&store).await;
+}
+
 #[tokio::test]
 async fn sqlite_store_pool_conforms() {
     let store = SqliteStore::in_memory().await.unwrap();

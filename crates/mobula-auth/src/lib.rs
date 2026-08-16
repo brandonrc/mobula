@@ -168,6 +168,7 @@ pub enum AuthError {
 }
 
 pub mod flows;
+pub mod local;
 
 /// Subset of the OIDC provider metadata Mobula uses.
 #[derive(Debug, Clone, Deserialize)]
@@ -233,6 +234,11 @@ pub struct Validator {
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 
 impl Validator {
+    /// The configured OIDC issuer (for `GET /api/v1/auth/providers`).
+    pub fn issuer(&self) -> &str {
+        &self.config.issuer
+    }
+
     /// Run OIDC discovery and the initial JWKS fetch. Fails fast — a
     /// control plane that cannot validate tokens must not start serving.
     pub async fn discover(

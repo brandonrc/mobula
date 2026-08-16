@@ -1,0 +1,52 @@
+# Local-auth variant: login with NO IdP at all — Mobula's own local auth
+# (ADR-0011: username/password → opaque PAT, bcrypt-hashed in the store).
+# Use this to try the login/RBAC/audit path with nothing but Docker; use
+# `up.sh auth` (Keycloak) to try the production-shaped OIDC path.
+#
+#   ./deploy/up.sh local        # stops the other variants, starts this one
+#   ./deploy/up.sh local down   # tear down (-v wipes the data volume)
+#
+# Bootstrap: admin / admin (MOBULA_LOCAL_ADMIN_PASSWORD below — demo only).
+# Without it, a random password is generated and written to
+# /data/local-admin-password inside the container (and logged once).
+
+services:
+  # The volume starts root-owned; the mobula image runs as uid 1001.
+  local-init:
+    profiles: ["local"]
+    image: alpine:3
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /data && chown -R 1001:0 /data"]
+    volumes:
+      - mobula-local-data:/data
+
+  mobula:
+    profiles: ["local"]
+    depends_on:
+      local-init:
+        condition: service_completed_successfully
+    command:
+      - "serve"
+      - "--bind"
+      - "0.0.0.0:8484"
+      - "--demo"
+      - "--local-auth"
+      - "--db"
+      - "/data/mobula.db"
+      - "--audit-log"
+      - "/data/mobula-audit.jsonl"
+      - "--metering-interval-secs"
+      - "5"
+      - "--policy"
+      - "/etc/mobula/policy.toml"
+    environment:
+      MOBULA_LOCAL_ADMIN_PASSWORD: "admin"
+    volumes:
+      - mobula-local-data:/data
+      - ./policy.toml:/etc/mobula/policy.toml:ro
+
+  ui:
+    profiles: ["local"]
+
+volumes:
+  mobula-local-data:

@@ -6,6 +6,7 @@
 //! never depend on a cloud SDK or Kubernetes client (see ADR-0002).
 
 pub mod audit;
+pub mod auth;
 pub mod cluster;
 pub mod job;
 pub mod pool;
@@ -13,6 +14,7 @@ pub mod registry;
 pub mod service;
 
 pub use audit::{AuditDecision, AuditEvent, AuditFilter, AuditRequired};
+pub use auth::{ApiTokenRecord, ApiTokenView, LocalRole, LocalUserRecord, LocalUserView};
 pub use cluster::{
     ClusterId, ClusterSpec, ClusterState, DriftCondition, TransitionError, WorkerGroup,
 };

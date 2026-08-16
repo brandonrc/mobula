@@ -15,7 +15,9 @@ services:
     # unauthenticated on all interfaces (dev only). Fast metering so the
     # usage screens populate during a short demo.
     command: ["serve", "--bind", "0.0.0.0:8484", "--demo", "--dev-allow-unauthenticated",
-              "--metering-interval-secs", "5"]
+              "--metering-interval-secs", "5", "--policy", "/etc/mobula/policy.toml"]
+    volumes:
+      - ./policy.toml:/etc/mobula/policy.toml:ro
     ports:
       - "8484:8484"
     restart: unless-stopped

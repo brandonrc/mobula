@@ -151,7 +151,28 @@ pub async fn authed_app_with_services(
         None,
         Default::default(),
         Some(provisioner),
+        None,
     )
+}
+
+/// App with ONLY local auth (ADR-0011) enabled on the given store.
+pub async fn local_auth_app(
+    store: Arc<dyn Store>,
+) -> (Router, Arc<mobula_auth::local::LocalAuthenticator>) {
+    let auth = Arc::new(mobula_auth::local::LocalAuthenticator::new(
+        store.clone(),
+        3600,
+        90,
+    ));
+    let app = mobula_api::build_app_full_svc(
+        ClusterRegistry::default(),
+        None,
+        Some(store),
+        Default::default(),
+        None,
+        Some(auth.clone()),
+    );
+    (app, auth)
 }
 
 /// Same, but with a governance policy (quotas/prices) for Phase 4 tests.
@@ -416,5 +437,118 @@ impl mobula_controller::Store for FailingStore {
     {
         self.check("list_audit")?;
         self.inner.list_audit(filter).await
+    }
+    async fn create_local_user(
+        &self,
+        username: &str,
+        email: Option<&str>,
+        password_hash: &str,
+        role: mobula_core::LocalRole,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("create_local_user")?;
+        self.inner
+            .create_local_user(username, email, password_hash, role)
+            .await
+    }
+    async fn get_local_user(
+        &self,
+        username: &str,
+    ) -> Result<Option<mobula_core::LocalUserRecord>, mobula_controller::StoreError> {
+        self.check("get_local_user")?;
+        self.inner.get_local_user(username).await
+    }
+    async fn list_local_users(
+        &self,
+    ) -> Result<Vec<mobula_core::LocalUserRecord>, mobula_controller::StoreError> {
+        self.check("list_local_users")?;
+        self.inner.list_local_users().await
+    }
+    async fn set_local_user_password(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("set_local_user_password")?;
+        self.inner
+            .set_local_user_password(username, password_hash)
+            .await
+    }
+    async fn set_local_user_role(
+        &self,
+        username: &str,
+        role: mobula_core::LocalRole,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("set_local_user_role")?;
+        self.inner.set_local_user_role(username, role).await
+    }
+    async fn set_local_user_disabled(
+        &self,
+        username: &str,
+        disabled: bool,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("set_local_user_disabled")?;
+        self.inner.set_local_user_disabled(username, disabled).await
+    }
+    async fn set_login_lockout(
+        &self,
+        username: &str,
+        failed_logins: u32,
+        locked_until: Option<u64>,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("set_login_lockout")?;
+        self.inner
+            .set_login_lockout(username, failed_logins, locked_until)
+            .await
+    }
+    async fn record_login_failure(
+        &self,
+        username: &str,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("record_login_failure")?;
+        self.inner.record_login_failure(username).await
+    }
+    async fn record_login_success(
+        &self,
+        username: &str,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("record_login_success")?;
+        self.inner.record_login_success(username).await
+    }
+    async fn create_api_token(
+        &self,
+        record: mobula_core::ApiTokenRecord,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("create_api_token")?;
+        self.inner.create_api_token(record).await
+    }
+    async fn get_api_token_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<mobula_core::ApiTokenRecord>, mobula_controller::StoreError> {
+        self.check("get_api_token_by_prefix")?;
+        self.inner.get_api_token_by_prefix(prefix).await
+    }
+    async fn list_api_tokens(
+        &self,
+        username: &str,
+    ) -> Result<Vec<mobula_core::ApiTokenRecord>, mobula_controller::StoreError> {
+        self.check("list_api_tokens")?;
+        self.inner.list_api_tokens(username).await
+    }
+    async fn revoke_api_token(
+        &self,
+        prefix: &str,
+        username: &str,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("revoke_api_token")?;
+        self.inner.revoke_api_token(prefix, username).await
+    }
+    async fn touch_api_token(
+        &self,
+        prefix: &str,
+        now: u64,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("touch_api_token")?;
+        self.inner.touch_api_token(prefix, now).await
     }
 }

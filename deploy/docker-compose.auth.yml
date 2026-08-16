@@ -72,5 +72,8 @@ services:
       - "/tmp/mobula-audit.jsonl"
       - "--metering-interval-secs"
       - "5"
+      - "--policy"
+      - "/etc/mobula/policy.toml"
     volumes:
       - ./keycloak/auth.toml:/etc/mobula/auth.toml:ro
+      - ./policy.toml:/etc/mobula/policy.toml:ro

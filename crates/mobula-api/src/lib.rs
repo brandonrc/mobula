@@ -8,6 +8,7 @@ pub mod audit;
 pub mod auth_layer;
 pub mod clusters;
 pub mod gateway;
+pub mod local_auth;
 pub mod pools;
 pub mod registry;
 pub mod services;
@@ -57,10 +58,25 @@ use utoipa_swagger_ui::SwaggerUi;
         services::delete_service,
         registry::list_registry,
         audit::list_audit_events,
+        local_auth::login,
+        local_auth::providers,
+        local_auth::create_token,
+        local_auth::list_tokens,
+        local_auth::revoke_token,
+        local_auth::logout,
     ),
     components(
         schemas(
             VersionInfo,
+            local_auth::LoginRequest,
+            local_auth::LoginResponse,
+            local_auth::LoginIdentity,
+            local_auth::ProvidersResponse,
+            local_auth::OidcProviderInfo,
+            local_auth::CreateTokenRequest,
+            local_auth::CreateTokenResponse,
+            mobula_core::ApiTokenView,
+            mobula_core::LocalRole,
             clusters::CreateCluster,
             clusters::ClusterView,
             clusters::JobView,
@@ -119,6 +135,11 @@ use utoipa_swagger_ui::SwaggerUi;
          proxied gateway request, newest-first with seq-cursor pagination \
          and CSV export. Admin-only — audit subjects are Admin data. \
          Mounted only when a store is configured."),
+        (name = "auth", description = "Local auth (ADR-0011): username/\
+         password login issuing opaque (unsigned) bearer tokens, personal \
+         access token management, and provider metadata. `login` and \
+         `providers` are public; token routes are owner-scoped. Mounted \
+         only with `serve --local-auth` (except `providers`)."),
     ),
     info(
         title = "Mobula",
@@ -233,11 +254,13 @@ pub fn build_app_full(
     store: Option<Arc<dyn mobula_controller::Store>>,
     policy: clusters::PolicyConfig,
 ) -> Router {
-    build_app_full_svc(registry, validator, store, policy, None)
+    build_app_full_svc(registry, validator, store, policy, None, None)
 }
 
 /// As [`build_app_full`], plus an optional Serve-service provisioner; when
-/// present, the `/api/v1/services` routes are mounted.
+/// present, the `/api/v1/services` routes are mounted, and an optional
+/// [`mobula_auth::local::LocalAuthenticator`]; when present, the local-auth
+/// routes (`/api/v1/auth/*`) are mounted (ADR-0011).
 ///
 /// Gated behind `test-util`/`test`: it defaults `allow_unauthenticated = true`
 /// so it never installs the fail-closed guard, which is wrong for production.
@@ -253,8 +276,9 @@ pub fn build_app_full_svc(
     store: Option<Arc<dyn mobula_controller::Store>>,
     policy: clusters::PolicyConfig,
     services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
+    local: Option<Arc<mobula_auth::local::LocalAuthenticator>>,
 ) -> Router {
-    build_app_full_svc_inner(registry, validator, store, policy, services, true)
+    build_app_full_svc_inner(registry, validator, store, policy, services, local, true)
 }
 
 /// Router-level fail-closed guard (#45, moving #36's invariant into the
@@ -285,10 +309,11 @@ async fn refuse_non_loopback(req: Request, next: Next) -> Response {
 }
 
 /// The real router builder. `allow_unauthenticated` decides whether the
-/// fail-closed guard is installed: when a validator is present it is never
-/// needed; when absent and NOT explicitly allowed, the outermost
-/// [`refuse_non_loopback`] layer keeps the control plane closed to remote
-/// peers even if an embedder `axum::serve`s this router directly.
+/// fail-closed guard is installed: when a validator OR a local authenticator
+/// (ADR-0011) is present it is never needed; when both are absent and NOT
+/// explicitly allowed, the outermost [`refuse_non_loopback`] layer keeps
+/// the control plane closed to remote peers even if an embedder
+/// `axum::serve`s this router directly.
 #[allow(clippy::too_many_arguments)]
 fn build_app_full_svc_inner(
     registry: ClusterRegistry,
@@ -296,13 +321,17 @@ fn build_app_full_svc_inner(
     store: Option<Arc<dyn mobula_controller::Store>>,
     policy: clusters::PolicyConfig,
     services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
+    local: Option<Arc<mobula_auth::local::LocalAuthenticator>>,
     allow_unauthenticated: bool,
 ) -> Router {
     let registry = Arc::new(registry);
     let gw = gateway::GatewayState::new(registry.clone(), store.clone());
-    let fail_closed = validator.is_none() && !allow_unauthenticated;
+    // Local auth IS authentication: it satisfies the fail-closed rule
+    // (#36/#45) the same way an OIDC validator does.
+    let fail_closed = validator.is_none() && local.is_none() && !allow_unauthenticated;
     let auth = auth_layer::AuthState {
-        validator,
+        validator: validator.clone(),
+        local: local.clone(),
         registry: registry.clone(),
         store: store.clone(),
     };
@@ -315,6 +344,17 @@ fn build_app_full_svc_inner(
         .route("/api/v1/version", get(version))
         .route("/api/v1/authz/check", any(auth_layer::authz_check))
         .with_state(auth.clone());
+    // Local-auth routes (ADR-0011): `providers` is always mounted (public
+    // login-page metadata); the rest mount only when local auth is on.
+    // Both builders return state-complete routers, so merge after
+    // `with_state` like the registry routes below.
+    app = app.merge(local_auth::providers_router(
+        local.is_some(),
+        validator.as_ref().map(|v| v.issuer().to_string()),
+    ));
+    if let Some(local) = local {
+        app = app.merge(local_auth::router(local));
+    }
     // Registry routes mount unconditionally (gateway-only deployments have a
     // routing table even without a store); merged once the app is
     // state-complete (Router<()>).
@@ -358,6 +398,10 @@ fn build_app_full_svc_inner(
 pub struct ServeOptions {
     pub registry: ClusterRegistry,
     pub validator: Option<Arc<Validator>>,
+    /// Local (IdP-free) auth (ADR-0011); when present, the
+    /// `/api/v1/auth/*` routes mount and opaque PATs authenticate. Counts
+    /// as configured authentication for the fail-closed non-loopback rule.
+    pub local_auth: Option<Arc<mobula_auth::local::LocalAuthenticator>>,
     /// Permit binding a non-loopback address with no validator configured.
     pub allow_unauthenticated: bool,
     /// Permit cluster tokens over cleartext http:// (registry validation).
@@ -393,13 +437,18 @@ pub async fn serve_with_shutdown(
     opts.registry
         .validate(opts.allow_insecure_transport)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    if opts.validator.is_none() && !addr.ip().is_loopback() && !opts.allow_unauthenticated {
+    if opts.validator.is_none()
+        && opts.local_auth.is_none()
+        && !addr.ip().is_loopback()
+        && !opts.allow_unauthenticated
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
                 "refusing to bind {addr}: no authentication is configured, so a \
                  non-loopback bind exposes every registered cluster to unauthenticated \
-                 code execution. Configure a validator, or set allow_unauthenticated."
+                 code execution. Configure a validator or --local-auth, or set \
+                 allow_unauthenticated."
             ),
         ));
     }
@@ -413,6 +462,7 @@ pub async fn serve_with_shutdown(
         opts.store,
         opts.policy,
         opts.services,
+        opts.local_auth,
         opts.allow_unauthenticated,
     );
     axum::serve(
@@ -452,6 +502,7 @@ mod tests {
             super::ServeOptions {
                 registry: ClusterRegistry::default(),
                 validator: None,
+                local_auth: None,
                 allow_unauthenticated: true,
                 allow_insecure_transport: true,
                 store: None,
@@ -532,6 +583,18 @@ mod tests {
         assert!(doc["paths"]["/api/v1/audit"]["get"].is_object());
         assert!(doc["components"]["schemas"]["AuditEvent"].is_object());
         assert!(doc["components"]["schemas"]["AuditListResponse"].is_object());
+        // The local-auth contract (ADR-0011).
+        assert!(doc["paths"]["/api/v1/auth/login"]["post"].is_object());
+        assert!(doc["paths"]["/api/v1/auth/providers"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/auth/tokens"]["post"].is_object());
+        assert!(doc["paths"]["/api/v1/auth/tokens"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/auth/tokens/{prefix}"]["delete"].is_object());
+        assert!(doc["paths"]["/api/v1/auth/logout"]["post"].is_object());
+        assert!(doc["components"]["schemas"]["LoginRequest"].is_object());
+        assert!(doc["components"]["schemas"]["LoginResponse"].is_object());
+        assert!(doc["components"]["schemas"]["ProvidersResponse"].is_object());
+        assert!(doc["components"]["schemas"]["CreateTokenResponse"].is_object());
+        assert!(doc["components"]["schemas"]["ApiTokenView"].is_object());
         // Bearer security scheme is advertised for client codegen.
         assert_eq!(
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
@@ -602,6 +665,7 @@ mod tests {
             Some(store),
             Default::default(),
             None,
+            None,
             false,
         );
         let req = with_peer(
@@ -625,6 +689,7 @@ mod tests {
             None,
             Default::default(),
             None,
+            None,
             false,
         );
         let req = with_peer(
@@ -644,6 +709,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            None,
             None,
             false,
         );

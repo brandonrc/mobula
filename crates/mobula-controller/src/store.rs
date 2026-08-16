@@ -6,8 +6,8 @@
 
 use async_trait::async_trait;
 use mobula_core::{
-    AllocationSpec, AuditEvent, AuditFilter, ClusterId, ClusterSpec, ClusterState, DriftCondition,
-    JobRecord, PoolSpec,
+    AllocationSpec, ApiTokenRecord, AuditEvent, AuditFilter, ClusterId, ClusterSpec, ClusterState,
+    DriftCondition, JobRecord, LocalUserRecord, PoolSpec,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -244,6 +244,25 @@ pub enum IntentOutcome {
     ParamMismatch,
 }
 
+/// Local-auth lockout policy (ADR-0011): after this many consecutive failed
+/// logins the account locks for [`LOCKOUT_SECS`].
+pub const LOGIN_LOCKOUT_THRESHOLD: u32 = 5;
+/// Lockout duration in seconds (5 minutes, mirroring artifact-keeper).
+pub const LOCKOUT_SECS: u64 = 300;
+
+/// Pure lockout state machine, shared by every `Store` implementation via
+/// the default [`Store::record_login_failure`]: one more failure increments
+/// the counter; crossing [`LOGIN_LOCKOUT_THRESHOLD`] resets the counter and
+/// locks the account until `now + LOCKOUT_SECS`.
+pub fn next_login_failure_state(failed_logins: u32, now: u64) -> (u32, Option<u64>) {
+    let failed = failed_logins + 1;
+    if failed >= LOGIN_LOCKOUT_THRESHOLD {
+        (0, Some(now + LOCKOUT_SECS))
+    } else {
+        (failed, None)
+    }
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     /// Create or update desired spec. Returns the (possibly bumped)
@@ -391,6 +410,104 @@ pub trait Store: Send + Sync {
         &self,
         filter: &AuditFilter,
     ) -> Result<(Vec<(u64, AuditEvent)>, Option<u64>), StoreError>;
+
+    // --- Local auth (ADR-0011) ---
+
+    /// Create a local user. The store receives the bcrypt password hash,
+    /// never plaintext. `created_at` is stamped by the store; lockout
+    /// counters start cleared. Errors when the username already exists.
+    async fn create_local_user(
+        &self,
+        username: &str,
+        email: Option<&str>,
+        password_hash: &str,
+        role: mobula_core::LocalRole,
+    ) -> Result<(), StoreError>;
+
+    /// Read a local user row (including the password hash — the caller is
+    /// the auth layer, which must never serialize it).
+    async fn get_local_user(&self, username: &str) -> Result<Option<LocalUserRecord>, StoreError>;
+
+    /// List all local users, ordered by username.
+    async fn list_local_users(&self) -> Result<Vec<LocalUserRecord>, StoreError>;
+
+    /// Replace a user's bcrypt password hash. Errors naming the missing
+    /// user when it does not exist.
+    async fn set_local_user_password(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Change a user's role (ADR-0011: resolved per request, so this
+    /// applies to the very next authenticated call). Errors naming the
+    /// missing user.
+    async fn set_local_user_role(
+        &self,
+        username: &str,
+        role: mobula_core::LocalRole,
+    ) -> Result<(), StoreError>;
+
+    /// Disable or re-enable a user. Disabled users cannot log in and their
+    /// existing tokens stop authenticating. Errors naming the missing user.
+    async fn set_local_user_disabled(
+        &self,
+        username: &str,
+        disabled: bool,
+    ) -> Result<(), StoreError>;
+
+    /// Persist the lockout counters. Backend hook for the default
+    /// [`Store::record_login_failure`] / [`Store::record_login_success`]
+    /// implementations; errors naming the missing user.
+    async fn set_login_lockout(
+        &self,
+        username: &str,
+        failed_logins: u32,
+        locked_until: Option<u64>,
+    ) -> Result<(), StoreError>;
+
+    /// Record a failed login: increments the counter, and when it crosses
+    /// [`LOGIN_LOCKOUT_THRESHOLD`] locks the account for [`LOCKOUT_SECS`]
+    /// and resets the counter. The decision lives in
+    /// [`next_login_failure_state`] so every backend shares semantics.
+    async fn record_login_failure(&self, username: &str) -> Result<(), StoreError> {
+        let user = self
+            .get_local_user(username)
+            .await?
+            .ok_or_else(|| StoreError::Backend(format!("no such local user {username}")))?;
+        let (failed, locked) = next_login_failure_state(user.failed_logins, now_unix());
+        self.set_login_lockout(username, failed, locked).await
+    }
+
+    /// Record a successful login: clears the failure counter and any lock.
+    async fn record_login_success(&self, username: &str) -> Result<(), StoreError> {
+        self.set_login_lockout(username, 0, None).await
+    }
+
+    /// Store an opaque API token (ADR-0011). `record` carries the bcrypt
+    /// token hash; the plaintext is shown once at issuance and never
+    /// stored. Errors when the prefix collides.
+    async fn create_api_token(&self, record: ApiTokenRecord) -> Result<(), StoreError>;
+
+    /// Look a token up by its 8-char prefix (including the hash — the
+    /// caller is the auth layer, which must never serialize it).
+    async fn get_api_token_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<ApiTokenRecord>, StoreError>;
+
+    /// List one user's tokens, newest first. Never returns hashes to the
+    /// wire — callers project to `ApiTokenView`.
+    async fn list_api_tokens(&self, username: &str) -> Result<Vec<ApiTokenRecord>, StoreError>;
+
+    /// Revoke a token, owner-scoped: revoking someone else's token (or a
+    /// nonexistent one) errors as "no such token" so ownership can't be
+    /// probed. Idempotent for an already-revoked own token.
+    async fn revoke_api_token(&self, prefix: &str, username: &str) -> Result<(), StoreError>;
+
+    /// Best-effort `last_used_at` stamp on a successful token
+    /// authentication. Never fails the request being authenticated.
+    async fn touch_api_token(&self, prefix: &str, now: u64) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]
@@ -479,6 +596,8 @@ pub mod memory {
         /// (seq, event) in insertion order; seq is 1-based from `audit_seq`.
         audit: Mutex<Vec<(u64, AuditEvent)>>,
         audit_seq: std::sync::atomic::AtomicU64,
+        local_users: Mutex<HashMap<String, LocalUserRecord>>,
+        api_tokens: Mutex<HashMap<String, ApiTokenRecord>>,
     }
 
     impl InMemoryStore {
@@ -794,6 +913,153 @@ pub mod memory {
             };
             Ok((rows, next_cursor))
         }
+
+        async fn create_local_user(
+            &self,
+            username: &str,
+            email: Option<&str>,
+            password_hash: &str,
+            role: mobula_core::LocalRole,
+        ) -> Result<(), StoreError> {
+            let mut map = self.local_users.lock().unwrap();
+            if map.contains_key(username) {
+                return Err(StoreError::Backend(format!(
+                    "local user {username} already exists"
+                )));
+            }
+            map.insert(
+                username.to_string(),
+                LocalUserRecord {
+                    username: username.to_string(),
+                    email: email.map(String::from),
+                    password_hash: password_hash.to_string(),
+                    role,
+                    disabled: false,
+                    created_at: now_unix(),
+                    failed_logins: 0,
+                    locked_until: None,
+                },
+            );
+            Ok(())
+        }
+
+        async fn get_local_user(
+            &self,
+            username: &str,
+        ) -> Result<Option<LocalUserRecord>, StoreError> {
+            Ok(self.local_users.lock().unwrap().get(username).cloned())
+        }
+
+        async fn list_local_users(&self) -> Result<Vec<LocalUserRecord>, StoreError> {
+            let mut users: Vec<LocalUserRecord> =
+                self.local_users.lock().unwrap().values().cloned().collect();
+            users.sort_by(|a, b| a.username.cmp(&b.username));
+            Ok(users)
+        }
+
+        async fn set_local_user_password(
+            &self,
+            username: &str,
+            password_hash: &str,
+        ) -> Result<(), StoreError> {
+            let mut map = self.local_users.lock().unwrap();
+            let user = map
+                .get_mut(username)
+                .ok_or_else(|| StoreError::Backend(format!("no such local user {username}")))?;
+            user.password_hash = password_hash.to_string();
+            Ok(())
+        }
+
+        async fn set_local_user_role(
+            &self,
+            username: &str,
+            role: mobula_core::LocalRole,
+        ) -> Result<(), StoreError> {
+            let mut map = self.local_users.lock().unwrap();
+            let user = map
+                .get_mut(username)
+                .ok_or_else(|| StoreError::Backend(format!("no such local user {username}")))?;
+            user.role = role;
+            Ok(())
+        }
+
+        async fn set_local_user_disabled(
+            &self,
+            username: &str,
+            disabled: bool,
+        ) -> Result<(), StoreError> {
+            let mut map = self.local_users.lock().unwrap();
+            let user = map
+                .get_mut(username)
+                .ok_or_else(|| StoreError::Backend(format!("no such local user {username}")))?;
+            user.disabled = disabled;
+            Ok(())
+        }
+
+        async fn set_login_lockout(
+            &self,
+            username: &str,
+            failed_logins: u32,
+            locked_until: Option<u64>,
+        ) -> Result<(), StoreError> {
+            let mut map = self.local_users.lock().unwrap();
+            let user = map
+                .get_mut(username)
+                .ok_or_else(|| StoreError::Backend(format!("no such local user {username}")))?;
+            user.failed_logins = failed_logins;
+            user.locked_until = locked_until;
+            Ok(())
+        }
+
+        async fn create_api_token(&self, record: ApiTokenRecord) -> Result<(), StoreError> {
+            let mut map = self.api_tokens.lock().unwrap();
+            if map.contains_key(&record.prefix) {
+                return Err(StoreError::Backend(format!(
+                    "api token prefix {} already exists",
+                    record.prefix
+                )));
+            }
+            map.insert(record.prefix.clone(), record);
+            Ok(())
+        }
+
+        async fn get_api_token_by_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Option<ApiTokenRecord>, StoreError> {
+            Ok(self.api_tokens.lock().unwrap().get(prefix).cloned())
+        }
+
+        async fn list_api_tokens(&self, username: &str) -> Result<Vec<ApiTokenRecord>, StoreError> {
+            let mut tokens: Vec<ApiTokenRecord> = self
+                .api_tokens
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|t| t.username == username)
+                .cloned()
+                .collect();
+            tokens.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+            Ok(tokens)
+        }
+
+        async fn revoke_api_token(&self, prefix: &str, username: &str) -> Result<(), StoreError> {
+            let mut map = self.api_tokens.lock().unwrap();
+            match map.get_mut(prefix) {
+                Some(token) if token.username == username => {
+                    token.revoked = true;
+                    Ok(())
+                }
+                _ => Err(StoreError::Backend(format!("no such api token {prefix}"))),
+            }
+        }
+
+        async fn touch_api_token(&self, prefix: &str, now: u64) -> Result<(), StoreError> {
+            if let Some(token) = self.api_tokens.lock().unwrap().get_mut(prefix) {
+                token.last_used_at = Some(now);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -989,6 +1255,97 @@ pub(crate) mod testkit {
         ) -> Result<(Vec<(u64, AuditEvent)>, Option<u64>), StoreError> {
             self.check("list_audit")?;
             self.inner.list_audit(filter).await
+        }
+        async fn create_local_user(
+            &self,
+            username: &str,
+            email: Option<&str>,
+            password_hash: &str,
+            role: mobula_core::LocalRole,
+        ) -> Result<(), StoreError> {
+            self.check("create_local_user")?;
+            self.inner
+                .create_local_user(username, email, password_hash, role)
+                .await
+        }
+        async fn get_local_user(
+            &self,
+            username: &str,
+        ) -> Result<Option<LocalUserRecord>, StoreError> {
+            self.check("get_local_user")?;
+            self.inner.get_local_user(username).await
+        }
+        async fn list_local_users(&self) -> Result<Vec<LocalUserRecord>, StoreError> {
+            self.check("list_local_users")?;
+            self.inner.list_local_users().await
+        }
+        async fn set_local_user_password(
+            &self,
+            username: &str,
+            password_hash: &str,
+        ) -> Result<(), StoreError> {
+            self.check("set_local_user_password")?;
+            self.inner
+                .set_local_user_password(username, password_hash)
+                .await
+        }
+        async fn set_local_user_role(
+            &self,
+            username: &str,
+            role: mobula_core::LocalRole,
+        ) -> Result<(), StoreError> {
+            self.check("set_local_user_role")?;
+            self.inner.set_local_user_role(username, role).await
+        }
+        async fn set_local_user_disabled(
+            &self,
+            username: &str,
+            disabled: bool,
+        ) -> Result<(), StoreError> {
+            self.check("set_local_user_disabled")?;
+            self.inner.set_local_user_disabled(username, disabled).await
+        }
+        async fn set_login_lockout(
+            &self,
+            username: &str,
+            failed_logins: u32,
+            locked_until: Option<u64>,
+        ) -> Result<(), StoreError> {
+            self.check("set_login_lockout")?;
+            self.inner
+                .set_login_lockout(username, failed_logins, locked_until)
+                .await
+        }
+        async fn record_login_failure(&self, username: &str) -> Result<(), StoreError> {
+            self.check("record_login_failure")?;
+            self.inner.record_login_failure(username).await
+        }
+        async fn record_login_success(&self, username: &str) -> Result<(), StoreError> {
+            self.check("record_login_success")?;
+            self.inner.record_login_success(username).await
+        }
+        async fn create_api_token(&self, record: ApiTokenRecord) -> Result<(), StoreError> {
+            self.check("create_api_token")?;
+            self.inner.create_api_token(record).await
+        }
+        async fn get_api_token_by_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Option<ApiTokenRecord>, StoreError> {
+            self.check("get_api_token_by_prefix")?;
+            self.inner.get_api_token_by_prefix(prefix).await
+        }
+        async fn list_api_tokens(&self, username: &str) -> Result<Vec<ApiTokenRecord>, StoreError> {
+            self.check("list_api_tokens")?;
+            self.inner.list_api_tokens(username).await
+        }
+        async fn revoke_api_token(&self, prefix: &str, username: &str) -> Result<(), StoreError> {
+            self.check("revoke_api_token")?;
+            self.inner.revoke_api_token(prefix, username).await
+        }
+        async fn touch_api_token(&self, prefix: &str, now: u64) -> Result<(), StoreError> {
+            self.check("touch_api_token")?;
+            self.inner.touch_api_token(prefix, now).await
         }
     }
 }

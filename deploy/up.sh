@@ -4,8 +4,8 @@
 #
 #   ./deploy/up.sh              # build + start, streaming logs
 #   ./deploy/up.sh -d           # detached
-#   ./deploy/up.sh auth         # authenticated variant: local Keycloak +
-#                               # OIDC-enforced control plane (detached)
+#   ./deploy/up.sh auth         # OIDC variant: local Keycloak + real SSO
+#   ./deploy/up.sh local        # IdP-free variant: Mobula local auth (ADR-0011)
 #   ./deploy/up.sh down         # tear down
 #
 # Generates the OpenAPI spec from the Rust source and the typed TS client
@@ -43,6 +43,24 @@ if [ "${1:-}" = "auth" ]; then
   docker compose -f "$COMPOSE" down >/dev/null
   echo "▶ starting the authenticated stack (Keycloak on :8090, API on :8484, UI on :8088)"
   exec docker compose -f "$COMPOSE" -f "$ROOT/deploy/docker-compose.auth.yml" --profile auth up -d "$@"
+fi
+
+# `local`: the IdP-free variant — Mobula's own local auth (ADR-0011), no
+# Keycloak. admin/admin bootstrap (MOBULA_LOCAL_ADMIN_PASSWORD in the
+# overlay). Stops the other variants first (port 8484).
+#   ./deploy/up.sh local        # start the local-auth stack (detached)
+#   ./deploy/up.sh local down   # tear down; add -v to wipe the data volume
+if [ "${1:-}" = "local" ]; then
+  shift
+  LOCAL_COMPOSE="$ROOT/deploy/docker-compose.local.yml"
+  if [ "${1:-}" = "down" ]; then
+    shift
+    exec docker compose -f "$COMPOSE" -f "$LOCAL_COMPOSE" --profile local down "$@"
+  fi
+  docker compose -f "$COMPOSE" down >/dev/null 2>&1 || true
+  docker compose -f "$COMPOSE" -f "$ROOT/deploy/docker-compose.auth.yml" --profile auth down >/dev/null 2>&1 || true
+  echo "▶ starting the local-auth stack (no IdP; admin/admin) — UI on :8088, API on :8484"
+  exec docker compose -f "$COMPOSE" -f "$LOCAL_COMPOSE" --profile local up -d "$@"
 fi
 
 [ -d "$UI" ] || { echo "mobula-ui not found at $UI (set MOBULA_UI_DIR)" >&2; exit 1; }

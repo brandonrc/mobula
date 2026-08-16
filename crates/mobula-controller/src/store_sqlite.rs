@@ -6,8 +6,8 @@
 
 use async_trait::async_trait;
 use mobula_core::{
-    AllocationSpec, AuditDecision, AuditEvent, AuditFilter, AuditRequired, ClusterId, ClusterSpec,
-    ClusterState, DriftCondition, PoolSpec,
+    AllocationSpec, ApiTokenRecord, AuditDecision, AuditEvent, AuditFilter, AuditRequired,
+    ClusterId, ClusterSpec, ClusterState, DriftCondition, LocalRole, LocalUserRecord, PoolSpec,
 };
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
@@ -118,6 +118,34 @@ CREATE TABLE IF NOT EXISTS audit_events (
     granted_roles TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS audit_events_ts ON audit_events (ts);
+-- Local auth (ADR-0011): users and opaque API tokens. Mobula stores
+-- credentials, never signs them — both secret columns hold bcrypt hashes.
+-- `role` is 'viewer'|'developer'|'operator'|'admin' (LocalRole), resolved
+-- per request. Lockout: `failed_logins` consecutive failures, and
+-- `locked_until` (unix seconds) when the threshold is crossed.
+CREATE TABLE IF NOT EXISTS local_users (
+    username      TEXT PRIMARY KEY,
+    email         TEXT,
+    password_hash TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL DEFAULT 0,
+    failed_logins INTEGER NOT NULL DEFAULT 0,
+    locked_until  INTEGER
+);
+-- Opaque API tokens (`mob_<prefix>_<32 hex>`). The 8-char prefix is the
+-- lookup key; the plaintext token is never stored.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    prefix       TEXT PRIMARY KEY,
+    token_hash   TEXT NOT NULL,
+    username     TEXT NOT NULL,
+    label        TEXT NOT NULL,
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    expires_at   INTEGER NOT NULL,
+    revoked      INTEGER NOT NULL DEFAULT 0,
+    last_used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS api_tokens_username ON api_tokens (username);
 "#;
 
 /// Additive column migrations for databases created by an older schema (#39
@@ -241,6 +269,38 @@ fn row_to_pool(row: SqliteRow) -> Result<StoredPool, StoreError> {
             .try_get::<Option<i64>, _>("observed_at")?
             .map(|v| v as u64),
         created_at: row.try_get::<i64, _>("created_at")? as u64,
+    })
+}
+
+fn row_to_local_user(row: &SqliteRow) -> Result<LocalUserRecord, StoreError> {
+    let role_str: String = row.try_get("role")?;
+    Ok(LocalUserRecord {
+        username: row.try_get::<String, _>("username")?,
+        email: row.try_get::<Option<String>, _>("email")?,
+        password_hash: row.try_get::<String, _>("password_hash")?,
+        role: LocalRole::parse(&role_str)
+            .ok_or_else(|| StoreError::Backend(format!("bad local role {role_str:?}")))?,
+        disabled: row.try_get::<i64, _>("disabled")? != 0,
+        created_at: row.try_get::<i64, _>("created_at")? as u64,
+        failed_logins: row.try_get::<i64, _>("failed_logins")? as u32,
+        locked_until: row
+            .try_get::<Option<i64>, _>("locked_until")?
+            .map(|v| v as u64),
+    })
+}
+
+fn row_to_api_token(row: &SqliteRow) -> Result<ApiTokenRecord, StoreError> {
+    Ok(ApiTokenRecord {
+        prefix: row.try_get::<String, _>("prefix")?,
+        token_hash: row.try_get::<String, _>("token_hash")?,
+        username: row.try_get::<String, _>("username")?,
+        label: row.try_get::<String, _>("label")?,
+        created_at: row.try_get::<i64, _>("created_at")? as u64,
+        expires_at: row.try_get::<i64, _>("expires_at")? as u64,
+        revoked: row.try_get::<i64, _>("revoked")? != 0,
+        last_used_at: row
+            .try_get::<Option<i64>, _>("last_used_at")?
+            .map(|v| v as u64),
     })
 }
 
@@ -890,6 +950,197 @@ impl Store for SqliteStore {
             None
         };
         Ok((out, next_cursor))
+    }
+
+    async fn create_local_user(
+        &self,
+        username: &str,
+        email: Option<&str>,
+        password_hash: &str,
+        role: LocalRole,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "INSERT INTO local_users (username, email, password_hash, role, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(username)
+        .bind(email)
+        .bind(password_hash)
+        .bind(role.as_str())
+        .bind(now_unix() as i64)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            // Primary-key conflict = the username is taken; surface a
+            // domain error, not a raw constraint dump.
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Err(StoreError::Backend(
+                format!("local user {username} already exists"),
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn get_local_user(&self, username: &str) -> Result<Option<LocalUserRecord>, StoreError> {
+        let row = sqlx::query("SELECT * FROM local_users WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_local_user).transpose()
+    }
+
+    async fn list_local_users(&self) -> Result<Vec<LocalUserRecord>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM local_users ORDER BY username ASC")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_local_user).collect()
+    }
+
+    async fn set_local_user_password(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<(), StoreError> {
+        let affected = sqlx::query("UPDATE local_users SET password_hash = ? WHERE username = ?")
+            .bind(password_hash)
+            .bind(username)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::Backend(format!(
+                "no such local user {username}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn set_local_user_role(&self, username: &str, role: LocalRole) -> Result<(), StoreError> {
+        let affected = sqlx::query("UPDATE local_users SET role = ? WHERE username = ?")
+            .bind(role.as_str())
+            .bind(username)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::Backend(format!(
+                "no such local user {username}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn set_local_user_disabled(
+        &self,
+        username: &str,
+        disabled: bool,
+    ) -> Result<(), StoreError> {
+        let affected = sqlx::query("UPDATE local_users SET disabled = ? WHERE username = ?")
+            .bind(disabled as i64)
+            .bind(username)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::Backend(format!(
+                "no such local user {username}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn set_login_lockout(
+        &self,
+        username: &str,
+        failed_logins: u32,
+        locked_until: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let affected = sqlx::query(
+            "UPDATE local_users SET failed_logins = ?, locked_until = ? WHERE username = ?",
+        )
+        .bind(failed_logins as i64)
+        .bind(locked_until.map(|v| v.min(i64::MAX as u64) as i64))
+        .bind(username)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::Backend(format!(
+                "no such local user {username}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn create_api_token(&self, record: ApiTokenRecord) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "INSERT INTO api_tokens \
+             (prefix, token_hash, username, label, created_at, expires_at, revoked, last_used_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&record.prefix)
+        .bind(&record.token_hash)
+        .bind(&record.username)
+        .bind(&record.label)
+        .bind(record.created_at.min(i64::MAX as u64) as i64)
+        .bind(record.expires_at.min(i64::MAX as u64) as i64)
+        .bind(record.revoked as i64)
+        .bind(record.last_used_at.map(|v| v.min(i64::MAX as u64) as i64))
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Err(StoreError::Backend(
+                format!("api token prefix {} already exists", record.prefix),
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn get_api_token_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<ApiTokenRecord>, StoreError> {
+        let row = sqlx::query("SELECT * FROM api_tokens WHERE prefix = ?")
+            .bind(prefix)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_api_token).transpose()
+    }
+
+    async fn list_api_tokens(&self, username: &str) -> Result<Vec<ApiTokenRecord>, StoreError> {
+        let rows =
+            sqlx::query("SELECT * FROM api_tokens WHERE username = ? ORDER BY created_at DESC")
+                .bind(username)
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(row_to_api_token).collect()
+    }
+
+    async fn revoke_api_token(&self, prefix: &str, username: &str) -> Result<(), StoreError> {
+        // Owner-scoped: the UPDATE matches only rows the caller owns, so
+        // revoking someone else's token and revoking a nonexistent token
+        // are indistinguishable ("no such token") — no ownership probing.
+        let affected =
+            sqlx::query("UPDATE api_tokens SET revoked = 1 WHERE prefix = ? AND username = ?")
+                .bind(prefix)
+                .bind(username)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::Backend(format!("no such api token {prefix}")));
+        }
+        Ok(())
+    }
+
+    async fn touch_api_token(&self, prefix: &str, now: u64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE prefix = ?")
+            .bind(now.min(i64::MAX as u64) as i64)
+            .bind(prefix)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

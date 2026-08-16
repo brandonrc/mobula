@@ -17,6 +17,7 @@ mobula-controller.workspace = true
 mobula-provision.workspace = true
 mobula-core.workspace = true
 mobula-auth.workspace = true
+mobula-policy.workspace = true
 reqwest.workspace = true
 clap.workspace = true
 tokio.workspace = true

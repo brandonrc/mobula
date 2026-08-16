@@ -29,7 +29,8 @@ pub const GPU: &str = "nvidia.com/gpu";
 /// GiB for `memory`, devices for `nvidia.com/gpu`). A missing key means
 /// zero — maps are sparse, so demand for a resource a quota doesn't
 /// mention is rejected by [`ResourceMap::fits_within`].
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(transparent)]
 pub struct ResourceMap(pub BTreeMap<String, f64>);
 
 impl std::ops::Add for ResourceMap {

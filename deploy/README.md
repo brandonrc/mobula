@@ -75,6 +75,25 @@ issuer string is identical from your shell, the container, and the token's
 is `deploy/keycloak/auth.toml`; cleartext HTTP is accepted because this is a
 local demo only (`--allow-insecure-transport`).
 
+## IdP-free variant (local auth, no Keycloak)
+
+To try login with **no IdP container at all** — Mobula's own local auth
+(ADR-0011: username/password → opaque token, bcrypt-hashed in the store):
+
+```bash
+./deploy/up.sh local         # stops the other variants; admin/admin
+./deploy/up.sh local down    # add -v to wipe the data volume (users, tokens, audit)
+```
+
+Sign in at http://localhost:8088/login with `admin`/`admin`. CLI:
+`mobula login --local --username admin --password-stdin`. The login page
+discovers available methods from `GET /api/v1/auth/providers`, so it shows
+the local form here, the SSO button under `up.sh auth`, and both when a
+deployment runs both. The bootstrap password comes from
+`MOBULA_LOCAL_ADMIN_PASSWORD` in `docker-compose.local.yml` — delete that
+env var and a random one is generated into `/data/local-admin-password`
+instead.
+
 ## Real clusters
 
 For **real** KubeRay provisioning (create a cluster → real Ray pods), use the

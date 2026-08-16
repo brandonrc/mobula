@@ -91,7 +91,9 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 > tokens (`mobula token --issuer/--client-id/--client-secret`, RFC 6749
 > client-credentials — Mobula never mints tokens itself), caller identity
 > in every gateway audit event (HTTP + websocket), and `serve --audit-log`
-> writing `mobula::audit` as append-only JSONL. Explicitly deferred:
+> writing `mobula::audit` as append-only JSONL. (Amended 2026-08-16: local
+> auth mode issues *opaque, unsigned* tokens — Mobula stores credentials,
+> never signs them; see ADR-0011.) Explicitly deferred:
 > Postgres-backed audit records (lands with the Phase 3 storage layer —
 > the JSONL file satisfies append-only/exportable until then) and the
 > FIPS crypto provider (aws-lc-rs; grouped with the release-engineering

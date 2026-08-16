@@ -15,3 +15,4 @@ for the full review log with evidence and dispositions).
 | [0008](0008-ubi-stig-containers.md) | UBI-only, STIG-postured container images |
 | [0009](0009-rbac-model.md) | RBAC follows artifact-keeper: permission-sets + scoped bindings |
 | [0010](0010-pool-engine-kueue.md) | Kueue is the pool engine; Mobula owns pool topology, admission UX, attribution |
+| [0011](0011-local-auth-opaque-tokens.md) | Local auth mode: opaque tokens only — Mobula stores credentials, never signs them |

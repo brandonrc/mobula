@@ -16,7 +16,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use mobula_auth::{Identity, PermissionType, Target, Validator};
+use mobula_auth::{local::LocalAuthenticator, Identity, PermissionType, Target, Validator};
 use mobula_controller::{now_unix, Store};
 use mobula_core::{AuditDecision, AuditEvent, AuditRequired, ClusterRegistry};
 
@@ -25,19 +25,27 @@ use crate::audit::{emit, permission_str, role_str, target_str};
 #[derive(Clone)]
 pub struct AuthState {
     pub validator: Option<Arc<Validator>>,
+    /// Local (IdP-free) auth (ADR-0011); `None` when `--local-auth` is off.
+    pub local: Option<Arc<LocalAuthenticator>>,
     pub registry: Arc<ClusterRegistry>,
     /// Audit persistence (api-v1.md §5.9); `None` in gateway-only mode.
     pub store: Option<Arc<dyn Store>>,
 }
 
 /// Paths that stay public on the control-plane host (never on cluster
-/// hosts): probes and API documentation.
+/// hosts): probes, API documentation, and the local-auth login endpoints
+/// (ADR-0011 — a login page must be reachable unauthenticated; login
+/// itself is rate-limited by bcrypt + lockout, and `providers` exposes
+/// only login-page metadata). NOTE: exact matches only — everything else
+/// under `/api/v1/auth/` (tokens, logout) requires an identity.
 fn is_public(path: &str) -> bool {
     path == "/healthz"
         || path == "/api/v1/version"
         || path == "/api/v1/openapi.json"
         || path == "/docs"
         || path.starts_with("/docs/")
+        || path == "/api/v1/auth/login"
+        || path == "/api/v1/auth/providers"
 }
 
 /// The permission a proxied gateway request requires. Reads (and the
@@ -83,6 +91,10 @@ fn target_for_path(path: &str) -> Target {
         // themselves — this mapping is for the ext_authz verb check.
         Target::Cluster
     } else {
+        // /api/v1/auth/* falls through to the safe default (Job). Those
+        // routes are self-guarding — login is public by design and token
+        // management is owner-scoped — so the ext_authz verb check for
+        // them only needs a sane, non-privileged target.
         Target::Job
     }
 }
@@ -95,11 +107,40 @@ fn bearer(req: &Request) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
+/// Whether the bearer is JWT-shaped (three dot-delimited segments). Token
+/// dispatch is unambiguous (ADR-0011): a `mob_…` PAT contains no dots and a
+/// JWT never matches the `mob_<prefix>_<hex>` scheme, so the two paths can
+/// coexist without misclassification.
+fn is_jwt_shaped(token: &str) -> bool {
+    token.split('.').count() == 3
+}
+
+/// Resolve a bearer token to an identity. Order: when a Validator exists
+/// and the token is JWT-shaped, the OIDC path; otherwise, when local auth
+/// is enabled, the opaque-PAT path.
+async fn resolve_identity(st: &AuthState, token: &str) -> Option<Identity> {
+    if let Some(validator) = &st.validator {
+        if is_jwt_shaped(token) {
+            return match validator.validate(token).await {
+                Ok(i) => Some(i),
+                Err(e) => {
+                    tracing::debug!(error = %e, "token validation failed");
+                    None
+                }
+            };
+        }
+    }
+    if let Some(local) = &st.local {
+        return local.authenticate_token(token).await;
+    }
+    None
+}
+
 pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next) -> Response {
-    let Some(validator) = &st.validator else {
+    if st.validator.is_none() && st.local.is_none() {
         // Auth disabled: dev mode, guarded by --dev-allow-unauthenticated.
         return next.run(req).await;
-    };
+    }
 
     let host_is_cluster = req
         .headers()
@@ -132,10 +173,9 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
         .await;
         return unauthorized("missing bearer token");
     };
-    let identity = match validator.validate(token).await {
-        Ok(i) => i,
-        Err(e) => {
-            tracing::debug!(error = %e, "token validation failed");
+    let identity = match resolve_identity(&st, token).await {
+        Some(i) => i,
+        None => {
             emit(
                 st.store.as_ref(),
                 AuditEvent {
@@ -241,9 +281,9 @@ pub async fn authorize(
 /// prefixes MUST stay in sync with the router prefixes in `clusters.rs` and
 /// `services.rs`.
 pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response {
-    let Some(validator) = &st.validator else {
+    if st.validator.is_none() && st.local.is_none() {
         return (StatusCode::NOT_IMPLEMENTED, "authn not configured").into_response();
-    };
+    }
     // Envoy forwards the original method/path via x-forwarded-*; fall back
     // to the check request's own for direct callers.
     let method = req
@@ -275,10 +315,9 @@ pub async fn authz_check(State(st): State<AuthState>, req: Request) -> Response 
         .await;
         return unauthorized("missing bearer token");
     };
-    let identity: Identity = match validator.validate(token).await {
-        Ok(i) => i,
-        Err(e) => {
-            tracing::debug!(error = %e, "token validation failed");
+    let identity: Identity = match resolve_identity(&st, token).await {
+        Some(i) => i,
+        None => {
             emit(
                 st.store.as_ref(),
                 AuditEvent {
@@ -362,12 +401,35 @@ mod tests {
             "/api/v1/openapi.json",
             "/docs",
             "/docs/x",
+            // ADR-0011: the login endpoints the login page must reach
+            // unauthenticated. Exact matches only.
+            "/api/v1/auth/login",
+            "/api/v1/auth/providers",
         ] {
             assert!(is_public(p), "{p}");
         }
-        for p in ["/api/jobs/", "/api/v1/authz/check", "/docsx", "/"] {
+        for p in [
+            "/api/jobs/",
+            "/api/v1/authz/check",
+            "/docsx",
+            "/",
+            // Everything else under /api/v1/auth/ requires an identity.
+            "/api/v1/auth/tokens",
+            "/api/v1/auth/logout",
+            "/api/v1/auth/login/evil",
+        ] {
             assert!(!is_public(p), "{p}");
         }
+    }
+
+    #[test]
+    fn jwt_and_pat_shapes_are_unambiguous() {
+        assert!(is_jwt_shaped("aaa.bbb.ccc"));
+        assert!(!is_jwt_shaped(
+            "mob_abcd1234_0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_jwt_shaped("garbage"));
+        assert!(!is_jwt_shaped("too.many.dots.here"));
     }
 
     #[test]

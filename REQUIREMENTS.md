@@ -174,6 +174,10 @@ Mobula meters real attribution itself via `usage_samples`.
 - Web UI: Authorization Code + PKCE. CLI: device-code flow. Machines: OAuth2
   client-credentials service accounts + scoped, expiring API tokens.
 - SCIM 2.0 (or IdP group claims at minimum) for user/group sync.
+- **Local auth mode** for standalone/dev/small deployments (ADR-0011):
+  username/password login against Mobula's own store issuing opaque,
+  unsigned bearer tokens (`mob_…`, bcrypt-hashed at rest), with account
+  lockout and audit. OIDC remains the production path; both can coexist.
 - **Identity-aware proxy in front of every data-plane surface:** Ray dashboards,
   Serve endpoints, Grafana, workspace UIs all sit behind the Rust proxy. Ray
   ≥2.52 provides only a single static, non-expiring, cluster-wide token (no

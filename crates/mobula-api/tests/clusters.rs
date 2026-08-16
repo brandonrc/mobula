@@ -166,6 +166,83 @@ impl Store for SlowListStore {
     ) -> Result<(Vec<(u64, mobula_core::AuditEvent)>, Option<u64>), StoreError> {
         self.inner.list_audit(filter).await
     }
+    async fn create_local_user(
+        &self,
+        username: &str,
+        email: Option<&str>,
+        password_hash: &str,
+        role: mobula_core::LocalRole,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .create_local_user(username, email, password_hash, role)
+            .await
+    }
+    async fn get_local_user(
+        &self,
+        username: &str,
+    ) -> Result<Option<mobula_core::LocalUserRecord>, StoreError> {
+        self.inner.get_local_user(username).await
+    }
+    async fn list_local_users(&self) -> Result<Vec<mobula_core::LocalUserRecord>, StoreError> {
+        self.inner.list_local_users().await
+    }
+    async fn set_local_user_password(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .set_local_user_password(username, password_hash)
+            .await
+    }
+    async fn set_local_user_role(
+        &self,
+        username: &str,
+        role: mobula_core::LocalRole,
+    ) -> Result<(), StoreError> {
+        self.inner.set_local_user_role(username, role).await
+    }
+    async fn set_local_user_disabled(
+        &self,
+        username: &str,
+        disabled: bool,
+    ) -> Result<(), StoreError> {
+        self.inner.set_local_user_disabled(username, disabled).await
+    }
+    async fn set_login_lockout(
+        &self,
+        username: &str,
+        failed_logins: u32,
+        locked_until: Option<u64>,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .set_login_lockout(username, failed_logins, locked_until)
+            .await
+    }
+    async fn create_api_token(
+        &self,
+        record: mobula_core::ApiTokenRecord,
+    ) -> Result<(), StoreError> {
+        self.inner.create_api_token(record).await
+    }
+    async fn get_api_token_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<mobula_core::ApiTokenRecord>, StoreError> {
+        self.inner.get_api_token_by_prefix(prefix).await
+    }
+    async fn list_api_tokens(
+        &self,
+        username: &str,
+    ) -> Result<Vec<mobula_core::ApiTokenRecord>, StoreError> {
+        self.inner.list_api_tokens(username).await
+    }
+    async fn revoke_api_token(&self, prefix: &str, username: &str) -> Result<(), StoreError> {
+        self.inner.revoke_api_token(prefix, username).await
+    }
+    async fn touch_api_token(&self, prefix: &str, now: u64) -> Result<(), StoreError> {
+        self.inner.touch_api_token(prefix, now).await
+    }
 }
 
 fn create_body(id: &str) -> serde_json::Value {
