@@ -20,15 +20,15 @@ fn pool() -> PoolSpec {
         name: "e2e-pool".into(),
         flavors: vec![FlavorSpec {
             name: "cpu".into(),
-            // Nominal 4 CPU; each cluster below demands 3 (head 1 + worker
-            // 2), so the first admits and the second must queue. Memory must
-            // be covered too — Kueue refuses admission when a workload
-            // requests a resource the ClusterQueue doesn't quota
+            // Nominal 2 CPU; each cluster below demands 1.5 (head 500m +
+            // worker 1), so the first admits and the second must queue.
+            // Memory must be covered too — Kueue refuses admission when a
+            // workload requests a resource the ClusterQueue doesn't quota
             // ("resource memory unavailable"), and Ray pods always request
-            // memory. 8Gi leaves headroom for both clusters (~3.5Gi each)
+            // memory. 8Gi leaves headroom for both clusters (~3Gi each)
             // so cpu stays the binding constraint.
             resources: BTreeMap::from([
-                ("cpu".to_string(), "4".to_string()),
+                ("cpu".to_string(), "2".to_string()),
                 ("memory".to_string(), "8Gi".to_string()),
             ]),
             node_labels: BTreeMap::new(),
@@ -57,13 +57,16 @@ fn cluster_spec(name: &str, project: &str) -> ClusterSpec {
         project: project.into(),
         ray_version: "2.57.0".into(),
         image: "rayproject/ray:2.57.0".into(),
-        head_cpu: "1".into(),
+        // Small enough to fit a 4-vCPU CI runner alongside Kueue/KubeRay and
+        // the kind system pods — worker cpu "2" left the worker pod Pending
+        // (Insufficient cpu) for the whole "cluster A running" window.
+        head_cpu: "500m".into(),
         // Ray's head reserves object-store/GCS memory; 2.5Gi is a safe
         // floor on a kind node (same as the kuberay e2e).
         head_memory: "2560Mi".into(),
         worker_groups: vec![WorkerGroup {
             name: "cpu".into(),
-            cpu: "2".into(),
+            cpu: "1".into(),
             memory: "1Gi".into(),
             gpu: None,
             min_replicas: 1,
@@ -126,7 +129,7 @@ async fn pool_admits_first_cluster_and_queues_the_second() {
         elastic: false,
     };
 
-    // Cluster A (3 CPU) fits within nominal 4 → admitted; its pods
+    // Cluster A (1.5 CPU) fits within nominal 2 → admitted; its pods
     // schedule and KubeRay drives it to Running.
     ray.apply(
         &id_a,
@@ -163,8 +166,8 @@ async fn pool_admits_first_cluster_and_queues_the_second() {
     )
     .await;
 
-    // Cluster B (another 3 CPU) exceeds the nominal quota → Kueue keeps its
-    // Workload pending and the RayCluster suspended.
+    // Cluster B (another 1.5 CPU) exceeds the nominal quota → Kueue keeps
+    // its Workload pending and the RayCluster suspended.
     ray.apply(
         &id_b,
         &cluster_spec("e2e-pool-b", "e2e-b"),

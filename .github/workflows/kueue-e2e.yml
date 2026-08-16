@@ -63,6 +63,9 @@ jobs:
           kubectl describe rayclusters || true
           echo "=== pods ==="
           kubectl get pods -o wide || true
+          kubectl describe pods || true
+          echo "=== events ==="
+          kubectl get events --sort-by=.lastTimestamp | tail -40 || true
           echo "=== kueue controller logs ==="
           kubectl logs -n kueue-system deployment/kueue-controller-manager --tail=200 || true
           echo "=== head pod logs (current) ==="
