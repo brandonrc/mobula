@@ -1,0 +1,30 @@
+# Local demo stack: the Mobula control plane in k8s-less demo mode + the
+# dashboard, so the UI and API can be exercised end-to-end with nothing but
+# Docker. Bring it up with `./deploy/up.sh` (which generates the spec + typed
+# client first). NOT for production — demo mode fakes cluster/service
+# lifecycle and serves unauthenticated.
+name: mobula-demo
+
+services:
+  mobula:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: mobula:demo
+    # Full cluster/service API on the in-memory mock provisioner (no k8s),
+    # unauthenticated on all interfaces (dev only).
+    command: ["serve", "--bind", "0.0.0.0:8484", "--demo", "--dev-allow-unauthenticated"]
+    ports:
+      - "8484:8484"
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ../../mobula-ui
+      dockerfile: Dockerfile
+    image: mobula-ui:demo
+    depends_on:
+      - mobula
+    ports:
+      - "8088:80"
+    restart: unless-stopped
