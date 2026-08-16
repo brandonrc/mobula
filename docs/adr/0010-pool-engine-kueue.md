@@ -28,6 +28,9 @@ attribution.** A Mobula `ResourcePool` translates to Kueue objects
 - one `LocalQueue` per project allocation, namespaced, pointing at the
   pool's ClusterQueue.
 
+Diagrams of the mapping, admission flow, scaling ownership, and attribution
+pipeline: [ARCHITECTURE.md — Resource pools](../ARCHITECTURE.md#resource-pools--shared-capacity-adr-0010).
+
 Why not our own allocation accounting: Kueue already provides cohort
 borrowing with `lendingLimit` (GA in v0.17), fair sharing (preemption-based
 stable since v0.7, no gate), gang admission of all three KubeRay CRDs

@@ -91,6 +91,9 @@ Everything is env-overridable (defaults shown):
 | `MOBULA_DEV_DB` | `./.dev/mobula.db` | SQLite desired-state store |
 | `MOBULA_UI_DIR` | `../mobula-ui` | mobula-ui checkout |
 | `MOBULA_RESYNC_SECS` | `10` | reconcile resync interval |
+| `MOBULA_WITH_KUEUE` | `1` | install Kueue into kind on `up` (`0` to opt out) |
+| `MOBULA_KUEUE_VERSION` | `v0.19.1` | Kueue release manifest (matches `kueue-e2e.yml`) |
+| `MOBULA_KIND_NODE_IMAGE` | `kindest/node:v1.34.0` | kind node image (Kueue v0.19 needs K8s ≥ 1.34) |
 
 The SQLite `--db` means desired state survives `serve` restarts; `down` wipes
 `./.dev`. State also persists across a `serve` restart *without* `down`, so you
@@ -98,19 +101,30 @@ can restart the control plane and it re-reconciles what's already there.
 
 ## How it fits together
 
-```
-kind (docker) ── KubeRay operator (watches all namespaces)
-    ▲                                   │ creates/observes
-    │ kube API (host kubeconfig)        ▼
-mobula serve ──reconciler──▶ RayCluster/RayService in ns=mobula-dev
-    ▲  :8484 (/api/v1, /healthz, /docs)
-    │ Vite proxy
-mobula-ui  :5173
+```mermaid
+flowchart LR
+    subgraph host [Your machine]
+        ui["mobula-ui dev server :5173"] -->|"/api proxy"| serve["mobula serve :8484<br/>control plane, not containerized"]
+        serve --> sqlite[(".dev/mobula.db<br/>desired state")]
+    end
+
+    subgraph kindc ["kind cluster (mobula-dev)"]
+        kray["KubeRay operator"]
+        kueue["Kueue<br/>MOBULA_WITH_KUEUE=1 (default)"]
+        rcs["RayClusters you create"]
+        kray -->|creates/observes| rcs
+        kueue -.->|gang admission<br/>when a pool + allocation exist| rcs
+    end
+
+    serve -->|kubeconfig| kray
+    serve -->|pool CRs| kueue
 ```
 
 `mobula serve` runs on the host and talks to kind through your kubeconfig — it
 is **not** containerized for dev, so `cargo run` picks up code changes on a
-plain restart. Only the Ray workloads run in the cluster.
+plain restart. Only the Ray workloads run in the cluster. With Kueue
+installed, `smoke --full` also creates a demo pool + allocation so the
+queue-label admission path is exercised end to end.
 
 ## Troubleshooting
 
