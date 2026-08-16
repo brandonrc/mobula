@@ -161,12 +161,14 @@ impl Provisioner for KubeRayProvisioner {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         let state = kuberay::status_to_state(&status);
+        let spec_fingerprint = obj.data.get("spec").and_then(kuberay::fingerprint_from_cr);
         // The head service KubeRay creates is `<name>-head-svc`; the job
         // gateway targets its dashboard port.
         Ok(ObservedCluster {
             id: id.clone(),
             state,
             observed_generation: observed_generation(&obj),
+            spec_fingerprint,
             api_base_url: Some(self.api_base_url(&id.0)),
         })
     }
@@ -187,6 +189,7 @@ impl Provisioner for KubeRayProvisioner {
                     id: ClusterId(name.clone()),
                     state: kuberay::status_to_state(&status),
                     observed_generation: observed_generation(&obj),
+                    spec_fingerprint: obj.data.get("spec").and_then(kuberay::fingerprint_from_cr),
                     api_base_url: Some(self.api_base_url(&name)),
                 })
             })

@@ -64,6 +64,22 @@ pub enum ClusterState {
     Terminated,
 }
 
+/// A drift/health condition the reconcile engine raises, distinct from the
+/// observed [`ClusterState`]: it records *why* a cluster diverges from
+/// desired so the control plane alarms instead of silently converging
+/// (ADR-0004: drift raises alarms, never a silent stomp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftCondition {
+    /// The observed spec diverges from desired at the same generation — an
+    /// out-of-band edit of a Mobula-owned field.
+    SpecDrift,
+    /// Observed `Degraded` while desired `Running`: the cluster is unhealthy
+    /// for runtime reasons, so re-applying the unchanged spec cannot repair
+    /// it — surfaced as an alarm rather than a re-apply hot loop.
+    Degraded,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("invalid cluster state transition: {from:?} -> {to:?}")]
 pub struct TransitionError {

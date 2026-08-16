@@ -97,6 +97,41 @@ async fn conformance(store: &dyn Store) {
     assert_eq!(store.reap_intents(32_503_680_000).await.unwrap(), 1);
     assert!(store.get_intent("demo/2").await.unwrap().is_none());
 
+    // Monotonic observed-generation fence (#41): a stale (older) observation
+    // must not roll the stored generation backwards.
+    store
+        .record_observation(&id, Some(ClusterState::Running), 5)
+        .await
+        .unwrap();
+    store
+        .record_observation(&id, Some(ClusterState::Running), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().observed_generation,
+        5,
+        "stale observation must not roll observed_generation back"
+    );
+
+    // Drift condition round-trips (#41/#47).
+    store
+        .set_condition(&id, Some(mobula_core::DriftCondition::SpecDrift))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().condition,
+        Some(mobula_core::DriftCondition::SpecDrift)
+    );
+    store.set_condition(&id, None).await.unwrap();
+    assert_eq!(store.get(&id).await.unwrap().unwrap().condition, None);
+
+    // Quarantine flag round-trips (#41).
+    assert!(!store.is_quarantined().await.unwrap());
+    store.set_quarantine(true).await.unwrap();
+    assert!(store.is_quarantined().await.unwrap());
+    store.set_quarantine(false).await.unwrap();
+    assert!(!store.is_quarantined().await.unwrap());
+
     // set_desired on a missing cluster errors.
     assert!(store
         .set_desired(&ClusterId("ghost".into()), DesiredState::Running)

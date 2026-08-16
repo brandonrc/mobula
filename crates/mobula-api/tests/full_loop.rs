@@ -56,6 +56,7 @@ impl Provisioner for MockProvisioner {
                 id: id.clone(),
                 state: *state,
                 observed_generation: self.gen.lock().unwrap().get(&id.0).copied(),
+                spec_fingerprint: None,
                 api_base_url: None,
             }),
             None => Err(ProvisionError::NotFound(id.clone())),

@@ -59,10 +59,117 @@ pub fn to_raycluster(
         "spec": {
             "rayVersion": spec.ray_version,
             "enableInTreeAutoscaling": autoscaling,
+            // Mobula owns `suspend` (SSA field manager) so a force re-apply
+            // clears an out-of-band `suspend: true` and resumes the cluster
+            // (#47). Without this, our field manager never owns the field and
+            // a Suspended cluster could never be repaired by re-applying.
+            "suspend": false,
             "headGroupSpec": head_group_spec(spec, Some(generation)),
             "workerGroupSpecs": worker_specs,
         },
     })
+}
+
+/// Fingerprint of the Mobula-owned, drift-relevant fields (ADR-0004 drift
+/// detection, #41). Deliberately EXCLUDES `replicas`/`scaleStrategy`: those
+/// are the autoscaler's when in-tree autoscaling is on (ADR-0007), and even
+/// off they converge on their own — so a replica count is never treated as
+/// drift. `name`/`project`/`ttl` are control-plane metadata, not on the CR.
+/// Both [`to_raycluster`] (implicitly) and [`fingerprint_from_cr`] project the
+/// same shape, so an out-of-band edit of an owned field changes the result.
+pub fn owned_spec_fingerprint(spec: &ClusterSpec) -> String {
+    let workers: Vec<Value> = spec
+        .worker_groups
+        .iter()
+        .map(|g| {
+            json!({
+                "name": g.name, "cpu": g.cpu, "memory": g.memory, "gpu": g.gpu,
+                "min": g.min_replicas, "max": g.max_replicas,
+            })
+        })
+        .collect();
+    json!({
+        "ray_version": spec.ray_version,
+        "image": spec.image,
+        "head_cpu": spec.head_cpu,
+        "head_memory": spec.head_memory,
+        "workers": workers,
+    })
+    .to_string()
+}
+
+/// Recompute the owned-field fingerprint from a *live* RayCluster `.spec`
+/// object (the inverse projection of [`to_raycluster`]), so `observe` can
+/// detect out-of-band edits. Returns `None` if the manifest is missing the
+/// fields we own (nothing to compare). Container resources are read from the
+/// first container of each group's pod template, matching [`pod_template`].
+pub fn fingerprint_from_cr(cr_spec: &Value) -> Option<String> {
+    let head = cr_spec.get("headGroupSpec")?;
+    let (head_cpu, head_memory) = container_resources(head)?;
+    let workers: Vec<Value> = cr_spec
+        .get("workerGroupSpecs")
+        .and_then(|w| w.as_array())
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|g| {
+                    let (cpu, memory) = container_resources(g)?;
+                    Some(json!({
+                        "name": g.get("groupName").and_then(|v| v.as_str()).unwrap_or(""),
+                        "cpu": cpu,
+                        "memory": memory,
+                        "gpu": container_gpu(g),
+                        "min": g.get("minReplicas").and_then(|v| v.as_u64()).unwrap_or(0),
+                        "max": g.get("maxReplicas").and_then(|v| v.as_u64()).unwrap_or(0),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(
+        json!({
+            "ray_version": cr_spec.get("rayVersion").and_then(|v| v.as_str()).unwrap_or(""),
+            "image": container_image(head).unwrap_or_default(),
+            "head_cpu": head_cpu,
+            "head_memory": head_memory,
+            "workers": workers,
+        })
+        .to_string(),
+    )
+}
+
+/// The first container of a group's pod template (`template.spec.containers[0]`).
+fn first_container(group: &Value) -> Option<&Value> {
+    group
+        .get("template")?
+        .get("spec")?
+        .get("containers")?
+        .as_array()?
+        .first()
+}
+
+fn container_resources(group: &Value) -> Option<(String, String)> {
+    let c = first_container(group)?;
+    let req = c.get("resources")?.get("requests")?;
+    let cpu = req.get("cpu")?.as_str()?.to_string();
+    let mem = req.get("memory")?.as_str()?.to_string();
+    Some((cpu, mem))
+}
+
+fn container_gpu(group: &Value) -> Option<String> {
+    first_container(group)?
+        .get("resources")?
+        .get("requests")?
+        .get("nvidia.com/gpu")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn container_image(group: &Value) -> Option<String> {
+    first_container(group)?
+        .get("image")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn head_group_spec(spec: &ClusterSpec, generation: Option<u64>) -> Value {
@@ -364,6 +471,49 @@ mod tests {
             &m["spec"]["workerGroupSpecs"][0]["template"]["spec"]["containers"][0]["resources"];
         assert_eq!(res["limits"]["nvidia.com/gpu"], "1");
         assert_eq!(res["requests"]["nvidia.com/gpu"], "1");
+    }
+
+    #[test]
+    fn to_raycluster_sets_suspend_false() {
+        // #47: Mobula must own spec.suspend so a force re-apply resumes an
+        // out-of-band-suspended cluster.
+        let m = to_raycluster(
+            &ClusterId("demo".into()),
+            &spec(&[("cpu", 0, 4, 2)]),
+            false,
+            1,
+        );
+        assert_eq!(m["spec"]["suspend"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn owned_fingerprint_round_trips_through_the_manifest() {
+        // #41: the fingerprint recomputed from a freshly-built manifest must
+        // equal the desired fingerprint, so an unedited cluster never looks
+        // drifted.
+        let s = spec(&[("cpu", 0, 4, 2)]);
+        let m = to_raycluster(&ClusterId("demo".into()), &s, false, 1);
+        let from_cr = fingerprint_from_cr(&m["spec"]).expect("fingerprint from CR");
+        assert_eq!(owned_spec_fingerprint(&s), from_cr);
+    }
+
+    #[test]
+    fn owned_fingerprint_ignores_replicas_but_catches_image() {
+        // #41 + ADR-0007: replica count is excluded (autoscaler-owned); an
+        // image change is real drift.
+        let a = spec(&[("cpu", 0, 4, 2)]);
+        let mut b = spec(&[("cpu", 0, 4, 9)]); // only replicas differ
+        assert_eq!(
+            owned_spec_fingerprint(&a),
+            owned_spec_fingerprint(&b),
+            "replica delta must not change the fingerprint"
+        );
+        b.image = "rayproject/ray:9.9.9".into();
+        assert_ne!(
+            owned_spec_fingerprint(&a),
+            owned_spec_fingerprint(&b),
+            "an image edit must change the fingerprint"
+        );
     }
 
     #[test]

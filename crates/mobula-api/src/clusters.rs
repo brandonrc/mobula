@@ -72,6 +72,10 @@ pub struct ClusterView {
     /// Observed lifecycle state, if the cluster has been reconciled.
     pub observed_state: Option<String>,
     pub observed_generation: u64,
+    /// Drift/health alarm raised by the reconcile engine (ADR-0004, #41/#47):
+    /// "spec_drift" (out-of-band edit) or "degraded". `None` when converging
+    /// normally. Distinct from `observed_state`.
+    pub condition: Option<String>,
     pub project: String,
     pub ray_version: String,
     /// Estimated $/hr at min size, if a price sheet is configured.
@@ -95,6 +99,11 @@ impl ClusterView {
                 .map(|s| serde_json::to_value(s).ok())
                 .and_then(|v| v.and_then(|v| v.as_str().map(String::from))),
             observed_generation: c.observed_generation,
+            condition: c.condition.and_then(|cond| {
+                serde_json::to_value(cond)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+            }),
             project: c.spec.project.clone(),
             ray_version: c.spec.ray_version.clone(),
             est_min_hourly: cost.map(|c| c.min_hourly),
