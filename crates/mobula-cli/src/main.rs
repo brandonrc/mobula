@@ -182,6 +182,18 @@ async fn main() -> std::io::Result<()> {
                         service_provisioner = Some(provisioner.clone());
                         let reconciler =
                             mobula_controller::Reconciler::new(concrete.clone(), provisioner);
+                        // ADR-0007 restore quarantine (#41): before actuating,
+                        // check whether the store was restored behind reality
+                        // (a backing cluster newer than the DB). If so, the
+                        // reconciler quarantines itself and only observes until
+                        // an operator clears it.
+                        match reconciler.detect_stale_restore().await {
+                            Ok(true) => tracing::error!(
+                                "started QUARANTINED after detecting a stale DB restore; not actuating until cleared"
+                            ),
+                            Ok(false) => {}
+                            Err(e) => tracing::warn!(error = %e, "stale-restore boot check failed"),
+                        }
                         let interval = std::time::Duration::from_secs(reconcile_interval_secs);
                         tokio::spawn(async move {
                             reconciler

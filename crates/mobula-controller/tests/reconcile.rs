@@ -21,6 +21,11 @@ struct MockProvisioner {
     /// reads back (#40). Set by `apply`, unchanged by `set_state` so a
     /// drift (state flip) keeps the applied generation.
     gen: Mutex<HashMap<String, u64>>,
+    /// Fingerprint each cluster reports from `observe` (#41 drift). `apply`
+    /// sets it to the applied spec's fingerprint (so a converged cluster
+    /// never looks drifted); `set_fingerprint` overrides it to simulate an
+    /// out-of-band edit.
+    fp: Mutex<HashMap<String, Option<String>>>,
     apply_keys: Mutex<Vec<String>>,
     terminate_calls: Mutex<Vec<String>>,
 }
@@ -28,6 +33,12 @@ struct MockProvisioner {
 impl MockProvisioner {
     fn set_state(&self, id: &str, s: ClusterState) {
         self.state.lock().unwrap().insert(id.into(), s);
+    }
+    fn set_fingerprint(&self, id: &str, fp: Option<String>) {
+        self.fp.lock().unwrap().insert(id.into(), fp);
+    }
+    fn set_observed_generation(&self, id: &str, g: u64) {
+        self.gen.lock().unwrap().insert(id.into(), g);
     }
     fn apply_count(&self) -> usize {
         self.apply_keys.lock().unwrap().len()
@@ -55,6 +66,12 @@ impl Provisioner for MockProvisioner {
             .unwrap()
             .insert(id.0.clone(), ClusterState::Running);
         self.gen.lock().unwrap().insert(id.0.clone(), generation);
+        // A freshly-applied cluster reports the fingerprint of what we
+        // applied, so it never looks drifted until something edits it.
+        self.fp.lock().unwrap().insert(
+            id.0.clone(),
+            Some(mobula_provision::kuberay::owned_spec_fingerprint(_spec)),
+        );
         Ok(ApplyResponse {
             generation,
             api_base_url: Some(format!("http://{}-head:8265", id.0)),
@@ -76,6 +93,7 @@ impl Provisioner for MockProvisioner {
                 id: id.clone(),
                 state: *state,
                 observed_generation: self.gen.lock().unwrap().get(&id.0).copied(),
+                spec_fingerprint: self.fp.lock().unwrap().get(&id.0).cloned().flatten(),
                 api_base_url: Some(format!("http://{}-head:8265", id.0)),
             }),
             None => Err(ProvisionError::NotFound(id.clone())),
@@ -84,6 +102,7 @@ impl Provisioner for MockProvisioner {
 
     async fn list(&self) -> Result<Vec<ObservedCluster>, ProvisionError> {
         let gens = self.gen.lock().unwrap();
+        let fps = self.fp.lock().unwrap();
         Ok(self
             .state
             .lock()
@@ -93,6 +112,7 @@ impl Provisioner for MockProvisioner {
                 id: ClusterId(k.clone()),
                 state: *v,
                 observed_generation: gens.get(k).copied(),
+                spec_fingerprint: fps.get(k).cloned().flatten(),
                 api_base_url: None,
             })
             .collect())
@@ -322,6 +342,7 @@ impl Provisioner for LaggingProvisioner {
             id: id.clone(),
             state: ClusterState::Running,
             observed_generation: Some(1),
+            spec_fingerprint: None,
             api_base_url: None,
         })
     }
@@ -395,6 +416,146 @@ async fn conflicting_intent_fingerprint_is_rejected() {
         0,
         "must not actuate under a conflicting intent"
     );
+}
+
+#[tokio::test]
+async fn repairs_drift_when_suspended_out_of_band() {
+    // #47: a Running-desired cluster observed Suspended must be re-applied
+    // (resume-as-reprovision), not left NoOp forever.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    rec.reconcile_all().await;
+    assert_eq!(prov.apply_count(), 1);
+
+    prov.set_state("demo", ClusterState::Suspended);
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Applied);
+    assert_eq!(
+        prov.apply_count(),
+        2,
+        "Suspended must trigger a resume re-apply"
+    );
+}
+
+#[tokio::test]
+async fn degraded_desired_running_raises_drift_alarm() {
+    // #47/#41: Degraded is a runtime failure, not spec drift — raise an alarm
+    // (Action::Drift + persisted condition) and do NOT hot-loop re-applying.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    rec.reconcile_all().await;
+    assert_eq!(prov.apply_count(), 1);
+
+    prov.set_state("demo", ClusterState::Degraded);
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Drift);
+    let stored = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.condition,
+        Some(mobula_core::DriftCondition::Degraded)
+    );
+
+    // Repeated passes must not churn the provider.
+    rec.reconcile_all().await;
+    rec.reconcile_all().await;
+    assert_eq!(
+        prov.apply_count(),
+        1,
+        "Degraded must not re-apply in a loop"
+    );
+}
+
+#[tokio::test]
+async fn out_of_band_spec_edit_raises_drift_and_does_not_silently_noop() {
+    // #41: a live cluster at the desired generation whose observed spec
+    // fingerprint diverges from desired is drift → alarm, never a silent NoOp.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    rec.reconcile_all().await;
+    let applies = prov.apply_count();
+
+    // Simulate an out-of-band edit: the cluster now reports a different
+    // owned-field fingerprint than desired.
+    prov.set_fingerprint("demo", Some("tampered-fingerprint".into()));
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Drift);
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().condition,
+        Some(mobula_core::DriftCondition::SpecDrift)
+    );
+    assert_eq!(
+        prov.apply_count(),
+        applies,
+        "drift alarms, it does not re-apply"
+    );
+}
+
+#[tokio::test]
+async fn autoscaler_owned_replicas_do_not_count_as_drift() {
+    // #41 + ADR-0007: replica counts are excluded from the drift fingerprint,
+    // so an autoscaler changing replicas must NOT raise a drift alarm.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 2)).await.unwrap();
+    rec.reconcile_all().await;
+
+    // The cluster reports the fingerprint of a spec that differs ONLY in
+    // replica count — which fingerprints identically (replicas excluded).
+    let fp_diff_replicas = mobula_provision::kuberay::owned_spec_fingerprint(&spec("demo", 99));
+    prov.set_fingerprint("demo", Some(fp_diff_replicas));
+    let r = rec.reconcile_all().await;
+    assert_eq!(
+        r[0].1.as_ref().unwrap(),
+        &Action::NoOp,
+        "replica delta is not drift"
+    );
+    assert_eq!(store.get(&id).await.unwrap().unwrap().condition, None);
+}
+
+#[tokio::test]
+async fn stale_restore_quarantines_and_blocks_actuation() {
+    // #41: if a backing cluster reports a generation NEWER than the store
+    // (a rolled-back DB restore), detect_stale_restore quarantines, and the
+    // reconciler then observes without actuating.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    rec.reconcile_all().await;
+    let applies = prov.apply_count();
+
+    // The live cluster is at a newer generation than the store believes.
+    prov.set_observed_generation("demo", 5);
+    assert!(
+        rec.detect_stale_restore().await.unwrap(),
+        "should quarantine"
+    );
+    assert!(store.is_quarantined().await.unwrap());
+
+    // Force a reason to actuate (drift), but quarantine must block it.
+    prov.set_state("demo", ClusterState::Terminated);
+    rec.reconcile_all().await;
+    assert_eq!(
+        prov.apply_count(),
+        applies,
+        "quarantine must block actuation"
+    );
+}
+
+#[tokio::test]
+async fn quarantined_store_observes_but_does_not_actuate() {
+    // #41: with quarantine set, a fresh cluster that would otherwise be
+    // applied is only observed.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    store.set_quarantine(true).await.unwrap();
+
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::NoOp);
+    assert_eq!(prov.apply_count(), 0, "quarantined: must not actuate");
 }
 
 #[tokio::test]

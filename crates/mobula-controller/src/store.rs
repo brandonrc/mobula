@@ -5,7 +5,7 @@
 //! store lands in the next slice behind the same trait.
 
 use async_trait::async_trait;
-use mobula_core::{ClusterId, ClusterSpec, ClusterState};
+use mobula_core::{ClusterId, ClusterSpec, ClusterState, DriftCondition};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -33,6 +33,10 @@ pub struct StoredCluster {
     pub desired: DesiredState,
     pub observed_state: Option<ClusterState>,
     pub observed_generation: u64,
+    /// Drift/health alarm raised by the reconcile engine (ADR-0004, #41/#47),
+    /// distinct from `observed_state`. `None` when the cluster is converging
+    /// normally.
+    pub condition: Option<DriftCondition>,
     /// Unix seconds when the cluster was first created (for TTL reaping).
     pub created_at: u64,
 }
@@ -139,12 +143,31 @@ pub trait Store: Send + Sync {
     async fn set_desired(&self, id: &ClusterId, desired: DesiredState) -> Result<(), StoreError>;
 
     /// Record the reconstructed observation and the generation it reflects.
+    /// The stored `observed_generation` is monotonic non-decreasing (ADR-0007
+    /// stale-generation fence, #41): an observation reporting an *older*
+    /// generation than what's stored does not roll it back.
     async fn record_observation(
         &self,
         id: &ClusterId,
         observed: Option<ClusterState>,
         observed_generation: u64,
     ) -> Result<(), StoreError>;
+
+    /// Set (or clear) the drift/health condition on a cluster (#41/#47).
+    async fn set_condition(
+        &self,
+        id: &ClusterId,
+        condition: Option<DriftCondition>,
+    ) -> Result<(), StoreError>;
+
+    /// Whether the control plane is quarantined (ADR-0007 restore quarantine,
+    /// #41): a stale-restore boot check trips this, and while set the
+    /// reconcile engine observes but never actuates until an operator clears
+    /// it.
+    async fn is_quarantined(&self) -> Result<bool, StoreError>;
+
+    /// Enter or leave quarantine.
+    async fn set_quarantine(&self, quarantined: bool) -> Result<(), StoreError>;
 
     /// Transactional outbox (ADR-0007): open an intent to actuate `key` with
     /// the given spec `fingerprint`, committing a `Pending` row *before* the
@@ -170,6 +193,7 @@ pub trait Store: Send + Sync {
 pub mod memory {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     /// In-memory `Store` for tests and single-node dev.
@@ -177,6 +201,7 @@ pub mod memory {
     pub struct InMemoryStore {
         clusters: Mutex<HashMap<String, StoredCluster>>,
         intents: Mutex<HashMap<String, IntentRecord>>,
+        quarantined: AtomicBool,
     }
 
     impl InMemoryStore {
@@ -208,6 +233,7 @@ pub mod memory {
                 desired: observed.map(|c| c.desired).unwrap_or(DesiredState::Running),
                 observed_state: observed.and_then(|c| c.observed_state),
                 observed_generation: observed.map(|c| c.observed_generation).unwrap_or(0),
+                condition: observed.and_then(|c| c.condition),
                 created_at: observed.map(|c| c.created_at).unwrap_or_else(now_unix),
             };
             map.insert(id.0.clone(), record);
@@ -244,8 +270,31 @@ pub mod memory {
             let mut map = self.clusters.lock().unwrap();
             if let Some(c) = map.get_mut(&id.0) {
                 c.observed_state = observed;
-                c.observed_generation = observed_generation;
+                // Monotonic fence (#41): never roll the observed generation
+                // backwards (a stale-restore observation must not overwrite a
+                // newer one).
+                c.observed_generation = c.observed_generation.max(observed_generation);
             }
+            Ok(())
+        }
+
+        async fn set_condition(
+            &self,
+            id: &ClusterId,
+            condition: Option<DriftCondition>,
+        ) -> Result<(), StoreError> {
+            if let Some(c) = self.clusters.lock().unwrap().get_mut(&id.0) {
+                c.condition = condition;
+            }
+            Ok(())
+        }
+
+        async fn is_quarantined(&self) -> Result<bool, StoreError> {
+            Ok(self.quarantined.load(Ordering::SeqCst))
+        }
+
+        async fn set_quarantine(&self, quarantined: bool) -> Result<(), StoreError> {
+            self.quarantined.store(quarantined, Ordering::SeqCst);
             Ok(())
         }
 

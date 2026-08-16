@@ -70,6 +70,19 @@ impl Store for SlowListStore {
     async fn reap_intents(&self, applied_before: u64) -> Result<u64, StoreError> {
         self.inner.reap_intents(applied_before).await
     }
+    async fn set_condition(
+        &self,
+        id: &ClusterId,
+        condition: Option<mobula_core::DriftCondition>,
+    ) -> Result<(), StoreError> {
+        self.inner.set_condition(id, condition).await
+    }
+    async fn is_quarantined(&self) -> Result<bool, StoreError> {
+        self.inner.is_quarantined().await
+    }
+    async fn set_quarantine(&self, quarantined: bool) -> Result<(), StoreError> {
+        self.inner.set_quarantine(quarantined).await
+    }
 }
 
 fn create_body(id: &str) -> serde_json::Value {

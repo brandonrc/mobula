@@ -33,6 +33,12 @@ pub struct ObservedCluster {
     /// engine records this, so convergence is observed rather than
     /// self-certified.
     pub observed_generation: Option<u64>,
+    /// Fingerprint of the Mobula-owned, drift-relevant fields as they exist
+    /// on the *live* resource (ADR-0004 drift detection, #41). Recomputed
+    /// from the observed manifest, so an out-of-band edit of an owned field
+    /// makes it diverge from the desired fingerprint. `None` when the backend
+    /// can't project one.
+    pub spec_fingerprint: Option<String>,
     /// Base URL of the cluster's native Ray dashboard/job API, reachable
     /// from the control plane. The job gateway proxies to this; it is never
     /// exposed to users directly.

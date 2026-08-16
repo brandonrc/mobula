@@ -5,7 +5,7 @@
 //! Postgres (the SQL is standard); a Postgres impl reuses this shape.
 
 use async_trait::async_trait;
-use mobula_core::{ClusterId, ClusterSpec, ClusterState};
+use mobula_core::{ClusterId, ClusterSpec, ClusterState, DriftCondition};
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS clusters (
     desired               TEXT NOT NULL,
     observed_state        TEXT,
     observed_generation   INTEGER NOT NULL DEFAULT 0,
+    condition             TEXT,
     created_at            INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS intents (
@@ -42,18 +43,24 @@ CREATE TABLE IF NOT EXISTS intents (
     created_at         INTEGER NOT NULL DEFAULT 0,
     completed_at       INTEGER
 );
+-- Singleton control flags (e.g. restore quarantine, #41).
+CREATE TABLE IF NOT EXISTS control (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
-/// Additive migrations for databases created by an older single-column
-/// `intents` schema (ADR-0007 outbox, #39). Each is idempotent: on a fresh
-/// DB the column already exists and SQLite errors with "duplicate column
-/// name", which we ignore. Ordering doesn't matter (all independent).
-const INTENT_MIGRATIONS: &[&str] = &[
+/// Additive column migrations for databases created by an older schema (#39
+/// outbox columns, #41 cluster condition). Each is idempotent: on a fresh DB
+/// the column already exists and SQLite errors with "duplicate column name",
+/// which we ignore. Ordering doesn't matter (all independent).
+const COLUMN_MIGRATIONS: &[&str] = &[
     "ALTER TABLE intents ADD COLUMN params_fingerprint TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE intents ADD COLUMN status TEXT NOT NULL DEFAULT 'applied'",
     "ALTER TABLE intents ADD COLUMN response_json TEXT",
     "ALTER TABLE intents ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE intents ADD COLUMN completed_at INTEGER",
+    "ALTER TABLE clusters ADD COLUMN condition TEXT",
 ];
 
 pub struct SqliteStore {
@@ -69,7 +76,7 @@ impl SqliteStore {
             .execute(pool)
             .await?;
         sqlx::query(SCHEMA).execute(pool).await?;
-        for m in INTENT_MIGRATIONS {
+        for m in COLUMN_MIGRATIONS {
             // Ignore "duplicate column name" on fresh DBs; surface anything else.
             if let Err(e) = sqlx::query(m).execute(pool).await {
                 let msg = e.to_string();
@@ -130,6 +137,10 @@ fn row_to_cluster(row: SqliteRow) -> Result<StoredCluster, StoreError> {
         Some(s) => Some(serde_json::from_str::<ClusterState>(&s).map_err(json_err)?),
         None => None,
     };
+    let condition = match row.try_get::<Option<String>, _>("condition")? {
+        Some(s) => Some(serde_json::from_str::<DriftCondition>(&s).map_err(json_err)?),
+        None => None,
+    };
     Ok(StoredCluster {
         id: ClusterId(row.try_get::<String, _>("id")?),
         spec,
@@ -137,6 +148,7 @@ fn row_to_cluster(row: SqliteRow) -> Result<StoredCluster, StoreError> {
         desired: desired_from_str(&row.try_get::<String, _>("desired")?)?,
         observed_state,
         observed_generation: row.try_get::<i64, _>("observed_generation")? as u64,
+        condition,
         created_at: row.try_get::<i64, _>("created_at")? as u64,
     })
 }
@@ -244,12 +256,55 @@ impl Store for SqliteStore {
             Some(s) => Some(serde_json::to_string(&s).map_err(json_err)?),
             None => None,
         };
-        sqlx::query("UPDATE clusters SET observed_state = ?, observed_generation = ? WHERE id = ?")
-            .bind(observed_json)
-            .bind(observed_generation as i64)
+        // MAX() keeps observed_generation monotonic (#41 stale-generation
+        // fence): a restore reporting an older generation can't roll it back.
+        sqlx::query(
+            "UPDATE clusters \
+             SET observed_state = ?, observed_generation = MAX(observed_generation, ?) \
+             WHERE id = ?",
+        )
+        .bind(observed_json)
+        .bind(observed_generation as i64)
+        .bind(&id.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn set_condition(
+        &self,
+        id: &ClusterId,
+        condition: Option<DriftCondition>,
+    ) -> Result<(), StoreError> {
+        let condition_json = match condition {
+            Some(c) => Some(serde_json::to_string(&c).map_err(json_err)?),
+            None => None,
+        };
+        sqlx::query("UPDATE clusters SET condition = ? WHERE id = ?")
+            .bind(condition_json)
             .bind(&id.0)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    async fn is_quarantined(&self) -> Result<bool, StoreError> {
+        let v: Option<String> = sqlx::query("SELECT value FROM control WHERE key = 'quarantine'")
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.try_get::<String, _>("value"))
+            .transpose()?;
+        Ok(v.as_deref() == Some("true"))
+    }
+
+    async fn set_quarantine(&self, quarantined: bool) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO control (key, value) VALUES ('quarantine', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(if quarantined { "true" } else { "false" })
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mobula_core::ClusterState;
+use mobula_core::{ClusterState, DriftCondition};
 use mobula_provision::{ProvisionError, Provisioner};
 
 use crate::store::{
@@ -45,6 +45,10 @@ pub enum Action {
     Applied,
     /// Requested teardown.
     Terminated,
+    /// Observed divergence that re-applying can't fix (Degraded, or an
+    /// out-of-band spec edit) — raised as an alarm, not silently converged
+    /// (ADR-0004, #41/#47). A drift condition is persisted.
+    Drift,
 }
 
 pub struct Reconciler<S, P> {
@@ -87,16 +91,44 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
             .as_ref()
             .and_then(|o| o.observed_generation)
             .unwrap_or(0);
+        let observed_fp = observed.as_ref().and_then(|o| o.spec_fingerprint.clone());
 
-        // 2. Decide and actuate against *observed* reality.
+        // Quarantine (ADR-0007 restore fence, #41): while set, observe and
+        // record but never actuate — an operator clears it after reviewing a
+        // suspected stale DB restore.
+        if self.store.is_quarantined().await? {
+            tracing::warn!(
+                target: "mobula::audit",
+                cluster = %c.id, "control plane quarantined: observing only, not actuating"
+            );
+            self.store
+                .record_observation(&c.id, observed_state, observed_gen)
+                .await?;
+            return Ok(Action::NoOp);
+        }
+
+        // 2. Decide and actuate against *observed* reality. Track the
+        //    drift/health condition to persist (#41/#47); every branch sets it.
+        let new_condition: Option<DriftCondition>;
         let action = match c.desired {
             DesiredState::Running => {
-                if needs_apply(observed_state, observed_gen, c.generation) {
-                    // Transactional outbox (ADR-0007, #39): open the intent —
-                    // committing a pending row — before the provider call.
-                    // A same-params re-open (`replay`) still actuates because
-                    // the call is idempotent per key and drift repair depends
-                    // on re-applying; a *different*-params re-use is rejected.
+                if matches!(observed_state, Some(ClusterState::Degraded)) {
+                    // #47: Degraded is a runtime failure, not spec drift —
+                    // re-applying the unchanged spec can't heal it and would
+                    // hot-loop. Alarm instead (ADR-0004), leave it Degraded.
+                    new_condition = Some(DriftCondition::Degraded);
+                    tracing::warn!(
+                        target: "mobula::audit",
+                        cluster = %c.id, "observed Degraded while desired Running — raising alarm, not re-applying"
+                    );
+                    Action::Drift
+                } else if needs_apply(observed_state, observed_gen, c.generation) {
+                    // None/Terminated/Terminating/Suspended(#47)/generation-
+                    // behind → (re)apply. Transactional outbox (ADR-0007, #39):
+                    // open the intent before the call; a same-params re-open
+                    // (`replay`) still actuates (idempotent SSA; drift repair
+                    // needs it), a different-params re-use is rejected.
+                    new_condition = None;
                     let key = c.intent_key();
                     let fp = params_fingerprint(&c.spec);
                     match self.store.begin_intent(&key, &fp).await? {
@@ -117,10 +149,26 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                         }
                     }
                 } else {
-                    Action::NoOp
+                    // Live at the desired generation: check for an out-of-band
+                    // edit of a Mobula-owned field (#41). The observed
+                    // fingerprint is recomputed from the live resource, so a
+                    // divergence is real drift — alarm, don't silently NoOp.
+                    let desired_fp = mobula_provision::kuberay::owned_spec_fingerprint(&c.spec);
+                    if observed_fp.as_deref().is_some_and(|fp| fp != desired_fp) {
+                        new_condition = Some(DriftCondition::SpecDrift);
+                        tracing::warn!(
+                            target: "mobula::audit",
+                            cluster = %c.id, "observed spec drift from desired — raising alarm"
+                        );
+                        Action::Drift
+                    } else {
+                        new_condition = None;
+                        Action::NoOp
+                    }
                 }
             }
             DesiredState::Terminated => {
+                new_condition = None;
                 if observed_state.is_some_and(|s| s != ClusterState::Terminated) {
                     self.provisioner.terminate(&c.id).await?;
                     Action::Terminated
@@ -141,6 +189,9 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
         self.store
             .record_observation(&c.id, final_state, final_gen)
             .await?;
+        if new_condition != c.condition {
+            self.store.set_condition(&c.id, new_condition).await?;
+        }
 
         Ok(action)
     }
@@ -169,6 +220,35 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
             }
         }
         Ok(reaped)
+    }
+
+    /// Boot check for a stale DB restore (ADR-0007 restore quarantine, #41):
+    /// if any backing cluster reports a generation *newer* than what the store
+    /// holds, the store was restored behind reality — actuating would stomp a
+    /// newer cluster with older desired state. Quarantine and alarm instead;
+    /// an operator clears it after review. Returns whether it quarantined.
+    /// Call this once before spawning [`Reconciler::run`].
+    pub async fn detect_stale_restore(&self) -> Result<bool, ReconcileError> {
+        let clusters = self.store.list().await?;
+        for c in clusters {
+            match self.provisioner.observe(&c.id).await {
+                Ok(o) => {
+                    if o.observed_generation.is_some_and(|g| g > c.generation) {
+                        tracing::error!(
+                            target: "mobula::audit",
+                            cluster = %c.id, stored_generation = c.generation,
+                            observed_generation = ?o.observed_generation,
+                            "stale DB restore detected (backing cluster is newer than the store) — quarantining"
+                        );
+                        self.store.set_quarantine(true).await?;
+                        return Ok(true);
+                    }
+                }
+                Err(ProvisionError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(false)
     }
 
     /// Run the control loop until `shutdown` resolves: each tick reaps
@@ -233,6 +313,10 @@ fn needs_apply(
     match observed {
         None => true,
         Some(ClusterState::Terminated) | Some(ClusterState::Terminating) => true,
+        // #47: a Suspended cluster whose desired state is Running is
+        // repairable drift — re-apply resumes it (to_raycluster owns
+        // spec.suspend=false, so the force-SSA re-apply clears it).
+        Some(ClusterState::Suspended) => true,
         Some(_) => observed_generation < desired_generation,
     }
 }
@@ -261,6 +345,7 @@ mod tests {
             desired: DesiredState::Running,
             observed_state: observed,
             observed_generation: 1,
+            condition: None,
             created_at,
         }
     }
@@ -303,5 +388,7 @@ mod tests {
         assert!(!needs_apply(Some(ClusterState::Running), 1, 1));
         // Mid-roll at the desired generation → wait, don't re-apply/churn.
         assert!(!needs_apply(Some(ClusterState::Provisioning), 2, 2));
+        // #47: Suspended with desired Running is repairable → re-apply.
+        assert!(needs_apply(Some(ClusterState::Suspended), 1, 1));
     }
 }
