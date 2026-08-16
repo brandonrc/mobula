@@ -37,7 +37,7 @@ test-util = []
 async-trait.workspace = true
 jsonwebtoken.workspace = true
 rsa = { version = "0.9", features = ["pem"] }
-rand = "0.8"
+rand = "0.10"
 # Enable `test-util` for this crate's own integration tests (which are a
 # separate crate and would not otherwise see the feature) without forcing
 # it on downstream consumers.

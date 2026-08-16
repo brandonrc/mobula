@@ -19,4 +19,4 @@ tracing.workspace = true
 [dev-dependencies]
 axum.workspace = true
 rsa = { version = "0.9", features = ["pem"] }
-rand = "0.8"
+rand = "0.10"
