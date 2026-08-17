@@ -78,8 +78,14 @@ impl KubeRayProvisioner {
         // reqwest and kube each bring a rustls crypto provider; with more
         // than one in the tree rustls refuses to auto-pick a default and
         // panics on first TLS use. Install one explicitly (idempotent —
-        // Err just means already installed).
+        // Err just means already installed). FIPS builds (#61) install the
+        // aws-lc-rs FIPS provider instead of ring; the binary's startup
+        // check (mobula_core::crypto::enforce_fips_startup) normally beats
+        // this to it, making this a no-op.
+        #[cfg(not(feature = "fips"))]
         let _ = rustls::crypto::ring::default_provider().install_default();
+        #[cfg(feature = "fips")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = Client::try_default()
             .await
             .map_err(|e| ProvisionError::Backend(e.to_string()))?;

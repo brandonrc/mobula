@@ -51,8 +51,12 @@ impl KueueClient {
     pub async fn connect() -> Result<Self, ProvisionError> {
         // See KubeRayProvisioner::connect: more than one rustls crypto
         // provider in the tree makes rustls panic on first TLS use unless a
-        // default is installed explicitly (idempotent).
+        // default is installed explicitly (idempotent). FIPS builds (#61)
+        // install the aws-lc-rs FIPS provider instead of ring.
+        #[cfg(not(feature = "fips"))]
         let _ = rustls::crypto::ring::default_provider().install_default();
+        #[cfg(feature = "fips")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = Client::try_default()
             .await
             .map_err(|e| ProvisionError::Backend(e.to_string()))?;

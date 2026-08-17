@@ -12,3 +12,13 @@ dev = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
 ml-team = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
 genai = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
 research = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
+
+# GPU sharing isolation (docs/security-gpu-sharing.md). default_sharing is
+# the platform-wide fallback for pool specs that leave `gpu_sharing` unset:
+# "whole-gpu" (the default) and "mig" are isolation-safe; "time-slice"
+# shares GPU SMs with no hardware isolation, so it is rejected whenever a
+# pool is shared by more than one project — a single-project pool must opt
+# in per pool (`gpu_sharing = "time-slice"` on the pool spec). Boot-time
+# only: not editable via PUT /api/v1/settings/policy.
+[gpu]
+default_sharing = "whole-gpu"

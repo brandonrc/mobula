@@ -224,6 +224,7 @@ fn pool_spec(name: &str, weight: f64) -> PoolSpec {
         cohort: "research".into(),
         fair_sharing_weight: weight,
         elastic: true,
+        gpu_sharing: None,
     }
 }
 

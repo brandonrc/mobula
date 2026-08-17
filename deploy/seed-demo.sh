@@ -18,7 +18,10 @@ put() {
 }
 
 echo "== pools"
-post /api/v1/pools '{"spec":{"name":"gpu-pool","cohort":"main","fair_sharing_weight":1.0,"elastic":true,"flavors":[
+# gpu-pool is shared by ml-team + genai, so its gpu_sharing must be
+# isolation-safe: "mig" (the mig-slice flavor serves MIG partitions).
+# "time-slice" would be rejected at the second allocation (#58).
+post /api/v1/pools '{"spec":{"name":"gpu-pool","cohort":"main","fair_sharing_weight":1.0,"elastic":true,"gpu_sharing":"mig","flavors":[
   {"name":"a100","resources":{"cpu":"64","memory":"256Gi","nvidia.com/gpu":"8"},"node_labels":{"node.kubernetes.io/instance-type":"a100-40gb"},"taints":[]},
   {"name":"mig-slice","resources":{"cpu":"16","memory":"64Gi","nvidia.com/mig-1g.10gb":"14"},"node_labels":{"nvidia.com/mig.strategy":"mixed"},"taints":[]}]}}'
 post /api/v1/pools '{"spec":{"name":"cpu-pool","cohort":"main","fair_sharing_weight":1.0,"elastic":false,"flavors":[
@@ -54,5 +57,10 @@ curl -s -o /dev/null -w "%{http_code} DELETE old-experiment\n" -X DELETE -H "$AU
 echo "== audit noise: a few denials + auth failures"
 curl -s -o /dev/null -w "%{http_code} unauth GET\n" "$API/api/v1/clusters"
 curl -s -o /dev/null -w "%{http_code} bad-password login\n" -X POST -H "$CT" -d '{"username":"admin","password":"wrong"}' "$API/api/v1/auth/login"
+
+echo "== demo users: alice (viewer + operator on project:ml-team), bob (admin)"
+post /api/v1/auth/users '{"username":"alice","email":"alice@mobula.local","password":"alice123","role":"viewer"}'
+post /api/v1/auth/users '{"username":"bob","email":"bob@mobula.local","password":"bob","role":"admin"}' 2>/dev/null || true
+put /api/v1/access/assignments/alice '{"role":"operator","scope":"project:ml-team"}'
 
 echo "done. UI: http://localhost:8088 (admin/admin)"

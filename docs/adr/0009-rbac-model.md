@@ -77,10 +77,15 @@ table set, in the smallest form that delivers value:
   mobula-api's `auth_layer` — one indexed row read per request that misses
   the flat fast path. Caching is a deliberate follow-up, not built.
 - **Enforcement rollout:** v0 wires scoped checks into the cluster routes
-  only (`create`/`get`/`delete` scoped to the cluster's project; `list`
-  filters per-project for callers lacking global `Read`). All other routes
-  keep flat checks; the admin API is `GET/PUT/DELETE
-  /api/v1/access/assignments…` (Admin-only, audited — api-v1.md §2.2).
+  only (`create`/`get`/`delete` scoped to the cluster's project). Reads are
+  additionally READ-SCOPED: a principal holding any `project:<name>`
+  binding only SEES those projects' clusters — `list` filters to them and
+  an out-of-scope `get` by name returns 404 so existence isn't leaked. This
+  holds even when the principal also holds a global role (group-derived or
+  a `"*"` binding): scoped presence narrows visibility; only a global Admin
+  role always sees everything. All other routes keep flat checks; the admin
+  API is `GET/PUT/DELETE /api/v1/access/assignments…` (Admin-only, audited
+  — api-v1.md §2.2).
 - **Out of scope, by design:** group-principal bindings are the OIDC-mapping
   layer's job (they collapse into group→role mapping), and per-cluster
   bindings wait for the Phase 3 `permissions`/`roles` tables.

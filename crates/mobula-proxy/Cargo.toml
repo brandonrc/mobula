@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Forwards mobula-auth's defaults: its workspace edge is
+# default-features = false so members can select feature sets (#61).
+default = ["mobula-auth/default"]
+
 [dependencies]
 mobula-auth.workspace = true
 axum.workspace = true

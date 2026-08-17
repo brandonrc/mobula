@@ -74,6 +74,28 @@ pub fn is_k8s_name(s: &str) -> bool {
         && s.bytes().last().is_some_and(|b| b.is_ascii_alphanumeric())
 }
 
+/// How a pool's GPUs may be shared between workloads (#58).
+///
+/// NVIDIA GPU time-slicing (and fractional `nvidia.com/gpu` requests via the
+/// device plugin) shares one GPU's SMs across processes with no hardware
+/// isolation — acceptable within one tenant, never across tenants. MIG is
+/// hardware partitioning and whole-GPU allocation needs no sharing at all,
+/// so both are isolation-safe. The tenant-isolation rule itself is enforced
+/// by `mobula-policy::gpu` at admission time; this field is the per-pool
+/// knob it evaluates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum GpuSharing {
+    /// One workload per GPU (the safe default).
+    #[default]
+    WholeGpu,
+    /// MIG hardware partitioning — isolation-safe sharing.
+    Mig,
+    /// Device-plugin time-slicing — software sharing, single-tenant pools
+    /// only.
+    TimeSlice,
+}
+
 /// A shared capacity pool: flavors + a cohort to borrow from (ADR-0010).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PoolSpec {
@@ -87,6 +109,14 @@ pub struct PoolSpec {
     /// Whether workloads in this pool may be elastically resized (Kueue
     /// elastic jobs / Workload Slices).
     pub elastic: bool,
+    /// GPU sharing mode for this pool (#58). `None` inherits the platform
+    /// default (`[gpu] default_sharing` in the policy file, itself
+    /// defaulting to `whole-gpu`). A pool shared by more than one project
+    /// may not resolve to `time-slice` — enforced at admission by
+    /// `mobula-policy::gpu`, not here (core validates shape; tenancy is
+    /// known only at the API edge, where allocations live).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_sharing: Option<GpuSharing>,
 }
 
 impl PoolSpec {
@@ -227,6 +257,7 @@ mod tests {
             cohort: "research".into(),
             fair_sharing_weight: 1.0,
             elastic: true,
+            gpu_sharing: None,
         }
     }
 
@@ -358,11 +389,40 @@ mod tests {
 
     #[test]
     fn serde_round_trip_snake_case() {
-        let p = pool();
+        let mut p = pool();
+        p.gpu_sharing = Some(GpuSharing::Mig);
         let v = serde_json::to_value(&p).unwrap();
         assert!(v.get("fair_sharing_weight").is_some());
+        assert_eq!(v["gpu_sharing"], "mig");
         assert!(v.get("node_labels").is_none()); // that's on flavors
         assert_eq!(serde_json::from_value::<PoolSpec>(v).unwrap(), p,);
+    }
+
+    #[test]
+    fn gpu_sharing_defaults_to_platform_default_when_absent() {
+        // A spec without the field (incl. rows stored before #58) carries
+        // None — the platform default applies at enforcement time, and the
+        // field is omitted from serialization rather than stored as null.
+        let p = pool();
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(v.get("gpu_sharing").is_none());
+        assert_eq!(serde_json::from_value::<PoolSpec>(v).unwrap(), p);
+    }
+
+    #[test]
+    fn gpu_sharing_values_are_kebab_case() {
+        for (json, mode) in [
+            ("\"whole-gpu\"", GpuSharing::WholeGpu),
+            ("\"mig\"", GpuSharing::Mig),
+            ("\"time-slice\"", GpuSharing::TimeSlice),
+        ] {
+            assert_eq!(serde_json::from_str::<GpuSharing>(json).unwrap(), mode);
+        }
+        // The safe default is whole-GPU.
+        assert_eq!(GpuSharing::default(), GpuSharing::WholeGpu);
+        // Unknown modes are rejected at parse time, never silently coerced.
+        assert!(serde_json::from_str::<GpuSharing>("\"timeslice\"").is_err());
+        assert!(serde_json::from_str::<GpuSharing>("\"shared\"").is_err());
     }
 
     #[test]

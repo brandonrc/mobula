@@ -481,7 +481,7 @@ fn build_app_full_svc_inner(
         let policy = Arc::new(policy);
         app = app
             .merge(clusters::router(store.clone(), policy.clone()))
-            .merge(pools::router(store.clone()))
+            .merge(pools::router(store.clone(), policy.clone()))
             .merge(usage::router(store.clone(), policy.clone()))
             .merge(settings::router(store.clone(), policy))
             .merge(metrics::router(

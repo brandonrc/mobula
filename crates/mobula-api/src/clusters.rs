@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use mobula_auth::{Identity, PermissionType, Target};
+use mobula_auth::{Identity, PermissionType, Role, Target};
 use mobula_controller::{now_unix, DesiredState, Store};
 use mobula_core::{AuditDecision, AuditEvent, ClusterId, ClusterSpec};
 use serde::{Deserialize, Serialize};
@@ -35,10 +35,19 @@ use mobula_auth::AssignmentSource;
 /// effective policy lives in the store and is read per request via
 /// [`crate::settings::effective_policy`]; this value is consulted only
 /// until the store holds a policy row (api-v1.md §5.16 precedence).
+///
+/// `gpu_default_sharing` (#58) is different: it is boot-time config only,
+/// never seeded into the store — the per-pool `gpu_sharing` knob (set via
+/// the pools API) is the tenant-visible override, and this is just the
+/// platform-wide fallback when a pool spec leaves it unset.
 #[derive(Clone, Default)]
 pub struct PolicyConfig {
     pub prices: Option<PriceSheet>,
     pub quotas: HashMap<String, ResourceMap>,
+    /// Platform default GPU sharing mode for pools without an explicit
+    /// `gpu_sharing` (`[gpu] default_sharing` in the policy file;
+    /// `whole-gpu` when unconfigured).
+    pub gpu_default_sharing: mobula_core::GpuSharing,
 }
 
 #[derive(Clone)]
@@ -133,6 +142,42 @@ fn store_err(e: mobula_controller::StoreError) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
 }
 
+/// Read-scoping (ADR-0009 addendum, #49 read side): resolve the caller's
+/// role assignments and, when any are project-scoped, the projects their
+/// cluster visibility is narrowed to. `None` projects = unrestricted
+/// visibility (dev mode, global admin, or no project-scoped assignments).
+///
+/// Edge case, pinned down: a caller holding BOTH a global role
+/// (group-derived or a `"*"` assignment) AND project-scoped assignments is
+/// narrowed to the scoped projects — the presence of a scoped binding
+/// defines the projects they operate in, so reads follow it. Only a global
+/// Admin role is exempt and always sees every cluster.
+async fn read_scope(
+    store: &Arc<dyn Store>,
+    id: Option<&Identity>,
+) -> (Vec<(Role, String)>, Option<Vec<String>>) {
+    match id {
+        None => (Vec::new(), None),
+        // Global admin always sees all, scoped assignments or not.
+        Some(i) if i.roles.contains(&Role::Admin) => (Vec::new(), None),
+        Some(i) => {
+            let assignments = StoreAssignments(store.as_ref())
+                .assignments_for(&i.subject)
+                .await;
+            let projects: Vec<String> = assignments
+                .iter()
+                .filter_map(|(_, scope)| scope.strip_prefix("project:").map(String::from))
+                .collect();
+            let narrowed = if projects.is_empty() {
+                None
+            } else {
+                Some(projects)
+            };
+            (assignments, narrowed)
+        }
+    }
+}
+
 #[utoipa::path(
     get, path = "/api/v1/clusters", tag = "clusters",
     responses((status = 200, description = "All managed clusters", body = [ClusterView]),
@@ -144,22 +189,18 @@ async fn list_clusters(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
 ) -> Response {
-    // Scoped RBAC (#49): the global `Read` on Cluster gets the full list
-    // (fast path, unchanged). A caller without it — e.g. an operator scoped
-    // to `project:ml-team` — gets the list filtered to the projects their
-    // assignments cover. Additive-only: nothing is ever hidden from someone
-    // the flat model would have shown it to.
+    // Scoped RBAC (#49) + read-scoping (ADR-0009 addendum): a caller with
+    // any project-scoped assignment only SEES those projects' clusters —
+    // even when a global role would otherwise grant cluster Read. Callers
+    // without project-scoped assignments are unchanged: global `Read` gets
+    // the full list; a caller with assignments but no global `Read` gets
+    // the `permits_scoped`-filtered list; no roles and no assignments is
+    // exactly today's flat-model denial, audit row included.
     let id = ident(&identity);
-    let scoped_assignments = match id {
-        None => None,
-        Some(i) if i.permits(PermissionType::Read, Target::Cluster) => None,
-        Some(i) => {
-            let assignments = StoreAssignments(st.store.as_ref())
-                .assignments_for(&i.subject)
-                .await;
-            if assignments.is_empty() {
-                // No global role and no assignments at all: exactly today's
-                // flat-model denial, audit row included.
+    let (assignments, narrowed) = read_scope(&st.store, id).await;
+    if narrowed.is_none() {
+        if let Some(i) = id {
+            if !i.permits(PermissionType::Read, Target::Cluster) && assignments.is_empty() {
                 if let Some(deny) = authorize(
                     Some(&st.store),
                     Some(i),
@@ -171,9 +212,8 @@ async fn list_clusters(
                     return deny;
                 }
             }
-            Some(assignments)
         }
-    };
+    }
     match st.store.list().await {
         Ok(clusters) => {
             // Effective policy is store-backed and read per request, so
@@ -185,14 +225,16 @@ async fn list_clusters(
             let prices = policy.prices.as_ref();
             let views: Vec<_> = clusters
                 .into_iter()
-                .filter(|c| match (&scoped_assignments, id) {
-                    (Some(assignments), Some(i)) => i.permits_scoped(
+                .filter(|c| match (&narrowed, id) {
+                    // Read-scoped caller: project membership decides.
+                    (Some(projects), _) => projects.contains(&c.spec.project),
+                    (None, Some(i)) => i.permits_scoped(
                         PermissionType::Read,
                         Target::Cluster,
-                        assignments,
+                        &assignments,
                         &c.spec.project,
                     ),
-                    _ => true,
+                    (None, None) => true,
                 })
                 .map(|c| ClusterView::from_stored(c, prices))
                 .collect();
@@ -216,10 +258,16 @@ async fn get_cluster(
     identity: Option<Extension<Identity>>,
     Path(id): Path<String>,
 ) -> Response {
-    // Scoped RBAC (#49): fetch first — the check needs the cluster's
-    // project — then require Read on Cluster scoped to that project.
+    // Scoped RBAC (#49) + read-scoping: fetch first — the checks need the
+    // cluster's project. A caller narrowed by project-scoped assignments
+    // gets 404 (not 403) for an out-of-scope cluster: the list hides it,
+    // so the by-name read must not leak its existence either.
     match st.store.get(&ClusterId(id)).await {
         Ok(Some(c)) => {
+            let (_, narrowed) = read_scope(&st.store, ident(&identity)).await;
+            if narrowed.is_some_and(|projects| !projects.contains(&c.spec.project)) {
+                return (StatusCode::NOT_FOUND, "no such cluster").into_response();
+            }
             if let Some(deny) = authorize_scoped(
                 Some(&st.store),
                 ident(&identity),
@@ -247,7 +295,7 @@ async fn get_cluster(
     request_body = CreateCluster,
     responses(
         (status = 201, description = "Desired state recorded; reconciler will converge"),
-        (status = 400, description = "Invalid spec (bad quantity, min>max)"),
+        (status = 400, description = "Invalid spec (bad quantity, min>max), or GPU tenant-isolation violation (fractional GPU in a multi-tenant pool)"),
         (status = 401, description = "No/invalid token"),
         (status = 403, description = "Missing Write on cluster (Operator/Admin only)"),
         (status = 409, description = "Project quota exceeded"),
@@ -286,6 +334,53 @@ async fn create_cluster(
         Ok(p) => p.map(|p| config_from_stored(&p)).unwrap_or_default(),
         Err(e) => return store_err(e),
     };
+
+    // GPU tenant-isolation admission (#58): when the project's pool is
+    // shared by more than one project, fractional GPU requests are rejected
+    // (SM-level time-slicing has no hardware isolation across tenants), as
+    // is admission into any pool resolving to time-slice. Tenancy = the
+    // pool's allocations (keyed (pool, project), so len = distinct
+    // projects). Queue-free projects (no allocation) are unaffected. The
+    // platform default is the boot-time `[gpu] default_sharing`, not the
+    // store-backed policy (see PolicyConfig docs).
+    {
+        let pools = match st.store.list_pools().await {
+            Ok(p) => p,
+            Err(e) => return store_err(e),
+        };
+        for p in &pools {
+            let allocs = match st.store.list_allocations(&p.name).await {
+                Ok(a) => a,
+                Err(e) => return store_err(e),
+            };
+            if !allocs.iter().any(|a| a.project == project) {
+                continue;
+            }
+            if let Err(v) = mobula_policy::gpu::check_cluster_gpu_isolation(
+                &p.spec,
+                st.policy.gpu_default_sharing,
+                allocs.len(),
+                &body.spec,
+            ) {
+                emit(
+                    Some(&st.store),
+                    AuditEvent {
+                        ts: now_unix(),
+                        subject: ident(&identity).map(|i| i.subject.clone()),
+                        decision: AuditDecision::Deny,
+                        reason: Some("gpu_tenant_isolation".into()),
+                        action: Some("create_cluster".into()),
+                        cluster: Some(id.to_string()),
+                        status: Some(StatusCode::BAD_REQUEST.as_u16()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                return (StatusCode::BAD_REQUEST, v.to_string()).into_response();
+            }
+            break;
+        }
+    }
     // When a quota applies, serialize concurrent same-project creates by
     // holding a per-project lock across the whole read-check-write section
     // (list -> admit -> upsert) so the TOCTOU window can't over-admit (#44).

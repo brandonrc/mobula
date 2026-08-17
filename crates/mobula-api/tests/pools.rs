@@ -615,6 +615,7 @@ fn pool_spec_typed(name: &str) -> mobula_core::PoolSpec {
         cohort: "research".into(),
         fair_sharing_weight: 1.0,
         elastic: true,
+        gpu_sharing: None,
     }
 }
 
@@ -770,4 +771,201 @@ async fn unparsable_stored_observation_is_treated_as_unobserved() {
     assert_eq!(v["utilization"]["cpu"]["nominal"], 64.0);
     assert_eq!(v["utilization"]["cpu"]["pct"], 0.0);
     assert!(v["projects"].as_object().unwrap().is_empty());
+}
+
+/// #58: a pool spec may set `gpu_sharing`; the value round-trips through
+/// the API and an unknown mode is rejected at deserialization.
+#[tokio::test]
+async fn gpu_sharing_field_round_trips_and_validates() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_store(&idp, store).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let mut body = pool_body("ts-pool");
+    body["spec"]["gpu_sharing"] = serde_json::json!("time-slice");
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/pools",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/api/v1/pools/ts-pool",
+            "mobula.example.com",
+            Some(&admin),
+        ))
+        .await
+        .unwrap();
+    let v = body_json(res).await;
+    assert_eq!(v["gpu_sharing"], "time-slice");
+
+    // A pool without the field reports null (platform default applies).
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/pools",
+            "mobula.example.com",
+            &admin,
+            pool_body("plain-pool"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/api/v1/pools/plain-pool",
+            "mobula.example.com",
+            Some(&admin),
+        ))
+        .await
+        .unwrap();
+    let v = body_json(res).await;
+    assert_eq!(v["gpu_sharing"], serde_json::Value::Null);
+
+    // Unknown modes never parse.
+    let mut bad = pool_body("bad-mode");
+    bad["spec"]["gpu_sharing"] = serde_json::json!("shared");
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/pools",
+            "mobula.example.com",
+            &admin,
+            bad,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// #58: a time-slice pool may serve ONE project; the allocation that would
+/// make it multi-tenant is rejected with the tenant-isolation reason.
+#[tokio::test]
+async fn time_slice_pool_rejects_second_tenant() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_store(&idp, store).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let mut body = pool_body("ts-pool");
+    body["spec"]["gpu_sharing"] = serde_json::json!("time-slice");
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/pools",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // First tenant: fine (single-tenant opt-in).
+    let res = app
+        .clone()
+        .oneshot(put_json(
+            "/api/v1/pools/ts-pool/allocations/proj-a",
+            "mobula.example.com",
+            &admin,
+            alloc_body("proj-a"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Re-PUT of the same tenant is not a second tenant.
+    let res = app
+        .clone()
+        .oneshot(put_json(
+            "/api/v1/pools/ts-pool/allocations/proj-a",
+            "mobula.example.com",
+            &admin,
+            alloc_body("proj-a"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Second tenant: rejected, naming tenant isolation.
+    let res = app
+        .oneshot(put_json(
+            "/api/v1/pools/ts-pool/allocations/proj-b",
+            "mobula.example.com",
+            &admin,
+            alloc_body("proj-b"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("tenant isolation"),
+        "error names the tenant-isolation reason: {text}"
+    );
+}
+
+/// #58: mig (and the whole-gpu default) pools share freely across tenants.
+#[tokio::test]
+async fn mig_and_default_pools_allow_multiple_tenants() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_store(&idp, store).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    for (name, mode) in [("mig-pool", "mig"), ("whole-pool", "whole-gpu")] {
+        let mut body = pool_body(name);
+        body["spec"]["gpu_sharing"] = serde_json::json!(mode);
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/pools",
+                "mobula.example.com",
+                &admin,
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+    // No gpu_sharing at all → platform default (whole-gpu) applies.
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/pools",
+            "mobula.example.com",
+            &admin,
+            pool_body("default-pool"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    for pool in ["mig-pool", "whole-pool", "default-pool"] {
+        for project in ["proj-a", "proj-b"] {
+            let res = app
+                .clone()
+                .oneshot(put_json(
+                    &format!("/api/v1/pools/{pool}/allocations/{project}"),
+                    "mobula.example.com",
+                    &admin,
+                    alloc_body(project),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{pool}/{project}");
+        }
+    }
 }

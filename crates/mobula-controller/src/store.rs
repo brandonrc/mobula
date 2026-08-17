@@ -879,6 +879,7 @@ mod tests {
             cohort: "research".into(),
             fair_sharing_weight: 1.0,
             elastic,
+            gpu_sharing: None,
         };
         let alloc = |pool: &str, project: &str| AllocationSpec {
             pool: pool.into(),

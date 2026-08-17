@@ -20,13 +20,24 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use mobula_auth::{Identity, PermissionType, Target};
 use mobula_controller::{now_unix, Store, StoreError, StoredPool};
-use mobula_core::{AllocationSpec, AuditDecision, AuditEvent, FlavorSpec, PoolSpec};
+use mobula_core::{AllocationSpec, AuditDecision, AuditEvent, FlavorSpec, GpuSharing, PoolSpec};
 use mobula_provision::PoolObservation;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::audit::emit;
 use crate::auth_layer::authorize;
+use crate::clusters::PolicyConfig;
+
+/// Pool API state: the store, plus the boot-time policy seed — only its
+/// `gpu_default_sharing` is consulted here (#58), as the platform fallback
+/// for pool specs that leave `gpu_sharing` unset. Quota/price governance
+/// is store-backed (see `crate::settings`); this knob is boot-time only.
+#[derive(Clone)]
+pub struct PoolApiState {
+    pub store: Arc<dyn Store>,
+    pub policy: Arc<PolicyConfig>,
+}
 
 fn ident(ext: &Option<Extension<Identity>>) -> Option<&Identity> {
     ext.as_ref().map(|e| &e.0)
@@ -55,6 +66,9 @@ pub struct PoolView {
     pub cohort: String,
     pub fair_sharing_weight: f64,
     pub elastic: bool,
+    /// The pool's GPU sharing mode (#58); `null` = the platform default
+    /// (`[gpu] default_sharing`, itself defaulting to `whole-gpu`).
+    pub gpu_sharing: Option<GpuSharing>,
     /// Resource key → summed nominal quota across flavors, as a string.
     /// A resource key whose quantity fails to parse on ANY flavor is
     /// omitted entirely (a partial sum would misreport capacity); the
@@ -106,6 +120,7 @@ impl PoolView {
             cohort: p.spec.cohort,
             fair_sharing_weight: p.spec.fair_sharing_weight,
             elastic: p.spec.elastic,
+            gpu_sharing: p.spec.gpu_sharing,
             total_nominal,
         }
     }
@@ -144,11 +159,11 @@ pub struct PutAllocation {
     security(("bearer" = []))
 )]
 async fn list_pools(
-    State(st): State<Arc<dyn Store>>,
+    State(st): State<PoolApiState>,
     identity: Option<Extension<Identity>>,
 ) -> Response {
     if let Some(deny) = authorize(
-        Some(&st),
+        Some(&st.store),
         ident(&identity),
         PermissionType::Read,
         Target::Pool,
@@ -157,7 +172,7 @@ async fn list_pools(
     {
         return deny;
     }
-    match st.list_pools().await {
+    match st.store.list_pools().await {
         Ok(pools) => Json(
             pools
                 .into_iter()
@@ -182,12 +197,12 @@ async fn list_pools(
     security(("bearer" = []))
 )]
 async fn create_pool(
-    State(st): State<Arc<dyn Store>>,
+    State(st): State<PoolApiState>,
     identity: Option<Extension<Identity>>,
     Json(body): Json<CreatePool>,
 ) -> Response {
     if let Some(deny) = authorize(
-        Some(&st),
+        Some(&st.store),
         ident(&identity),
         PermissionType::Write,
         Target::Pool,
@@ -204,19 +219,19 @@ async fn create_pool(
     }
     let name = body.spec.name.clone();
     // Create-only in v0: upsert-with-bump is for updates via a later PATCH.
-    match st.get_pool(&name).await {
+    match st.store.get_pool(&name).await {
         Ok(Some(_)) => {
             return (StatusCode::CONFLICT, format!("pool {name} already exists")).into_response()
         }
         Ok(None) => {}
         Err(e) => return store_err(e),
     }
-    match st.upsert_pool(&name, body.spec).await {
+    match st.store.upsert_pool(&name, body.spec).await {
         Ok(generation) => {
             // The pool name isn't an AuditEvent field (api-v1.md §5.9);
             // the action string carries the pool scope.
             emit(
-                Some(&st),
+                Some(&st.store),
                 AuditEvent {
                     ts: now_unix(),
                     subject: ident(&identity).map(|i| i.subject.clone()),
@@ -247,12 +262,12 @@ async fn create_pool(
     security(("bearer" = []))
 )]
 async fn get_pool(
-    State(st): State<Arc<dyn Store>>,
+    State(st): State<PoolApiState>,
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
     if let Some(deny) = authorize(
-        Some(&st),
+        Some(&st.store),
         ident(&identity),
         PermissionType::Read,
         Target::Pool,
@@ -261,7 +276,7 @@ async fn get_pool(
     {
         return deny;
     }
-    match st.get_pool(&name).await {
+    match st.store.get_pool(&name).await {
         Ok(Some(p)) => Json(PoolView::from_stored(p)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such pool").into_response(),
         Err(e) => store_err(e),
@@ -278,12 +293,12 @@ async fn get_pool(
     security(("bearer" = []))
 )]
 async fn delete_pool(
-    State(st): State<Arc<dyn Store>>,
+    State(st): State<PoolApiState>,
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
     if let Some(deny) = authorize(
-        Some(&st),
+        Some(&st.store),
         ident(&identity),
         PermissionType::Delete,
         Target::Pool,
@@ -292,10 +307,10 @@ async fn delete_pool(
     {
         return deny;
     }
-    match st.delete_pool(&name).await {
+    match st.store.delete_pool(&name).await {
         Ok(()) => {
             emit(
-                Some(&st),
+                Some(&st.store),
                 AuditEvent {
                     ts: now_unix(),
                     subject: ident(&identity).map(|i| i.subject.clone()),
@@ -326,7 +341,7 @@ async fn delete_pool(
     request_body = PutAllocation,
     responses(
         (status = 200, description = "Allocation recorded"),
-        (status = 400, description = "Invalid allocation, or body pool/project mismatches the path"),
+        (status = 400, description = "Invalid allocation, body pool/project mismatches the path, or GPU tenant-isolation violation (time-slice pool shared by >1 project)"),
         (status = 401, description = "No/invalid token"),
         (status = 403, description = "Missing Write on pool (Admin only)"),
         (status = 404, description = "No such pool"),
@@ -334,13 +349,13 @@ async fn delete_pool(
     security(("bearer" = []))
 )]
 async fn put_allocation(
-    State(st): State<Arc<dyn Store>>,
+    State(st): State<PoolApiState>,
     identity: Option<Extension<Identity>>,
     Path((name, project)): Path<(String, String)>,
     Json(body): Json<PutAllocation>,
 ) -> Response {
     if let Some(deny) = authorize(
-        Some(&st),
+        Some(&st.store),
         ident(&identity),
         PermissionType::Write,
         Target::Pool,
@@ -359,11 +374,11 @@ async fn put_allocation(
         )
             .into_response();
     }
-    match st.get_pool(&name).await {
-        Ok(Some(_)) => {}
+    let pool = match st.store.get_pool(&name).await {
+        Ok(Some(p)) => p,
         Ok(None) => return (StatusCode::NOT_FOUND, "no such pool").into_response(),
         Err(e) => return store_err(e),
-    }
+    };
     let alloc = AllocationSpec {
         pool: name.clone(),
         project: project.clone(),
@@ -375,10 +390,45 @@ async fn put_allocation(
     if let Err(e) = alloc.validate() {
         return (StatusCode::BAD_REQUEST, format!("invalid allocation: {e}")).into_response();
     }
-    match st.upsert_allocation(alloc).await {
+    // GPU tenant isolation (#58): this upsert must not leave a pool
+    // resolving to time-slice shared by more than one project. Tenants =
+    // distinct allocation projects after the upsert (allocations are keyed
+    // (pool, project), so the set union is exact — a re-PUT of an existing
+    // allocation doesn't double-count).
+    let existing = match st.store.list_allocations(&name).await {
+        Ok(a) => a,
+        Err(e) => return store_err(e),
+    };
+    let tenants = existing
+        .iter()
+        .map(|a| a.project.clone())
+        .chain(std::iter::once(project.clone()))
+        .collect::<BTreeSet<_>>()
+        .len();
+    if let Err(v) = mobula_policy::gpu::check_pool_gpu_isolation(
+        &pool.spec,
+        st.policy.gpu_default_sharing,
+        tenants,
+    ) {
+        emit(
+            Some(&st.store),
+            AuditEvent {
+                ts: now_unix(),
+                subject: ident(&identity).map(|i| i.subject.clone()),
+                decision: AuditDecision::Deny,
+                reason: Some("gpu_tenant_isolation".into()),
+                action: Some("put_allocation".into()),
+                status: Some(StatusCode::BAD_REQUEST.as_u16()),
+                ..Default::default()
+            },
+        )
+        .await;
+        return (StatusCode::BAD_REQUEST, v.to_string()).into_response();
+    }
+    match st.store.upsert_allocation(alloc).await {
         Ok(()) => {
             emit(
-                Some(&st),
+                Some(&st.store),
                 AuditEvent {
                     ts: now_unix(),
                     subject: ident(&identity).map(|i| i.subject.clone()),
@@ -404,12 +454,12 @@ async fn put_allocation(
     security(("bearer" = []))
 )]
 async fn list_allocations(
-    State(st): State<Arc<dyn Store>>,
+    State(st): State<PoolApiState>,
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
     if let Some(deny) = authorize(
-        Some(&st),
+        Some(&st.store),
         ident(&identity),
         PermissionType::Read,
         Target::Pool,
@@ -418,7 +468,7 @@ async fn list_allocations(
     {
         return deny;
     }
-    match st.list_allocations(&name).await {
+    match st.store.list_allocations(&name).await {
         Ok(allocs) => Json(allocs).into_response(),
         Err(e) => store_err(e),
     }
@@ -437,12 +487,12 @@ async fn list_allocations(
     security(("bearer" = []))
 )]
 async fn delete_allocation(
-    State(st): State<Arc<dyn Store>>,
+    State(st): State<PoolApiState>,
     identity: Option<Extension<Identity>>,
     Path((name, project)): Path<(String, String)>,
 ) -> Response {
     if let Some(deny) = authorize(
-        Some(&st),
+        Some(&st.store),
         ident(&identity),
         PermissionType::Delete,
         Target::Pool,
@@ -451,10 +501,10 @@ async fn delete_allocation(
     {
         return deny;
     }
-    match st.delete_allocation(&name, &project).await {
+    match st.store.delete_allocation(&name, &project).await {
         Ok(()) => {
             emit(
-                Some(&st),
+                Some(&st.store),
                 AuditEvent {
                     ts: now_unix(),
                     subject: ident(&identity).map(|i| i.subject.clone()),
@@ -531,12 +581,12 @@ fn sum_quantities(
     security(("bearer" = []))
 )]
 async fn pool_usage(
-    State(st): State<Arc<dyn Store>>,
+    State(st): State<PoolApiState>,
     identity: Option<Extension<Identity>>,
     Path(name): Path<String>,
 ) -> Response {
     if let Some(deny) = authorize(
-        Some(&st),
+        Some(&st.store),
         ident(&identity),
         PermissionType::Read,
         Target::Pool,
@@ -545,7 +595,7 @@ async fn pool_usage(
     {
         return deny;
     }
-    let p = match st.get_pool(&name).await {
+    let p = match st.store.get_pool(&name).await {
         Ok(Some(p)) => p,
         Ok(None) => return (StatusCode::NOT_FOUND, "no such pool").into_response(),
         Err(e) => return store_err(e),
@@ -623,7 +673,7 @@ async fn pool_usage(
     .into_response()
 }
 
-pub fn router(store: Arc<dyn Store>) -> Router {
+pub fn router(store: Arc<dyn Store>, policy: Arc<PolicyConfig>) -> Router {
     Router::new()
         .route("/api/v1/pools", get(list_pools).post(create_pool))
         .route("/api/v1/pools/{name}", get(get_pool).delete(delete_pool))
@@ -633,5 +683,5 @@ pub fn router(store: Arc<dyn Store>) -> Router {
             "/api/v1/pools/{name}/allocations/{project}",
             axum::routing::put(put_allocation).delete(delete_allocation),
         )
-        .with_state(store)
+        .with_state(PoolApiState { store, policy })
 }

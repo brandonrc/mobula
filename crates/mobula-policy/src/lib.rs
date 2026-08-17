@@ -11,6 +11,7 @@
 //! the old `mem_gib` semantics under the K8s resource name), and
 //! `nvidia.com/gpu` (devices).
 
+pub mod gpu;
 pub mod quantity;
 pub mod usage;
 

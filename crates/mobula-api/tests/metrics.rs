@@ -372,6 +372,7 @@ async fn control_plane_gauges_reflect_seeded_store_state() {
                 cohort: "research".into(),
                 fair_sharing_weight: 1.0,
                 elastic: true,
+                gpu_sharing: None,
             },
         )
         .await

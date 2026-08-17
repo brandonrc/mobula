@@ -337,6 +337,7 @@ async fn quota_admission_rejects_over_limit_with_409() {
     let policy = PolicyConfig {
         prices: None,
         quotas,
+        gpu_default_sharing: Default::default(),
     };
     let app = authed_app_with_policy(&idp, store, policy).await;
     let admin = idp_token(&idp, &["/platform-admins"]);
@@ -391,6 +392,7 @@ async fn concurrent_creates_cannot_over_admit_quota() {
     let policy = PolicyConfig {
         prices: None,
         quotas,
+        gpu_default_sharing: Default::default(),
     };
     let app = authed_app_with_policy(&idp, store, policy).await;
     let admin = idp_token(&idp, &["/platform-admins"]);
@@ -578,6 +580,7 @@ async fn create_with_pool_allocation_assigns_queue() {
                 cohort: "research".into(),
                 fair_sharing_weight: 1.0,
                 elastic: true,
+                gpu_sharing: None,
             },
         )
         .await
@@ -875,6 +878,7 @@ async fn queue_assigned_cluster_rejects_suspend_and_resume() {
                 cohort: "research".into(),
                 fair_sharing_weight: 1.0,
                 elastic: false,
+                gpu_sharing: None,
             },
         )
         .await
@@ -1093,4 +1097,291 @@ async fn scoped_assignments_gate_cluster_lifecycle_per_project() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN, "role-less get");
+}
+
+/// Read-scoping (ADR-0009 addendum): a caller whose access derives from
+/// project-scoped assignments only SEES those projects' clusters — the
+/// list is filtered and an out-of-scope get-by-name is 404 — even while
+/// also holding a global role (the both-global-and-scoped edge case:
+/// scoped presence narrows visibility). Global admin and assignment-less
+/// viewers are unaffected.
+#[tokio::test]
+async fn scoped_assignments_narrow_cluster_read_visibility() {
+    use common::idp_token_sub;
+
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    // alice: global viewer via group mapping + operator scoped to ml-team.
+    store
+        .upsert_role_assignment("alice", "operator", "project:ml-team")
+        .await
+        .unwrap();
+    let app = authed_app_with_store(&idp, store.clone()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    for (id, project) in [
+        ("vision-train", "ml-team"),
+        ("alice-ml", "ml-team"),
+        ("genai", "genai"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/clusters",
+                "mobula.test",
+                &admin,
+                create_body_in(id, project),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED, "seed {id}");
+    }
+
+    async fn list_ids(app: &axum::Router, token: &str) -> Vec<String> {
+        let res = app
+            .clone()
+            .oneshot(get("/api/v1/clusters", "mobula.test", Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut ids: Vec<String> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    // alice is narrowed to her scoped project despite the global viewer role.
+    let alice = idp_token_sub(&idp, "alice", &["/observers"]);
+    assert_eq!(
+        list_ids(&app, &alice).await,
+        ["alice-ml", "vision-train"],
+        "scoped list hides foreign projects"
+    );
+
+    // Get-by-name: in-scope reads fine; out-of-scope is 404, not 403 —
+    // existence must not leak.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/api/v1/clusters/vision-train",
+            "mobula.test",
+            Some(&alice),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "in-scope get");
+    let res = app
+        .clone()
+        .oneshot(get("/api/v1/clusters/genai", "mobula.test", Some(&alice)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "out-of-scope get 404");
+
+    // Global admin still sees everything, list and by-name.
+    assert_eq!(
+        list_ids(&app, &admin).await,
+        ["alice-ml", "genai", "vision-train"],
+        "admin list unfiltered"
+    );
+    let res = app
+        .clone()
+        .oneshot(get("/api/v1/clusters/genai", "mobula.test", Some(&admin)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "admin get");
+
+    // A global viewer with NO assignments is unaffected too.
+    let viewer = idp_token_sub(&idp, "view-1", &["/observers"]);
+    assert_eq!(
+        list_ids(&app, &viewer).await,
+        ["alice-ml", "genai", "vision-train"],
+        "assignment-less viewer list unfiltered"
+    );
+}
+
+/// #58 helpers: a GPU pool with the given sharing mode plus one allocation
+/// per project, seeded straight into the store (the pools API is covered
+/// separately in tests/pools.rs).
+async fn seed_gpu_pool(
+    store: &InMemoryStore,
+    mode: Option<mobula_core::GpuSharing>,
+    projects: &[&str],
+) {
+    use mobula_core::{AllocationSpec, FlavorSpec, PoolSpec};
+    use std::collections::BTreeMap;
+    store
+        .upsert_pool(
+            "gpu",
+            PoolSpec {
+                name: "gpu".into(),
+                flavors: vec![FlavorSpec {
+                    name: "a100".into(),
+                    resources: BTreeMap::from([("nvidia.com/gpu".to_string(), "8".to_string())]),
+                    node_labels: BTreeMap::new(),
+                    taints: vec![],
+                }],
+                cohort: "research".into(),
+                fair_sharing_weight: 1.0,
+                elastic: false,
+                gpu_sharing: mode,
+            },
+        )
+        .await
+        .unwrap();
+    for project in projects {
+        store
+            .upsert_allocation(AllocationSpec {
+                pool: "gpu".into(),
+                project: project.to_string(),
+                namespace: project.to_string(),
+                nominal: BTreeMap::new(),
+                borrowing_limit: BTreeMap::new(),
+                lending_limit: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+    }
+}
+
+/// A create body whose single worker group requests `gpu` GPUs.
+fn create_body_gpu(id: &str, project: &str, gpu: &str) -> serde_json::Value {
+    let mut b = create_body_in(id, project);
+    b["spec"]["worker_groups"] = serde_json::json!([{
+        "name": "w", "cpu": "2", "memory": "4Gi", "gpu": gpu,
+        "min_replicas": 1, "max_replicas": 1, "replicas": 1
+    }]);
+    b
+}
+
+/// #58: a fractional GPU request is device-plugin time-slicing — rejected
+/// with the tenant-isolation reason when the project's pool is shared by
+/// more than one project; whole-GPU requests admit.
+#[tokio::test]
+async fn fractional_gpu_rejected_in_multi_tenant_pool() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    seed_gpu_pool(&store, None, &["proj-a", "proj-b"]).await;
+    let app = authed_app_with_store(&idp, store).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_gpu("frac", "proj-a", "0.5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("tenant isolation"),
+        "error names the tenant-isolation reason: {text}"
+    );
+
+    // Whole GPUs are fine cross-tenant.
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_gpu("whole", "proj-a", "2"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+}
+
+/// #58: single-tenant pools may time-slice — fractional requests admit,
+/// whether the pool opts in explicitly or not.
+#[tokio::test]
+async fn fractional_gpu_allowed_in_single_tenant_pool() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    seed_gpu_pool(
+        &store,
+        Some(mobula_core::GpuSharing::TimeSlice),
+        &["proj-a"],
+    )
+    .await;
+    let app = authed_app_with_store(&idp, store).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_gpu("frac", "proj-a", "0.5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+}
+
+/// #58: a project with no pool allocation is queue-free and unaffected.
+#[tokio::test]
+async fn fractional_gpu_allowed_without_pool_allocation() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    seed_gpu_pool(&store, None, &["proj-a", "proj-b"]).await;
+    let app = authed_app_with_store(&idp, store).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_gpu("frac", "unallocated", "0.5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+}
+
+/// #58: a multi-tenant time-slice pool is unreachable through the
+/// validated API, but a pre-existing stored pool must fail closed — no
+/// cluster admits into it at all.
+#[tokio::test]
+async fn noncompliant_multi_tenant_pool_admits_nothing() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    seed_gpu_pool(
+        &store,
+        Some(mobula_core::GpuSharing::TimeSlice),
+        &["proj-a", "proj-b"],
+    )
+    .await;
+    let app = authed_app_with_store(&idp, store).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_gpu("whole", "proj-a", "1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("tenant isolation"), "{text}");
 }

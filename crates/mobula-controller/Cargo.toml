@@ -11,8 +11,16 @@ rust-version.workspace = true
 # Postgres store backend (ADR-0004: Postgres is truth in prod). Default-on,
 # mirroring mobula-provision's `kuberay`, so CI's plain
 # `cargo clippy --workspace --all-targets` / `cargo test --workspace` compile it.
-default = ["postgres"]
+default = ["postgres", "tls-ring"]
 postgres = ["sqlx/postgres"]
+# Postgres-over-TLS crypto provider (#61): ring by default (pure Rust,
+# UBI9/STIG posture). sqlx pins its rustls provider at compile time
+# (sqlx-core/src/net/tls/tls_rustls.rs) — features are additive and cannot
+# remove `tls-ring`, so FIPS builds must compile this crate with
+# --no-default-features (see ADR-0012 and the `mobula` CLI's `fips` feature).
+tls-ring = ["sqlx/tls-rustls-ring"]
+tls-aws-lc-rs = ["sqlx/tls-rustls-aws-lc-rs"]
+fips = ["mobula-core/fips", "tls-aws-lc-rs"]
 
 [dependencies]
 mobula-core.workspace = true
@@ -21,7 +29,9 @@ mobula-policy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+# `runtime-tokio` only: the TLS provider feature (`tls-ring` /
+# `tls-aws-lc-rs`) is selected above so FIPS builds can swap it.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
@@ -29,4 +39,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 # The Postgres conformance tests create a per-test schema over sqlx directly.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-ring"] }

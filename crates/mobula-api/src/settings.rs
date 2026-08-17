@@ -71,7 +71,9 @@ fn seed_from_config(cfg: &PolicyConfig) -> Option<StoredPolicy> {
 }
 
 /// Convert a stored row back into the in-flight [`PolicyConfig`] shape the
-/// policy engine (`mobula_policy`) consumes.
+/// policy engine (`mobula_policy`) consumes. The GPU-sharing default (#58)
+/// is boot-time-only config, not part of the stored row — callers that need
+/// it read it from the `--policy` seed, not from here.
 pub(crate) fn config_from_stored(p: &StoredPolicy) -> PolicyConfig {
     PolicyConfig {
         prices: p.prices.clone().map(PriceSheet),
@@ -80,6 +82,7 @@ pub(crate) fn config_from_stored(p: &StoredPolicy) -> PolicyConfig {
             .iter()
             .map(|(k, v)| (k.clone(), ResourceMap(v.clone())))
             .collect(),
+        gpu_default_sharing: Default::default(),
     }
 }
 
@@ -338,6 +341,7 @@ mod tests {
         let seeded = seed_from_config(&PolicyConfig {
             prices: Some(PriceSheet(BTreeMap::from([("cpu".into(), 0.04)]))),
             quotas: Default::default(),
+            gpu_default_sharing: Default::default(),
         })
         .unwrap();
         assert!(seeded.from_file_seed);
@@ -354,6 +358,7 @@ mod tests {
                 "demo".to_string(),
                 ResourceMap(BTreeMap::from([("cpu".to_string(), 5.0)])),
             )]),
+            gpu_default_sharing: Default::default(),
         };
         // First read seeds from the file seed.
         let p = effective_policy(&store, &seed).await.unwrap().unwrap();

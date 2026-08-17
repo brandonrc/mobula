@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod auth;
 pub mod cluster;
+pub mod crypto;
 pub mod job;
 pub mod pool;
 pub mod registry;
@@ -20,8 +21,8 @@ pub use cluster::{
 };
 pub use job::JobRecord;
 pub use pool::{
-    AllocationSpec, AllocationSpecError, FlavorSpec, FlavorSpecError, PoolSpec, PoolSpecError,
-    TaintSpec, TaintSpecError,
+    AllocationSpec, AllocationSpecError, FlavorSpec, FlavorSpecError, GpuSharing, PoolSpec,
+    PoolSpecError, TaintSpec, TaintSpecError,
 };
 pub use registry::{ClusterEndpoint, ClusterRegistry, RegistryError, TokenSourceNote};
 pub use service::{ServiceSpec, UpgradeStrategy};

@@ -7,10 +7,20 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# FIPS 140-3 mode (#61, ADR-0012): rustls on the aws-lc-rs FIPS-validated
+# module, plus the fail-closed startup check in `crypto`. Off by default —
+# default builds keep the pure-Rust ring provider and never link aws-lc-rs.
+fips = ["dep:rustls"]
+
 [dependencies]
 serde.workspace = true
 utoipa.workspace = true
 thiserror.workspace = true
+# Optional: only the `fips` feature pulls rustls, and only to install/verify
+# the aws-lc-rs FIPS provider (crypto.rs). `fips` implies aws-lc-rs with its
+# FIPS module; feature unification puts the whole workspace's rustls on it.
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "fips"], optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

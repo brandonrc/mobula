@@ -11,12 +11,24 @@ rust-version.workspace = true
 name = "mobula"
 path = "src/main.rs"
 
+[features]
+# Default = the pre-#61 feature set, forwarded explicitly because the
+# mobula-controller / mobula-api / mobula-auth edges are
+# default-features = false so that a FIPS build
+# (`--no-default-features --features "fips,postgres"`) can swap sqlx's
+# compile-time-pinned rustls provider for aws-lc-rs (ADR-0012).
+default = ["mobula-controller/postgres", "mobula-controller/tls-ring"]
+postgres = ["mobula-controller/postgres"]
+# FIPS 140-3 mode (#61): rustls on the aws-lc-rs FIPS-validated module and
+# a fail-closed startup check (mobula_core::crypto::enforce_fips_startup).
+fips = ["mobula-core/fips", "mobula-controller/fips", "mobula-provision/fips"]
+
 [dependencies]
-mobula-api.workspace = true
-mobula-controller.workspace = true
+mobula-api = { workspace = true, default-features = false }
+mobula-controller = { workspace = true, default-features = false }
 mobula-provision.workspace = true
 mobula-core.workspace = true
-mobula-auth.workspace = true
+mobula-auth = { workspace = true, default-features = false }
 mobula-policy.workspace = true
 reqwest.workspace = true
 clap.workspace = true

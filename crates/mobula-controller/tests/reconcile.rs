@@ -265,6 +265,7 @@ async fn queue_assignment_flows_from_allocation_to_apply() {
                 cohort: "research".into(),
                 fair_sharing_weight: 1.0,
                 elastic: true,
+                gpu_sharing: None,
             },
         )
         .await
@@ -909,6 +910,7 @@ async fn queued_cluster_is_never_suspended_by_the_engine() {
                 cohort: "research".into(),
                 fair_sharing_weight: 1.0,
                 elastic: true,
+                gpu_sharing: None,
             },
         )
         .await

@@ -18,7 +18,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p mobula-cli && strip target/release/mobula
+# FIPS 140-3 build (#61, ADR-0012), opt-in: --build-arg FIPS=true. aws-lc-rs'
+# FIPS module compiles from C and needs cmake/perl/Go, so the toolchain is
+# installed only on this path — the default image stays minimal and keeps
+# the pure-Rust ring provider.
+ARG FIPS=false
+RUN if [ "$FIPS" = "true" ]; then dnf install -y --nodocs cmake perl golang && dnf clean all; fi
+RUN if [ "$FIPS" = "true" ]; then \
+      cargo build --release -p mobula-cli --no-default-features --features "fips,postgres"; \
+    else \
+      cargo build --release -p mobula-cli; \
+    fi && strip target/release/mobula
 
 ARG BASE_REGISTRY=registry.access.redhat.com
 ARG RUNTIME_IMAGE=ubi9/ubi-micro:latest

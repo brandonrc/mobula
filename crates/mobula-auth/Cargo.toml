@@ -7,9 +7,15 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Forwards mobula-controller's defaults (#61: the Postgres TLS provider is
+# feature-selected there, so this edge is default-features = false to let
+# FIPS builds swap it; see ADR-0012).
+default = ["mobula-controller/postgres", "mobula-controller/tls-ring"]
+
 [dependencies]
 mobula-core.workspace = true
-mobula-controller.workspace = true
+mobula-controller = { workspace = true, default-features = false }
 async-trait.workspace = true
 bcrypt.workspace = true
 jsonwebtoken.workspace = true

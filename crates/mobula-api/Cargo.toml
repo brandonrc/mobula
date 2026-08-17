@@ -9,10 +9,12 @@ rust-version.workspace = true
 
 [dependencies]
 mobula-core.workspace = true
-mobula-controller.workspace = true
+# default-features = false + forwarding in [features] so FIPS builds can
+# swap mobula-controller's Postgres TLS provider (#61, ADR-0012).
+mobula-controller = { workspace = true, default-features = false }
 mobula-provision.workspace = true
 mobula-policy.workspace = true
-mobula-auth.workspace = true
+mobula-auth = { workspace = true, default-features = false }
 axum.workspace = true
 futures.workspace = true
 reqwest.workspace = true
@@ -33,6 +35,8 @@ async-trait.workspace = true
 # bypass the fail-closed guard, so they must never be reachable in a
 # production build (#45); they exist only for tests and embedded fixtures.
 test-util = []
+# Forwards the dependency defaults turned off above (#61).
+default = ["mobula-controller/postgres", "mobula-controller/tls-ring"]
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -12,6 +12,10 @@ default = ["kuberay"]
 # The live Kubernetes client. Pure translation (kuberay::manifest) is always
 # available; this feature adds the kube-rs-backed Provisioner.
 kuberay = ["dep:kube", "dep:k8s-openapi", "dep:tokio", "dep:tracing", "dep:rustls"]
+# FIPS 140-3 mode (#61): install the aws-lc-rs FIPS provider (instead of
+# ring) as rustls' process default from the kube connect paths, matching the
+# startup check in mobula_core::crypto.
+fips = ["mobula-core/fips", "rustls?/fips"]
 
 [dependencies]
 mobula-core.workspace = true

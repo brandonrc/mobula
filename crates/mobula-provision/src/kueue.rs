@@ -217,6 +217,7 @@ mod tests {
             cohort: "research".into(),
             fair_sharing_weight: 2.0,
             elastic: true,
+            gpu_sharing: None,
         }
     }
 

@@ -474,6 +474,7 @@ mod tests {
                 cohort: "c".into(),
                 fair_sharing_weight: 1.0,
                 elastic: false,
+                gpu_sharing: None,
             },
             generation: 1,
             observed_json: None,

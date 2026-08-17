@@ -158,6 +158,15 @@ async fn main() -> std::io::Result<()> {
     };
     init_tracing(audit_log.as_deref())?;
 
+    // FIPS 140-3 (#61, ADR-0012): a `fips` build must run all TLS on the
+    // aws-lc-rs FIPS-validated provider; abort startup (panic) unless it is
+    // confirmed active. Not compiled in non-fips builds — nothing to enforce.
+    #[cfg(feature = "fips")]
+    {
+        mobula_core::crypto::enforce_fips_startup();
+        tracing::info!("FIPS 140-3 mode: rustls on the aws-lc-rs FIPS-validated crypto provider");
+    }
+
     match cli.command {
         Command::Serve {
             bind,
@@ -655,18 +664,28 @@ async fn start_demo<S: mobula_controller::Store + 'static>(
     Ok((concrete, service_provisioner, cluster_provisioner))
 }
 
-/// Parse the `--policy` TOML: `[prices]` resource→$/hour and
-/// `[quotas] project = { resource = amount }` (Phase 4 governance).
+/// Parse the `--policy` TOML: `[prices]` resource→$/hour,
+/// `[quotas] project = { resource = amount }` (Phase 4 governance), and
+/// `[gpu] default_sharing = "whole-gpu" | "mig" | "time-slice"` (#58 — the
+/// platform fallback for pool specs that leave `gpu_sharing` unset;
+/// boot-time only, never seeded into the store).
 fn parse_policy(raw: &str) -> Result<mobula_api::clusters::PolicyConfig, toml::de::Error> {
+    #[derive(serde::Deserialize)]
+    struct GpuSection {
+        #[serde(default)]
+        default_sharing: mobula_core::GpuSharing,
+    }
     #[derive(serde::Deserialize)]
     struct PolicyFile {
         prices: Option<mobula_policy::PriceSheet>,
         quotas: Option<std::collections::HashMap<String, mobula_policy::ResourceMap>>,
+        gpu: Option<GpuSection>,
     }
     let parsed: PolicyFile = toml::from_str(raw)?;
     Ok(mobula_api::clusters::PolicyConfig {
         prices: parsed.prices,
         quotas: parsed.quotas.unwrap_or_default(),
+        gpu_default_sharing: parsed.gpu.map(|g| g.default_sharing).unwrap_or_default(),
     })
 }
 
@@ -1239,8 +1258,21 @@ dev = { cpu = 200, memory = 400, "nvidia.com/gpu" = 8 }
         let prices = cfg.prices.expect("prices parsed");
         assert_eq!(prices.0["nvidia.com/gpu"], 2.50);
         assert_eq!(cfg.quotas["dev"].0["cpu"], 200.0);
+        // No [gpu] section → the safe platform default.
+        assert_eq!(cfg.gpu_default_sharing, mobula_core::GpuSharing::WholeGpu);
         assert!(parse_policy("prices = 'nope'").is_err());
         assert!(parse_policy("").is_ok(), "empty file = no governance");
+    }
+
+    #[test]
+    fn parse_policy_reads_gpu_default_sharing() {
+        let cfg = parse_policy("[gpu]\ndefault_sharing = \"mig\"\n").unwrap();
+        assert_eq!(cfg.gpu_default_sharing, mobula_core::GpuSharing::Mig);
+        // An empty [gpu] section still defaults to whole-gpu.
+        let cfg = parse_policy("[gpu]\n").unwrap();
+        assert_eq!(cfg.gpu_default_sharing, mobula_core::GpuSharing::WholeGpu);
+        // Unknown modes fail at boot, never silently coerce.
+        assert!(parse_policy("[gpu]\ndefault_sharing = \"shared\"\n").is_err());
     }
 
     #[test]

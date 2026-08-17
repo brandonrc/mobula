@@ -45,6 +45,7 @@ fn priced_policy() -> mobula_api::clusters::PolicyConfig {
             ("memory".to_string(), 0.005),
         ]))),
         quotas: HashMap::new(),
+        gpu_default_sharing: Default::default(),
     }
 }
 
@@ -247,6 +248,7 @@ fn pool_spec(name: &str) -> PoolSpec {
         cohort: "research".into(),
         fair_sharing_weight: 1.0,
         elastic: true,
+        gpu_sharing: None,
     }
 }
 

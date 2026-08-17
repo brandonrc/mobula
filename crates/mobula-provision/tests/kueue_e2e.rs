@@ -37,6 +37,7 @@ fn pool() -> PoolSpec {
         cohort: "e2e-cohort".into(),
         fair_sharing_weight: 1.0,
         elastic: false,
+        gpu_sharing: None,
     }
 }
 

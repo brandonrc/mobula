@@ -21,10 +21,13 @@ rust-version = "1.85"
 [workspace.dependencies]
 mobula-core = { path = "crates/mobula-core" }
 mobula-provision = { path = "crates/mobula-provision" }
-mobula-controller = { path = "crates/mobula-controller" }
+# default-features = false here so members can select (and, for FIPS
+# builds, swap) feature sets; each member forwards the old defaults in its
+# own `default` feature, keeping default builds identical (#61, ADR-0012).
+mobula-controller = { path = "crates/mobula-controller", default-features = false }
 mobula-policy = { path = "crates/mobula-policy" }
-mobula-api = { path = "crates/mobula-api" }
-mobula-auth = { path = "crates/mobula-auth" }
+mobula-api = { path = "crates/mobula-api", default-features = false }
+mobula-auth = { path = "crates/mobula-auth", default-features = false }
 mobula-proxy = { path = "crates/mobula-proxy" }
 
 async-trait = "0.1"

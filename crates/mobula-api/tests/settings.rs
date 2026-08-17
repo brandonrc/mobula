@@ -55,6 +55,7 @@ fn seeded_policy() -> PolicyConfig {
                 ("memory".to_string(), 100.0),
             ])),
         )]),
+        gpu_default_sharing: Default::default(),
     }
 }
 
