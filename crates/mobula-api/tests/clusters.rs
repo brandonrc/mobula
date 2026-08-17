@@ -160,6 +160,18 @@ impl Store for SlowListStore {
     async fn record_audit(&self, event: &mobula_core::AuditEvent) -> Result<u64, StoreError> {
         self.inner.record_audit(event).await
     }
+    async fn get_policy(&self) -> Result<Option<mobula_controller::StoredPolicy>, StoreError> {
+        self.inner.get_policy().await
+    }
+    async fn set_policy(&self, policy: &mobula_controller::StoredPolicy) -> Result<(), StoreError> {
+        self.inner.set_policy(policy).await
+    }
+    async fn seed_policy(
+        &self,
+        policy: &mobula_controller::StoredPolicy,
+    ) -> Result<bool, StoreError> {
+        self.inner.seed_policy(policy).await
+    }
     async fn list_audit(
         &self,
         filter: &mobula_core::AuditFilter,

@@ -13,6 +13,7 @@ pub mod local_auth;
 pub mod pools;
 pub mod registry;
 pub mod services;
+pub mod settings;
 pub mod usage;
 
 use std::net::SocketAddr;
@@ -53,6 +54,8 @@ use utoipa_swagger_ui::SwaggerUi;
         pools::delete_allocation,
         usage::usage_report,
         usage::metrics,
+        settings::get_policy,
+        settings::update_policy,
         services::list_services,
         services::get_service,
         services::deploy_service,
@@ -99,6 +102,8 @@ use utoipa_swagger_ui::SwaggerUi;
             pools::PutAllocation,
             usage::UsageReport,
             usage::UsageGroup,
+            settings::PolicyView,
+            settings::UpdatePolicy,
             services::DeployService,
             services::ServiceView,
             registry::RegistryEntryView,
@@ -138,6 +143,13 @@ use utoipa_swagger_ui::SwaggerUi;
          samples. Reads need Read on the cluster target (Viewer+) — \
          consumption reporting is cluster data, not pool topology. Mounted \
          only when a store is configured."),
+        (name = "settings", description = "Governance policy management \
+         (api-v1.md §5.16): the effective price sheet and per-project \
+         quotas. Admin-only. The `--policy` file is the boot-time default; \
+         the store row wins once edited via PUT, and every consumer (quota \
+         admission, cost estimates, usage roll-up) reads the store per \
+         request, so edits apply without a restart. Mounted only when a \
+         store is configured."),
         (name = "registry", description = "The job gateway's routing table \
          (ADR-0002). Admin-only: it is the credential-routing table. Static \
          config today; dynamic registration of managed clusters is a \
@@ -387,7 +399,8 @@ fn build_app_full_svc_inner(
         app = app
             .merge(clusters::router(store.clone(), policy.clone()))
             .merge(pools::router(store.clone()))
-            .merge(usage::router(store.clone(), policy))
+            .merge(usage::router(store.clone(), policy.clone()))
+            .merge(settings::router(store.clone(), policy))
             .merge(audit::router(store));
     }
     if let Some(services) = services {
@@ -433,8 +446,11 @@ pub struct ServeOptions {
     /// (`/api/v1/clusters`) and capacity-pool routes (`/api/v1/pools`) are
     /// mounted. The caller owns the reconcile loop.
     pub store: Option<Arc<dyn mobula_controller::Store>>,
-    /// Cost/quota governance for the cluster routes (Phase 4). Default =
-    /// no cost shown, no quota enforced.
+    /// Cost/quota governance for the cluster routes (Phase 4). This is the
+    /// boot-time SEED: the effective policy is the store's policy row, read
+    /// per request; this value seeds the store on first use when the store
+    /// has no row (api-v1.md §5.16). Default = no cost shown, no quota
+    /// enforced.
     pub policy: clusters::PolicyConfig,
     /// Serve-service provisioner; when present, the `/api/v1/services`
     /// routes are mounted (Phase 4).
@@ -599,6 +615,11 @@ mod tests {
         assert!(doc["paths"]["/api/v1/metrics"]["get"].is_object());
         assert!(doc["components"]["schemas"]["UsageReport"].is_object());
         assert!(doc["components"]["schemas"]["PoolUsageView"].is_object());
+        // The settings/policy contract (Admin-only, api-v1.md §5.16).
+        assert!(doc["paths"]["/api/v1/settings/policy"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/settings/policy"]["put"].is_object());
+        assert!(doc["components"]["schemas"]["PolicyView"].is_object());
+        assert!(doc["components"]["schemas"]["UpdatePolicy"].is_object());
         // The gateway registry contract (Admin-only read).
         assert!(doc["paths"]["/api/v1/registry/clusters"]["get"].is_object());
         assert!(doc["components"]["schemas"]["RegistryEntryView"].is_object());

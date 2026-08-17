@@ -75,6 +75,7 @@ Effective v1 matrix (from `Role::grants`):
 | Pool topology reads (`GET /api/v1/pools…`) | `Read` on `Target::Pool` | Viewer and above |
 | Pool/allocation mutations (`POST`/`DELETE /api/v1/pools…`) | `Write`/`Delete` on `Target::Pool` | Admin only |
 | Registry, audit, access-control surfaces | Admin | Admin only |
+| Settings (governance policy) reads & edits (`/api/v1/settings/policy`) | Admin (classified with `Target::Cluster`) | Admin only |
 
 Pools and allocations are **platform configuration** (capacity topology), not
 app lifecycle — hence Admin-only mutations where clusters are Operator+Admin.
@@ -960,6 +961,47 @@ to the token store.
 - CLI: `mobula login --local --username X --password-stdin`; `mobula logout`
   revokes the PAT server-side before dropping the local credentials file.
 
+### 5.16 Settings — `/api/v1/settings/policy`
+
+Settings page (ui-ux-spec §5.9): view the effective governance policy and
+edit per-project quotas and the price sheet. **Implemented** (2026-08-16,
+`settings.rs`) — Admin-only (§2.2); mounted only when a store is configured.
+
+**Precedence: the `--policy` TOML file is the boot-time DEFAULT; the store
+wins once edited.** The effective policy is a single store row (JSON in the
+`control` KV table). A store with no row is seeded from `--policy`
+(insert-if-absent, so a concurrent edit is never clobbered); that seeded row
+reports `source: "file"` until the first PUT, which rewrites it as
+`"store"`. Every consumer — quota admission in `POST /api/v1/clusters`, the
+`est_*_hourly` fields on `ClusterView`, and the `cost_usd` roll-up in
+`GET /api/v1/usage` — reads the store row per request, so edits take effect
+immediately, with no restart.
+
+- `GET /api/v1/settings/policy` → 200
+  ```json
+  {
+    "prices": { "cpu": 0.048, "memory": 0.005, "nvidia.com/gpu": 2.50 } ,
+    "quotas": { "ml-team": { "cpu": 500, "memory": 1000 } },
+    "source": "file",
+    "editable": true
+  }
+  ```
+  `prices` is `null` when no price sheet is configured; `quotas` is `{}`
+  when no project has a limit. `source` is `"file"` (the untouched
+  `--policy` boot seed), `"store"` (edited via PUT), or `"none"` (no policy
+  configured at all — `prices: null`, `quotas: {}`).
+- `PUT /api/v1/settings/policy` `{ prices?, quotas? }` → 200 with the
+  policy after the update (`source` is now `"store"`). **Section-replace**
+  semantics: a present key replaces that whole section — `prices: null`
+  clears the price sheet, `quotas: {}` clears all quotas; an absent key
+  leaves that section untouched. Prices and quota values must be
+  non-negative finite numbers → 400 with a message naming the key. Every
+  accepted edit emits an `update_policy` audit event (§5.9).
+
+Concurrent PUTs are last-writer-wins (v1; multi-replica compare-and-swap is
+a follow-up, same tracking as the quota-admission transaction note in
+`clusters.rs`).
+
 ## 6. Endpoint × milestone summary
 
 | Endpoint | Milestone | Backs (ui-ux-spec) | Status in code |
@@ -974,6 +1016,7 @@ to the token store.
 | `GET /api/v1/overview` | B | §5.1 | new |
 | `GET /api/v1/audit` | B | §5.7 | **exists** (audit.rs, persisted + CSV) |
 | `GET /api/v1/access/roles` | B | §5.8 | **exists** (access.rs; `mappings: null`/`source: "local"` without OIDC) |
+| `GET`/`PUT /api/v1/settings/policy` | B | §5.9 | **exists** (settings.rs, Admin-only; store-backed, `--policy` is the boot seed) |
 | PKCE auth endpoints | B | §5.10 | UI does SPA-direct PKCE; backend endpoints still new |
 | Local auth (`/api/v1/auth/*`) | B | §5.10 | **exists** (local_auth.rs, ADR-0011; incl. Admin-only user management) |
 | `GET /api/v1/clusters/{id}/nodes` | B/C | §5.4 nodes tab | new |

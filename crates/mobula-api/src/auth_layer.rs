@@ -70,8 +70,8 @@ fn required_permission(method: &Method) -> PermissionType {
 /// but only Read on `Cluster`, and an Operator is the reverse. These prefixes
 /// MUST stay in sync with the router prefixes in `clusters.rs`
 /// (`/api/v1/clusters`), `services.rs` (`/api/v1/services`), `pools.rs`
-/// (`/api/v1/pools`), `registry.rs` (`/api/v1/registry`), and `audit.rs`
-/// (`/api/v1/audit`).
+/// (`/api/v1/pools`), `registry.rs` (`/api/v1/registry`), `audit.rs`
+/// (`/api/v1/audit`), and `settings.rs` (`/api/v1/settings`).
 ///
 /// Matching is on segment boundaries — an exact match or a `<prefix>/…`
 /// child — so `/api/v1/clusters-evil` is NOT a cluster path and falls through
@@ -85,10 +85,15 @@ fn target_for_path(path: &str) -> Target {
         Target::Service
     } else if is_under("/api/v1/pools") {
         Target::Pool
-    } else if is_under("/api/v1/registry") || is_under("/api/v1/audit") {
-        // Registry entries describe cluster routing and the audit trail is
-        // dominated by cluster decisions; both route handlers enforce Admin
-        // themselves — this mapping is for the ext_authz verb check.
+    } else if is_under("/api/v1/registry")
+        || is_under("/api/v1/audit")
+        || is_under("/api/v1/settings")
+    {
+        // Registry entries describe cluster routing, the audit trail is
+        // dominated by cluster decisions, and the governance policy
+        // (settings) drives cluster admission/costs; all three route
+        // handlers enforce Admin themselves — this mapping is for the
+        // ext_authz verb check.
         Target::Cluster
     } else {
         // /api/v1/auth/* falls through to the safe default (Job). Those
@@ -453,6 +458,9 @@ mod tests {
             Target::Pool
         );
         assert_eq!(target_for_path("/api/v1/audit"), Target::Cluster);
+        assert_eq!(target_for_path("/api/v1/settings"), Target::Cluster);
+        assert_eq!(target_for_path("/api/v1/settings/policy"), Target::Cluster);
+        assert_eq!(target_for_path("/api/v1/settings-evil"), Target::Job);
         assert_eq!(target_for_path("/api/jobs/"), Target::Job);
         // Segment boundary, not naive prefix: `clusters-evil` is not clusters.
         assert_eq!(target_for_path("/api/v1/clusters-evil"), Target::Job);

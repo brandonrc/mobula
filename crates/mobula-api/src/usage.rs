@@ -30,10 +30,14 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::auth_layer::authorize;
 use crate::clusters::PolicyConfig;
+use crate::settings::{config_from_stored, effective_policy};
 
 #[derive(Clone)]
 pub struct UsageApiState {
     pub store: Arc<dyn Store>,
+    /// Boot-time policy seed (`--policy` file), NOT the effective policy:
+    /// the cost roll-up loads the effective (store-backed) price sheet per
+    /// request via [`effective_policy`].
     pub policy: Arc<PolicyConfig>,
 }
 
@@ -135,6 +139,12 @@ async fn usage_report(
             .push((s.ts, s.quantity));
     }
 
+    // The effective price sheet is store-backed, read per request, so a
+    // settings edit applies to the very next report.
+    let policy = match effective_policy(&st.store, &st.policy).await {
+        Ok(p) => p.map(|p| config_from_stored(&p)).unwrap_or_default(),
+        Err(e) => return store_err(e),
+    };
     let groups = grouped
         .into_iter()
         .map(|((project, pool), by_resource)| {
@@ -142,7 +152,7 @@ async fn usage_report(
                 .into_iter()
                 .map(|(r, pts)| (r, mobula_policy::usage::resource_hours(&pts, from, to)))
                 .collect();
-            let cost_usd = st.policy.prices.as_ref().map(|sheet| {
+            let cost_usd = policy.prices.as_ref().map(|sheet| {
                 mobula_policy::usage::cost(
                     &ResourceMap(resource_hours.clone().into_iter().collect()),
                     sheet,

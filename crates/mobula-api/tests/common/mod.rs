@@ -206,6 +206,15 @@ pub fn post_json(path: &str, host: &str, token: &str, body: serde_json::Value) -
         .unwrap()
 }
 
+pub fn put_json(path: &str, host: &str, token: &str, body: serde_json::Value) -> Request<Body> {
+    Request::put(path)
+        .header(header::HOST, host)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 /// A `Store` that delegates to `InMemoryStore` but fails the named methods
 /// with an injected backend error — drives the handlers' 500 paths.
 pub struct FailingStore {
@@ -429,6 +438,26 @@ impl mobula_controller::Store for FailingStore {
     ) -> Result<u64, mobula_controller::StoreError> {
         self.check("record_audit")?;
         self.inner.record_audit(event).await
+    }
+    async fn get_policy(
+        &self,
+    ) -> Result<Option<mobula_controller::StoredPolicy>, mobula_controller::StoreError> {
+        self.check("get_policy")?;
+        self.inner.get_policy().await
+    }
+    async fn set_policy(
+        &self,
+        policy: &mobula_controller::StoredPolicy,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("set_policy")?;
+        self.inner.set_policy(policy).await
+    }
+    async fn seed_policy(
+        &self,
+        policy: &mobula_controller::StoredPolicy,
+    ) -> Result<bool, mobula_controller::StoreError> {
+        self.check("seed_policy")?;
+        self.inner.seed_policy(policy).await
     }
     async fn list_audit(
         &self,

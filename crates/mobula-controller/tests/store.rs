@@ -845,6 +845,73 @@ async fn sqlite_store_pool_conforms() {
     pool_conformance(&store).await;
 }
 
+/// Governance-policy conformance (api-v1.md §5.16): unset reads as `None`;
+/// set round-trips the full record (prices, quotas, provenance flag);
+/// overwrite replaces the row; `seed_policy` is insert-if-absent.
+async fn policy_conformance(store: &dyn Store) {
+    use mobula_controller::StoredPolicy;
+
+    let policy = |cpu_price: f64, seed: bool| StoredPolicy {
+        prices: Some(BTreeMap::from([("cpu".to_string(), cpu_price)])),
+        quotas: BTreeMap::from([(
+            "ml-team".to_string(),
+            BTreeMap::from([("cpu".to_string(), 500.0)]),
+        )]),
+        from_file_seed: seed,
+    };
+
+    // Unset → None.
+    assert_eq!(store.get_policy().await.unwrap(), None);
+
+    // Round-trip.
+    store.set_policy(&policy(0.048, true)).await.unwrap();
+    assert_eq!(store.get_policy().await.unwrap(), Some(policy(0.048, true)));
+
+    // Overwrite (the settings PUT path).
+    store.set_policy(&policy(0.05, false)).await.unwrap();
+    assert_eq!(store.get_policy().await.unwrap(), Some(policy(0.05, false)));
+
+    // seed_policy never clobbers an existing row (a concurrent edit or a
+    // second boot loses; the existing row — seed or edit — wins).
+    assert!(!store.seed_policy(&policy(9.9, true)).await.unwrap());
+    assert_eq!(store.get_policy().await.unwrap(), Some(policy(0.05, false)));
+}
+
+/// seed_policy on an EMPTY store inserts and reports the insertion (both
+/// impls; kept separate from `policy_conformance` which ends non-empty).
+async fn policy_seed_conformance(store: &dyn Store) {
+    use mobula_controller::StoredPolicy;
+
+    let seed = StoredPolicy {
+        prices: None,
+        quotas: BTreeMap::from([(
+            "demo".to_string(),
+            BTreeMap::from([("cpu".to_string(), 5.0)]),
+        )]),
+        from_file_seed: true,
+    };
+    assert!(store.seed_policy(&seed).await.unwrap());
+    assert_eq!(store.get_policy().await.unwrap(), Some(seed.clone()));
+    // A second seed (e.g. a concurrent boot) is a no-op.
+    assert!(!store.seed_policy(&seed).await.unwrap());
+    assert_eq!(store.get_policy().await.unwrap(), Some(seed));
+}
+
+#[tokio::test]
+async fn in_memory_store_policy_conforms() {
+    let store = InMemoryStore::new();
+    policy_conformance(&store).await;
+    policy_seed_conformance(&InMemoryStore::new()).await;
+}
+
+#[tokio::test]
+async fn sqlite_store_policy_conforms() {
+    let store = SqliteStore::in_memory().await.unwrap();
+    policy_conformance(&store).await;
+    let fresh = SqliteStore::in_memory().await.unwrap();
+    policy_seed_conformance(&fresh).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_distinct_upserts_do_not_collapse_generation() {
     // #42: two concurrent upserts of DIFFERENT specs on the same id must

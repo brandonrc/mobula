@@ -24,10 +24,16 @@ use std::collections::HashMap;
 
 use crate::audit::emit;
 use crate::auth_layer::authorize;
+use crate::settings::{config_from_stored, effective_policy};
 
 /// Governance config for the cluster API (Phase 4): an optional price
 /// sheet for cost estimates, and per-project quota limits for admission.
 /// Empty = no cost shown, no quota enforced (unlimited).
+///
+/// This is the BOOT-TIME SEED shape (the `--policy` TOML file). The
+/// effective policy lives in the store and is read per request via
+/// [`crate::settings::effective_policy`]; this value is consulted only
+/// until the store holds a policy row (api-v1.md §5.16 precedence).
 #[derive(Clone, Default)]
 pub struct PolicyConfig {
     pub prices: Option<PriceSheet>,
@@ -37,6 +43,9 @@ pub struct PolicyConfig {
 #[derive(Clone)]
 pub struct ClusterApiState {
     pub store: Arc<dyn Store>,
+    /// Boot-time policy seed (`--policy` file), NOT the effective policy:
+    /// handlers load the effective (store-backed) policy per request via
+    /// [`crate::settings::effective_policy`].
     pub policy: Arc<PolicyConfig>,
     /// Per-project admission locks (#44). Quota admission is a non-atomic
     /// read-check-write (list -> admit -> upsert) with `.await` points and
@@ -145,7 +154,13 @@ async fn list_clusters(
     }
     match st.store.list().await {
         Ok(clusters) => {
-            let prices = st.policy.prices.as_ref();
+            // Effective policy is store-backed and read per request, so
+            // settings edits apply without a restart.
+            let policy = match effective_policy(&st.store, &st.policy).await {
+                Ok(p) => p.map(|p| config_from_stored(&p)).unwrap_or_default(),
+                Err(e) => return store_err(e),
+            };
+            let prices = policy.prices.as_ref();
             let views: Vec<_> = clusters
                 .into_iter()
                 .map(|c| ClusterView::from_stored(c, prices))
@@ -181,7 +196,13 @@ async fn get_cluster(
         return deny;
     }
     match st.store.get(&ClusterId(id)).await {
-        Ok(Some(c)) => Json(ClusterView::from_stored(c, st.policy.prices.as_ref())).into_response(),
+        Ok(Some(c)) => {
+            let policy = match effective_policy(&st.store, &st.policy).await {
+                Ok(p) => p.map(|p| config_from_stored(&p)).unwrap_or_default(),
+                Err(e) => return store_err(e),
+            };
+            Json(ClusterView::from_stored(c, policy.prices.as_ref())).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "no such cluster").into_response(),
         Err(e) => store_err(e),
     }
@@ -220,15 +241,21 @@ async fn create_cluster(
     // Quota admission (Borg: quota is admission control). Only enforced for
     // projects with a configured limit; unconfigured projects are
     // unlimited in v0. Checked against max-demand of the project's other
-    // live clusters plus this request.
+    // live clusters plus this request. The effective limits come from the
+    // store-backed policy (read per request — settings edits apply
+    // immediately).
     let project = body.spec.project.clone();
+    let policy = match effective_policy(&st.store, &st.policy).await {
+        Ok(p) => p.map(|p| config_from_stored(&p)).unwrap_or_default(),
+        Err(e) => return store_err(e),
+    };
     // When a quota applies, serialize concurrent same-project creates by
     // holding a per-project lock across the whole read-check-write section
     // (list -> admit -> upsert) so the TOCTOU window can't over-admit (#44).
     // The guard is an OwnedMutexGuard so it stays alive past the `if let`,
     // covering the `upsert_desired` below; it drops at end of function.
     // Projects without a quota skip the lock entirely and stay concurrent.
-    let _admit_guard = if let Some(limit) = st.policy.quotas.get(&project).cloned() {
+    let _admit_guard = if let Some(limit) = policy.quotas.get(&project).cloned() {
         // Fetch-or-insert this project's lock (brief std::Mutex hold, never
         // across an await), then acquire it.
         let lock = {

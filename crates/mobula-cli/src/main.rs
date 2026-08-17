@@ -80,6 +80,9 @@ enum Command {
         /// (e.g. cpu = 0.04, "nvidia.com/gpu" = 2.50) for cost estimates,
         /// and `[quotas] project = { cpu = 100, ... }` for admission
         /// control. Without it there are no cost estimates and no quotas.
+        /// This is the boot-time DEFAULT: it seeds the store's policy row,
+        /// which is then editable via `PUT /api/v1/settings/policy` — the
+        /// store wins once edited (api-v1.md §5.16).
         #[arg(long)]
         policy: Option<std::path::PathBuf>,
         /// DEMO: mount the full cluster/service API backed by an in-memory

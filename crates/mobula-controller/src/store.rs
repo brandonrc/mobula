@@ -207,6 +207,28 @@ pub struct UsageSample {
     pub source: UsageSource,
 }
 
+/// The persisted governance policy (api-v1.md §5.16): the optional price
+/// sheet (resource → $/unit-hour) and per-project quota limits (project →
+/// resource → amount), stored as one JSON-text row (the `control` KV table
+/// in SQLite — policy is a singleton like the quarantine flag, so a
+/// dedicated single-row table would add schema for nothing; the JSON-text
+/// convention keeps the SQL Postgres-portable).
+///
+/// `from_file_seed` records provenance: the row written from the `--policy`
+/// boot seed carries `true`; the first `PUT /api/v1/settings/policy` edit
+/// rewrites the row with `false`. The settings API derives its `source`
+/// field ("file" | "store") from it; "none" is simply the absence of a row.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredPolicy {
+    /// resource → $/unit-hour; `None` = no price sheet (no cost estimates).
+    pub prices: Option<std::collections::BTreeMap<String, f64>>,
+    /// project → resource → limit. Empty = no quotas enforced.
+    #[serde(default)]
+    pub quotas: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
+    /// True while the row is the untouched `--policy` boot seed.
+    pub from_file_seed: bool,
+}
+
 /// Lifecycle of an outbox intent (ADR-0007). A `Pending` row left behind by
 /// a crash between `begin_intent` and `complete_intent` tells recovery the
 /// previous apply may not have finished; `Applied` means it committed and a
@@ -392,6 +414,20 @@ pub trait Store: Send + Sync {
         from: u64,
         to: u64,
     ) -> Result<Vec<UsageSample>, StoreError>;
+
+    /// Read the persisted governance policy (api-v1.md §5.16); `None` when
+    /// no policy row exists (never seeded, never edited).
+    async fn get_policy(&self) -> Result<Option<StoredPolicy>, StoreError>;
+
+    /// Overwrite the governance policy row (the settings PUT path).
+    async fn set_policy(&self, policy: &StoredPolicy) -> Result<(), StoreError>;
+
+    /// Insert the `--policy` boot seed ONLY when no policy row exists
+    /// (insert-if-absent, so a concurrent edit or seeder is never
+    /// clobbered). Returns true when this call inserted the row. Backends
+    /// must implement this atomically (a single conditional INSERT), not as
+    /// get+set.
+    async fn seed_policy(&self, policy: &StoredPolicy) -> Result<bool, StoreError>;
 
     /// Append an audit event (api-v1.md §5.9). Append-only: returns the
     /// row's `seq`, a 1-based monotonic sequence number that doubles as the
@@ -593,6 +629,9 @@ pub mod memory {
         pools: Mutex<HashMap<String, StoredPool>>,
         allocations: Mutex<HashMap<(String, String), AllocationSpec>>,
         usage: Mutex<Vec<UsageSample>>,
+        /// Governance policy row (api-v1.md §5.16); `None` = never seeded
+        /// nor edited.
+        policy: Mutex<Option<StoredPolicy>>,
         /// (seq, event) in insertion order; seq is 1-based from `audit_seq`.
         audit: Mutex<Vec<(u64, AuditEvent)>>,
         audit_seq: std::sync::atomic::AtomicU64,
@@ -887,6 +926,24 @@ pub mod memory {
             let seq = self.audit_seq.fetch_add(1, Ordering::SeqCst) + 1;
             self.audit.lock().unwrap().push((seq, event.clone()));
             Ok(seq)
+        }
+
+        async fn get_policy(&self) -> Result<Option<StoredPolicy>, StoreError> {
+            Ok(self.policy.lock().unwrap().clone())
+        }
+
+        async fn set_policy(&self, policy: &StoredPolicy) -> Result<(), StoreError> {
+            *self.policy.lock().unwrap() = Some(policy.clone());
+            Ok(())
+        }
+
+        async fn seed_policy(&self, policy: &StoredPolicy) -> Result<bool, StoreError> {
+            let mut slot = self.policy.lock().unwrap();
+            if slot.is_some() {
+                return Ok(false);
+            }
+            *slot = Some(policy.clone());
+            Ok(true)
         }
 
         async fn list_audit(
@@ -1248,6 +1305,18 @@ pub(crate) mod testkit {
         async fn record_audit(&self, event: &AuditEvent) -> Result<u64, StoreError> {
             self.check("record_audit")?;
             self.inner.record_audit(event).await
+        }
+        async fn get_policy(&self) -> Result<Option<StoredPolicy>, StoreError> {
+            self.check("get_policy")?;
+            self.inner.get_policy().await
+        }
+        async fn set_policy(&self, policy: &StoredPolicy) -> Result<(), StoreError> {
+            self.check("set_policy")?;
+            self.inner.set_policy(policy).await
+        }
+        async fn seed_policy(&self, policy: &StoredPolicy) -> Result<bool, StoreError> {
+            self.check("seed_policy")?;
+            self.inner.seed_policy(policy).await
         }
         async fn list_audit(
             &self,

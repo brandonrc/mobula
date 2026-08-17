@@ -16,7 +16,8 @@ use mobula_core::JobRecord;
 
 use crate::store::{
     now_unix, pool_spec_changed, spec_changed, DesiredState, IntentOutcome, IntentRecord,
-    IntentStatus, Store, StoreError, StoredCluster, StoredPool, UsageSample, UsageSource,
+    IntentStatus, Store, StoreError, StoredCluster, StoredPolicy, StoredPool, UsageSample,
+    UsageSource,
 };
 
 impl From<sqlx::Error> for StoreError {
@@ -457,6 +458,42 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn get_policy(&self) -> Result<Option<StoredPolicy>, StoreError> {
+        let v: Option<String> = sqlx::query("SELECT value FROM control WHERE key = 'policy'")
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.try_get::<String, _>("value"))
+            .transpose()?;
+        v.map(|s| serde_json::from_str(&s).map_err(json_err))
+            .transpose()
+    }
+
+    async fn set_policy(&self, policy: &StoredPolicy) -> Result<(), StoreError> {
+        let json = serde_json::to_string(policy).map_err(json_err)?;
+        sqlx::query(
+            "INSERT INTO control (key, value) VALUES ('policy', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_policy(&self, policy: &StoredPolicy) -> Result<bool, StoreError> {
+        let json = serde_json::to_string(policy).map_err(json_err)?;
+        // Insert-if-absent in one statement: a concurrent edit or seeder is
+        // never clobbered, and two racing seeders write the same row.
+        let res = sqlx::query(
+            "INSERT INTO control (key, value) VALUES ('policy', ?) \
+             ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(json)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn record_attempt(
