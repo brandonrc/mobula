@@ -70,6 +70,7 @@ fn app_with_cluster(addr: SocketAddr, token: Option<&str>) -> Router {
                 hostname: "demo.ray.test".into(),
                 api_base_url: format!("http://{addr}"),
                 auth_token: token.map(String::from),
+                auth_token_env: None,
             }],
         },
         None,
@@ -86,6 +87,7 @@ fn app_with_cluster_limits(addr: SocketAddr, limits: mobula_api::ServeLimits) ->
                 hostname: "demo.ray.test".into(),
                 api_base_url: format!("http://{addr}"),
                 auth_token: None,
+                auth_token_env: None,
             }],
         },
         None,
@@ -288,6 +290,7 @@ mod websocket {
                     hostname: "127.0.0.1".into(),
                     api_base_url: format!("http://{head}"),
                     auth_token: token.map(String::from),
+                    auth_token_env: None,
                 }],
             },
             None,
@@ -371,6 +374,7 @@ mod websocket {
                     hostname: "127.0.0.1".into(),
                     api_base_url: format!("http://{head}"),
                     auth_token: None,
+                    auth_token_env: None,
                 }],
             },
             None,
@@ -678,6 +682,7 @@ fn link_local_api_base_urls_are_rejected_at_validation() {
                 hostname: "evil.ray.test".into(),
                 api_base_url: url.into(),
                 auth_token: None,
+                auth_token_env: None,
             }],
         };
         assert!(
@@ -694,6 +699,7 @@ fn link_local_api_base_urls_are_rejected_at_validation() {
                 hostname: "ok.ray.test".into(),
                 api_base_url: url.into(),
                 auth_token: None,
+                auth_token_env: None,
             }],
         };
         assert!(registry.validate(false).is_ok(), "{url} must pass");

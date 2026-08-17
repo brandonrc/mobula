@@ -127,6 +127,7 @@ async fn validator_for(idp: &Idp) -> Arc<Validator> {
             operator: vec!["/sre".into()],
             developer: vec!["/ml-eng".into()],
             viewer: vec!["/observers".into()],
+            auditor: vec!["/compliance".into()],
         },
     };
     Arc::new(
@@ -472,6 +473,14 @@ impl mobula_controller::Store for FailingStore {
     {
         self.check("list_audit")?;
         self.inner.list_audit(filter).await
+    }
+    async fn audit_chain(
+        &self,
+        from_seq: Option<u64>,
+        limit: u32,
+    ) -> Result<mobula_controller::AuditChainWindow, mobula_controller::StoreError> {
+        self.check("audit_chain")?;
+        self.inner.audit_chain(from_seq, limit).await
     }
     async fn create_local_user(
         &self,

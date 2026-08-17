@@ -67,6 +67,7 @@ pub struct RoleMappingsView {
     pub operator: Vec<String>,
     pub developer: Vec<String>,
     pub viewer: Vec<String>,
+    pub auditor: Vec<String>,
 }
 
 impl From<&RoleMappings> for RoleMappingsView {
@@ -76,6 +77,7 @@ impl From<&RoleMappings> for RoleMappingsView {
             operator: m.operator.clone(),
             developer: m.developer.clone(),
             viewer: m.viewer.clone(),
+            auditor: m.auditor.clone(),
         }
     }
 }

@@ -66,6 +66,7 @@ use utoipa_swagger_ui::SwaggerUi;
         services::delete_service,
         registry::list_registry,
         audit::list_audit_events,
+        audit::verify_audit_trail,
         local_auth::login,
         local_auth::providers,
         local_auth::create_token,
@@ -118,6 +119,7 @@ use utoipa_swagger_ui::SwaggerUi;
             registry::RegistryEntryView,
             registry::RegistryValidation,
             audit::AuditListResponse,
+            audit::AuditVerifyResponse,
             mobula_core::AuditEvent,
             mobula_core::AuditRequired,
             mobula_core::AuditDecision,
@@ -166,8 +168,10 @@ use utoipa_swagger_ui::SwaggerUi;
         (name = "audit", description = "The persisted audit trail \
          (api-v1.md §5.9): every authn/authz decision, mutation, and \
          proxied gateway request, newest-first with seq-cursor pagination \
-         and CSV export. Admin-only — audit subjects are Admin data. \
-         Mounted only when a store is configured."),
+         and CSV export. Rows are hash-chained for tamper-evidence (#59); \
+         `audit/verify` replays the chain. Reads need Read on the audit \
+         target — Admin or Auditor — and are themselves audited \
+         (`audit_read` rows). Mounted only when a store is configured."),
         (name = "auth", description = "Local auth (ADR-0011): username/\
          password login issuing opaque (unsigned) bearer tokens, personal \
          access token management, provider metadata, and Admin-only local \
@@ -779,10 +783,12 @@ mod tests {
         // The gateway registry contract (Admin-only read).
         assert!(doc["paths"]["/api/v1/registry/clusters"]["get"].is_object());
         assert!(doc["components"]["schemas"]["RegistryEntryView"].is_object());
-        // The audit trail contract (Admin-only, api-v1.md §5.9).
+        // The audit trail contract (Admin/Auditor, api-v1.md §5.9).
         assert!(doc["paths"]["/api/v1/audit"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/audit/verify"]["get"].is_object());
         assert!(doc["components"]["schemas"]["AuditEvent"].is_object());
         assert!(doc["components"]["schemas"]["AuditListResponse"].is_object());
+        assert!(doc["components"]["schemas"]["AuditVerifyResponse"].is_object());
         // The local-auth contract (ADR-0011).
         assert!(doc["paths"]["/api/v1/auth/login"]["post"].is_object());
         assert!(doc["paths"]["/api/v1/auth/providers"]["get"].is_object());

@@ -5,7 +5,14 @@
 
 use std::time::{Duration, Instant};
 
+use kube::api::{Api, ListParams};
+use kube::core::DynamicObject;
+use kube::discovery::ApiResource;
+use kube::Client;
 use mobula_core::{ClusterId, ClusterSpec, ClusterState, WorkerGroup};
+use mobula_provision::kuberay::{
+    DEFAULT_DENY_POLICY_NAME, PSS_ENFORCE_LABEL, TENANT_ALLOW_POLICY_NAME,
+};
 use mobula_provision::{KubeRayProvisioner, Provisioner};
 
 fn tiny_spec() -> ClusterSpec {
@@ -39,10 +46,58 @@ fn tiny_spec() -> ClusterSpec {
 #[ignore = "requires a cluster with the KubeRay operator"]
 async fn provisions_observes_and_terminates() {
     let ns = std::env::var("MOBULA_E2E_NAMESPACE").unwrap_or_else(|_| "default".into());
-    let prov = KubeRayProvisioner::connect(ns, false)
+    let prov = KubeRayProvisioner::connect(ns.clone(), false)
         .await
         .expect("connect to cluster");
     let id = ClusterId("e2e-demo".into());
+
+    // #56/#62: cluster creation ensures the namespace security posture.
+    // Idempotent; a second call must be a no-op. (kind's kindnet does not
+    // enforce NetworkPolicy, so this cannot break pod traffic in CI.)
+    prov.ensure_namespace_posture(&ns)
+        .await
+        .expect("ensure namespace posture");
+    prov.ensure_namespace_posture(&ns)
+        .await
+        .expect("re-ensure is idempotent");
+
+    // Assert the posture landed: both policies exist and the namespace
+    // carries the PSS labels.
+    let client = Client::try_default().await.expect("kube client");
+    let np_resource = ApiResource::from_gvk(&kube::core::GroupVersionKind {
+        group: "networking.k8s.io".into(),
+        version: "v1".into(),
+        kind: "NetworkPolicy".into(),
+    });
+    let policies: Api<DynamicObject> = Api::namespaced_with(client.clone(), &ns, &np_resource);
+    let names: Vec<String> = policies
+        .list(&ListParams::default())
+        .await
+        .expect("list networkpolicies")
+        .into_iter()
+        .filter_map(|p| p.metadata.name)
+        .collect();
+    assert!(
+        names.iter().any(|n| n == DEFAULT_DENY_POLICY_NAME),
+        "default-deny policy must exist (found: {names:?})"
+    );
+    assert!(
+        names.iter().any(|n| n == TENANT_ALLOW_POLICY_NAME),
+        "tenant-allow policy must exist (found: {names:?})"
+    );
+    let ns_resource = ApiResource::from_gvk(&kube::core::GroupVersionKind {
+        group: "".into(),
+        version: "v1".into(),
+        kind: "Namespace".into(),
+    });
+    let namespaces: Api<DynamicObject> = Api::all_with(client, &ns_resource);
+    let ns_obj = namespaces.get(&ns).await.expect("get namespace");
+    let labels = ns_obj.metadata.labels.unwrap_or_default();
+    assert_eq!(
+        labels.get(PSS_ENFORCE_LABEL).map(String::as_str),
+        Some("baseline"),
+        "namespace must enforce PSS baseline (labels: {labels:?})"
+    );
 
     // Idempotent apply (generation 1).
     prov.apply(&id, &tiny_spec(), 1, "e2e/1", None)

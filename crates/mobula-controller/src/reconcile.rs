@@ -257,6 +257,12 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                             return Err(ReconcileError::StaleIntent(key));
                         }
                         IntentOutcome::Proceed { replay } => {
+                            // #56/#62: namespace security posture (default-
+                            // deny NetworkPolicy + PSS labels) is per-
+                            // namespace, not per-cluster — ensure it with
+                            // each actuating apply. Fail-closed: a posture
+                            // error blocks the cluster apply.
+                            self.provisioner.ensure_namespace_posture().await?;
                             let resp = self
                                 .provisioner
                                 .apply(&c.id, &c.spec, c.generation, &key, queue.as_ref())

@@ -53,6 +53,22 @@ fn rayservice_resource() -> ApiResource {
     })
 }
 
+fn networkpolicy_resource() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind {
+        group: "networking.k8s.io".into(),
+        version: "v1".into(),
+        kind: "NetworkPolicy".into(),
+    })
+}
+
+fn namespace_resource() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind {
+        group: "".into(),
+        version: "v1".into(),
+        kind: "Namespace".into(),
+    })
+}
+
 impl KubeRayProvisioner {
     /// Connect using the ambient kubeconfig / in-cluster service account.
     pub async fn connect(
@@ -94,6 +110,115 @@ impl KubeRayProvisioner {
             target: "mobula::audit",
             cluster = %id, suspend, "raycluster suspend field set"
         );
+        Ok(())
+    }
+
+    /// Ensure the namespace security posture (#56/#62) in `namespace`:
+    /// default-deny + tenant-allow NetworkPolicies and Pod Security
+    /// Standards labels (see [`kuberay::default_deny_network_policy`] /
+    /// [`kuberay::tenant_allow_network_policy`] / [`kuberay::namespace_pss_labels`]).
+    ///
+    /// Check-then-apply, never weakening a stricter existing posture:
+    /// - if a default-deny policy Mobula does not manage already exists in
+    ///   the namespace, an admin runs their own (stricter or differently
+    ///   shaped) network posture — leave ALL network policy untouched,
+    ///   including our allow rules, which could only widen it;
+    /// - if the namespace already enforces PSS `restricted`, the labels are
+    ///   left alone (never downgraded to baseline).
+    ///
+    /// Everything else is idempotent server-side apply with the `mobula`
+    /// field manager, so the reconciler can call this with every actuating
+    /// apply. The namespace must already exist (same precondition as the
+    /// RayCluster apply); a missing namespace is an error, not silently
+    /// skipped — provisioning must not proceed without isolation.
+    pub async fn ensure_namespace_posture(&self, namespace: &str) -> Result<(), ProvisionError> {
+        let policies: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), namespace, &networkpolicy_resource());
+        let existing = policies.list(&ListParams::default()).await?;
+        let admin_managed_deny = existing.items.iter().any(|p| {
+            let ours = p
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(MANAGED_BY_LABEL))
+                .is_some_and(|v| v == FIELD_MANAGER);
+            !ours && kuberay::is_default_deny(&p.data)
+        });
+        if admin_managed_deny {
+            tracing::info!(
+                target: "mobula::audit",
+                namespace, "admin-managed default-deny NetworkPolicy present; leaving network posture untouched"
+            );
+        } else {
+            for manifest in [
+                kuberay::default_deny_network_policy(),
+                kuberay::tenant_allow_network_policy(),
+            ] {
+                let name = manifest["metadata"]["name"]
+                    .as_str()
+                    .expect("policy manifests carry a name")
+                    .to_string();
+                let mut obj = DynamicObject::new(&name, &networkpolicy_resource());
+                obj.metadata = ObjectMeta {
+                    name: Some(name.clone()),
+                    labels: Some(std::collections::BTreeMap::from([(
+                        MANAGED_BY_LABEL.to_string(),
+                        FIELD_MANAGER.to_string(),
+                    )])),
+                    ..Default::default()
+                };
+                obj.data = serde_json::json!({ "spec": manifest["spec"] });
+                // SSA is idempotent for identical desired state; force so a
+                // field conflict with a previous Mobula-shaped apply repairs
+                // instead of erroring.
+                let params = PatchParams::apply(FIELD_MANAGER).force();
+                policies.patch(&name, &params, &Patch::Apply(&obj)).await?;
+            }
+            tracing::info!(
+                target: "mobula::audit",
+                namespace, "default-deny + tenant-allow NetworkPolicies ensured"
+            );
+        }
+
+        let namespaces: Api<DynamicObject> =
+            Api::all_with(self.client.clone(), &namespace_resource());
+        let current = namespaces
+            .get_opt(namespace)
+            .await?
+            .ok_or_else(|| ProvisionError::Backend(format!("namespace {namespace} not found")))?;
+        let enforce = current
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(kuberay::PSS_ENFORCE_LABEL))
+            .cloned();
+        if enforce.as_deref() == Some("restricted") {
+            tracing::info!(
+                target: "mobula::audit",
+                namespace, "namespace already enforces PSS restricted; leaving labels untouched"
+            );
+        } else {
+            let labels: std::collections::BTreeMap<String, String> =
+                serde_json::from_value(kuberay::namespace_pss_labels())
+                    .map_err(|e| ProvisionError::Backend(e.to_string()))?;
+            let mut obj = DynamicObject::new(namespace, &namespace_resource());
+            obj.metadata = ObjectMeta {
+                name: Some(namespace.to_string()),
+                labels: Some(labels),
+                ..Default::default()
+            };
+            // No force: if another manager owns the enforce label with a
+            // conflicting (looser) value, the conflict error surfaces the
+            // disagreement instead of silently stealing the field.
+            let params = PatchParams::apply(FIELD_MANAGER);
+            namespaces
+                .patch(namespace, &params, &Patch::Apply(&obj))
+                .await?;
+            tracing::info!(
+                target: "mobula::audit",
+                namespace, "pod-security namespace labels ensured (enforce=baseline, warn/audit=restricted)"
+            );
+        }
         Ok(())
     }
 }
@@ -160,6 +285,13 @@ impl Provisioner for KubeRayProvisioner {
             generation,
             api_base_url: Some(self.api_base_url(&id.0)),
         })
+    }
+
+    async fn ensure_namespace_posture(&self) -> Result<(), ProvisionError> {
+        // Clone only to satisfy the inherent method's borrow; the provisioner
+        // is single-namespace, so the trait form needs no argument.
+        let ns = self.namespace.clone();
+        KubeRayProvisioner::ensure_namespace_posture(self, &ns).await
     }
 
     async fn terminate(&self, id: &ClusterId) -> Result<(), ProvisionError> {

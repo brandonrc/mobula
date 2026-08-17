@@ -45,6 +45,7 @@ async fn app(idp: &common::Idp, store: Arc<dyn Store>, head: SocketAddr) -> Rout
             operator: vec!["/sre".into()],
             developer: vec!["/ml-eng".into()],
             viewer: vec!["/observers".into()],
+            auditor: vec!["/compliance".into()],
         },
     };
     let validator = mobula_auth::Validator::discover(config, reqwest::Client::new(), true)
@@ -57,6 +58,7 @@ async fn app(idp: &common::Idp, store: Arc<dyn Store>, head: SocketAddr) -> Rout
                 hostname: "demo.ray.test".into(),
                 api_base_url: format!("http://{head}"),
                 auth_token: None,
+                auth_token_env: None,
             }],
         },
         Some(Arc::new(validator)),
@@ -195,16 +197,22 @@ async fn seeded_requests_become_filtered_audit_rows() {
     assert_eq!(items[3]["required"]["target"], "cluster");
     assert_eq!(items[3]["granted_roles"], serde_json::json!(["viewer"]));
 
-    // Filters.
+    // Filters. Note (#59): every successful audit read appends an
+    // `audit_read` row (decision=allow, subject=user-123, status=200, no
+    // method), so allow/subject/window counts below grow by one per
+    // preceding query, while deny/method/cluster/reason counts don't.
     let deny = audit_query(&app, &admin, "?decision=deny").await;
     assert_eq!(deny["items"].as_array().unwrap().len(), 2);
     let allow = audit_query(&app, &admin, "?decision=allow").await;
-    assert_eq!(allow["items"].as_array().unwrap().len(), 2);
+    // 2 seeded allows + the 2 audit_read rows from the queries above.
+    assert_eq!(allow["items"].as_array().unwrap().len(), 4);
 
     let by_subject = audit_query(&app, &admin, "?subject=user-123").await;
-    assert_eq!(by_subject["items"].as_array().unwrap().len(), 3);
+    // 3 seeded + 3 audit_read rows so far.
+    assert_eq!(by_subject["items"].as_array().unwrap().len(), 6);
 
-    // min_status excludes status-less rows; the 200/201 rows fall out.
+    // min_status excludes status-less rows; the 200/201 rows fall out. The
+    // audit_read rows carry status 200, so they fall out too.
     let errors = audit_query(&app, &admin, "?min_status=400").await;
     let statuses: Vec<u64> = errors["items"]
         .as_array()
@@ -216,7 +224,8 @@ async fn seeded_requests_become_filtered_audit_rows() {
 
     let gw = audit_query(&app, &admin, "?cluster=demo").await;
     assert_eq!(gw["items"].as_array().unwrap().len(), 1);
-    // method=GET matches the gateway row AND the token-less GET 401.
+    // method=GET matches the gateway row AND the token-less GET 401 (the
+    // audit_read rows are handler-styled and carry no method).
     let gets = audit_query(&app, &admin, "?method=GET").await;
     assert_eq!(gets["items"].as_array().unwrap().len(), 2);
     // Handler-emitted rows (authorize denials, mutations) carry action/
@@ -235,7 +244,29 @@ async fn seeded_requests_become_filtered_audit_rows() {
     let past = audit_query(&app, &admin, "?to=1000").await;
     assert!(past["items"].as_array().unwrap().is_empty());
     let window = audit_query(&app, &admin, &format!("?from={}&to={}", now - 60, now + 60)).await;
-    assert_eq!(window["items"].as_array().unwrap().len(), 4);
+    // 4 seeded + 12 audit_read rows from the queries above.
+    assert_eq!(window["items"].as_array().unwrap().len(), 16);
+
+    // #59: the audit_read rows themselves — one per successful read above
+    // (13 so far), path carrying the query string (the filter params).
+    let reads = audit_query(&app, &admin, "?path_prefix=/api/v1/audit&limit=1000").await;
+    let reads = reads["items"].as_array().unwrap();
+    assert_eq!(reads.len(), 13, "{reads:?}");
+    let read = &reads[0];
+    assert_eq!(read["action"], "audit_read");
+    assert_eq!(read["decision"], "allow");
+    assert_eq!(read["subject"], "user-123");
+    assert_eq!(read["status"], 200);
+    assert!(
+        read["path"].as_str().unwrap().starts_with("/api/v1/audit"),
+        "{read}"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|r| r["path"].as_str().unwrap().contains("decision=deny")),
+        "the filter params are part of the audited path: {reads:?}"
+    );
 }
 
 #[tokio::test]
@@ -346,14 +377,14 @@ async fn csv_export_has_a_header_and_one_line_per_row() {
 }
 
 #[tokio::test]
-async fn audit_endpoint_is_admin_only() {
+async fn audit_endpoint_is_admin_or_auditor_only() {
     let idp = common::spawn_idp().await;
     let admin = common::idp_token(&idp, &["/platform-admins"]);
     let store: Arc<dyn Store> = Arc::new(mobula_controller::InMemoryStore::new());
     let head = spawn_mock_ray_head().await;
     let app = app(&idp, store, head).await;
 
-    // No token → 401; every non-admin role → 403.
+    // No token → 401; every non-admin, non-auditor role → 403.
     let res = app
         .clone()
         .oneshot(common::get("/api/v1/audit", CP_HOST, None))
@@ -375,7 +406,9 @@ async fn audit_endpoint_is_admin_only() {
     }
 
     // The denials themselves are audit rows: three insufficient_permission
-    // entries (one per non-admin probe), readable by the admin.
+    // entries (one per non-admin probe), readable by the admin. #59: the
+    // required permission is now Read on the audit target (was Admin on
+    // Cluster).
     let page = audit_query(
         &app,
         &admin,
@@ -384,9 +417,122 @@ async fn audit_endpoint_is_admin_only() {
     .await;
     let items = page["items"].as_array().unwrap();
     assert_eq!(items.len(), 3, "{page}");
-    assert_eq!(items[0]["required"]["action"], "admin");
-    assert_eq!(items[0]["required"]["target"], "cluster");
+    assert_eq!(items[0]["required"]["action"], "read");
+    assert_eq!(items[0]["required"]["target"], "audit");
     assert_eq!(items[0]["granted_roles"], serde_json::json!(["viewer"]));
+}
+
+/// #59 separation of duties: the auditor reads the audit surface (list AND
+/// verify) but holds nothing else — no cluster create, no registry, not
+/// even cluster reads.
+#[tokio::test]
+async fn auditor_reads_audit_but_nothing_else() {
+    let idp = common::spawn_idp().await;
+    let admin = common::idp_token(&idp, &["/platform-admins"]);
+    let auditor = common::idp_token(&idp, &["/compliance"]);
+    let store: Arc<dyn Store> = Arc::new(mobula_controller::InMemoryStore::new());
+    let head = spawn_mock_ray_head().await;
+    let app = app(&idp, store, head).await;
+    seed_events(&app, &admin, &auditor).await;
+
+    // Audit surface: list and verify both succeed.
+    let res = app
+        .clone()
+        .oneshot(common::get("/api/v1/audit", CP_HOST, Some(&auditor)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app
+        .clone()
+        .oneshot(common::get("/api/v1/audit/verify", CP_HOST, Some(&auditor)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Everything else is closed: no cluster create (Write on Cluster)…
+    let res = app
+        .clone()
+        .oneshot(common::post_json(
+            "/api/v1/clusters",
+            CP_HOST,
+            &auditor,
+            create_body("auditor-c"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    // …no registry (Admin on Cluster)…
+    let res = app
+        .clone()
+        .oneshot(common::get(
+            "/api/v1/registry/clusters",
+            CP_HOST,
+            Some(&auditor),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    // …not even cluster reads (Read on Cluster — Viewer territory).
+    let res = app
+        .clone()
+        .oneshot(common::get("/api/v1/clusters", CP_HOST, Some(&auditor)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+/// #59: `GET /api/v1/audit/verify` replays the hash chain — over the whole
+/// trail by default, or a bounded `from_seq`/`limit` window.
+#[tokio::test]
+async fn verify_endpoint_replays_the_chain() {
+    let idp = common::spawn_idp().await;
+    let admin = common::idp_token(&idp, &["/platform-admins"]);
+    let viewer = common::idp_token(&idp, &["/observers"]);
+    let store: Arc<dyn Store> = Arc::new(mobula_controller::InMemoryStore::new());
+    let head = spawn_mock_ray_head().await;
+    let app = app(&idp, store, head).await;
+    seed_events(&app, &admin, &viewer).await;
+
+    let verify = |token: &str, query: &str| {
+        let app = app.clone();
+        let token = token.to_string();
+        let query = query.to_string();
+        async move {
+            app.oneshot(common::get(
+                &format!("/api/v1/audit/verify{query}"),
+                CP_HOST,
+                Some(&token),
+            ))
+            .await
+            .unwrap()
+        }
+    };
+
+    // Full trail: the 4 seeded rows chain cleanly from genesis.
+    let body = body_json(verify(&admin, "").await).await;
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["events_checked"], 4, "{body}");
+    assert!(body["first_broken_seq"].is_null(), "{body}");
+
+    // A mid-trail window verifies against the preceding row's hash — and
+    // sees the audit_read row the first verify appended (seq 5).
+    let body = body_json(verify(&admin, "?from_seq=2").await).await;
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["events_checked"], 4, "{body}");
+
+    // A bounded window checks only its rows.
+    let body = body_json(verify(&admin, "?limit=2").await).await;
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["events_checked"], 2, "{body}");
+
+    // Verify is part of the audit surface: viewer 403, no token 401.
+    assert_eq!(verify(&viewer, "").await.status(), StatusCode::FORBIDDEN);
+    let res = app
+        .clone()
+        .oneshot(common::get("/api/v1/audit/verify", CP_HOST, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

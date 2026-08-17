@@ -53,7 +53,7 @@ is greenfield. Where the proposal changes existing behavior, §8 calls it out.
   does not carry RFC 3339 strings.
 - Enums serialize snake_case (`ClusterState` has
   `#[serde(rename_all = "snake_case")]`). Roles serialize snake_case:
-  `viewer`, `developer`, `operator`, `admin`.
+  `viewer`, `developer`, `operator`, `admin`, `auditor`.
 - `Option<T>` fields are always present in responses, serialized as `null`
   when absent — generated clients should never have to guess field presence.
 
@@ -61,7 +61,8 @@ is greenfield. Where the proposal changes existing behavior, §8 calls it out.
 
 The code's model (ADR-0009, `mobula-auth/src/lib.rs`) is **permission-sets**,
 not an ordinal rank: `PermissionType {Read, Write, Delete, Admin}` ×
-`Target {Job, Cluster, Service, Pool}`, four built-in roles. The baseline is
+`Target {Job, Cluster, Service, Pool, Audit}`, five built-in roles. The
+baseline is
 flat group→role mapping (a group-derived role applies globally); on top of
 that, **scoped role bindings** (below) grant roles per principal at a scope.
 
@@ -69,12 +70,13 @@ Effective v1 matrix (from `Role::grants`):
 
 | Endpoint class | Required permission | Roles that pass |
 |---|---|---|
-| Any `GET` on cluster/audit data | `Read` on the route's target | Viewer and above |
+| Any `GET` on cluster data | `Read` on the route's target | Viewer and above |
 | Cluster lifecycle mutations (create, patch, suspend, resume, terminate) | `Write`/`Delete` on `Target::Cluster` | Operator, Admin |
 | Job-surface mutations (submit, stop, delete via proxy) | `Write` on `Target::Job` | Developer, Admin |
 | Pool topology reads (`GET /api/v1/pools…`) | `Read` on `Target::Pool` | Viewer and above |
 | Pool/allocation mutations (`POST`/`DELETE /api/v1/pools…`) | `Write`/`Delete` on `Target::Pool` | Admin only |
-| Registry, audit, access-control surfaces | Admin | Admin only |
+| Registry, access-control surfaces | Admin | Admin only |
+| Audit trail reads (`/api/v1/audit…`, §5.9) | `Read` on `Target::Audit` | Admin, Auditor |
 | Settings (governance policy) reads & edits (`/api/v1/settings/policy`) | Admin (classified with `Target::Cluster`) | Admin only |
 
 Pools and allocations are **platform configuration** (capacity topology), not
@@ -457,6 +459,50 @@ menus, rendered from `can_transition()` client-side and enforced server-side.
   back-compat; the POST action is canonical for the UI. Same permission,
   same 409 behavior (§8).
 
+#### Provisioned security posture (#56, #62)
+
+Cluster creation is not just a RayCluster: with the KubeRay backend, every
+actuating apply first ensures the **namespace-level** security posture
+(`Provisioner::ensure_namespace_posture`, called by the reconciler — one
+posture covers every cluster in the namespace). This is the tenant network
+isolation + STIG pod-security floor (compliance gap assessment §4.3/§4.7;
+K8s STIG V-242437). Posture failures are **fail-closed**: the RayCluster
+apply does not proceed.
+
+What Mobula ensures (server-side apply, field manager `mobula`):
+
+- **`mobula-default-deny` NetworkPolicy** — selects all pods in the
+  namespace, denies all ingress+egress.
+- **`mobula-tenant-allow` NetworkPolicy** — the minimal Ray allows:
+  same-namespace pod-to-pod (head↔workers: GCS 6379, dashboard 8265,
+  client 10001, raylet dynamic ports); ingress from namespaces labeled
+  `mobula.dev/control-plane=true` (documented constant
+  `CONTROL_PLANE_NAMESPACE_LABEL` — operators label the control-plane
+  namespace once) to the head's TCP 8265/10001 only; egress to kube-dns
+  (`kube-system`, `k8s-app: kube-dns`, 53 UDP/TCP).
+- **Pod Security Standards labels on the namespace** —
+  `pod-security.kubernetes.io/enforce: baseline` plus `warn`/`audit:
+  restricted`. Enforce is baseline, not restricted, because
+  KubeRay-generated Ray pods do not carry the full restricted
+  `securityContext` (`runAsNonRoot`, seccomp, drop-all capabilities) and
+  would be rejected; warn/audit at restricted keep the gap visible.
+
+What admins can tighten — check-then-apply never weakens a stricter
+posture:
+
+- A default-deny NetworkPolicy **not** managed by Mobula (any name) means
+  the admin owns the network posture: Mobula leaves all NetworkPolicies in
+  the namespace untouched, including its own allow rules (which could only
+  widen an admin's tighter policy set).
+- A namespace already at `enforce: restricted` is never downgraded.
+- Admins may add further allow policies (tenant egress to object stores,
+  registries) — NetworkPolicies are additive, so Mobula's floor composes.
+
+Requirements and limits: NetworkPolicy needs a CNI that enforces it
+(kind's kindnet does not; Cilium/Calico do); node-local and `hostNetwork`
+traffic bypasses policy. Demo mode (`--demo`) provisions nothing and
+ensures no posture.
+
 ### 5.2 (reserved — see §5.1/PATCH)
 
 ### 5.3 Nodes — `GET /api/v1/clusters/{id}/nodes`
@@ -717,7 +763,15 @@ gateway per-request rows, authn failures, authz denials, cluster/pool
 mutations — goes through `mobula_api::audit::emit`. The route mounts only
 when a store is configured (gateway-only deployments stay trace-only).
 
-- **Auth:** Admin.
+- **Auth:** `Read` on `Target::Audit` — granted to **Admin** (catch-all)
+  and **Auditor** (#59, separation of duties: a compliance reader who holds
+  Read on the audit surface and *nothing* else — no cluster reads, no
+  registry, no writes anywhere). The Auditor role is granted via the
+  `auditor` group list in the auth config's role mappings (serde-defaulted
+  to empty, so existing `auth.toml` files keep working); scoped role
+  bindings don't apply — the trail isn't project-scoped. Viewer's
+  read-everything explicitly excludes the audit target: audit subjects are
+  Admin data (§2.2).
 - **Query:** `limit` (default 100, max 1000), `cursor`; filters `from`,
   `to` (unix seconds, inclusive), `subject`, `cluster`, `method`,
   `path_prefix`, `min_status`, `decision` (`allow|deny`), `reason`.
@@ -740,6 +794,60 @@ when a store is configured (gateway-only deployments stay trace-only).
   have no `subject`; gateway rows have no `action`/`reason`; handler rows
   (mutations, `authorize` denials) carry `action`/`cluster` instead of
   `method`/`path`; `required`/`granted_roles` appear on authz denials only.
+
+#### Tamper-evidence: the hash chain (#59)
+
+Every row carries a `chain_hash`: `sha256(prev_row.chain_hash ‖
+canonical_json(row))`, computed in the store at append time. The genesis
+row (seq 1) chains from 64 zero hex chars. The canonical serialization is
+`serde_json` over the `AuditEvent` struct (fixed field order, `Option`
+fields always present as `null`), shared by all store backends and the
+verifier via one pure function (`mobula_controller::audit_chain_hash`). A
+single `chain_hash` column suffices — the previous row's hash is an input
+to this row's, so a separate `prev_hash` column would be redundant.
+
+This is tamper-**evidence**, not tamper-proofing: the chain holds no secret,
+so an attacker with table write access can rewrite history and recompute
+hashes — but any edit/insert/delete of a middle row breaks every later
+hash, which verification exposes. Deleting the *newest* rows leaves no gap
+to detect; ship the `--audit-log` JSONL export off-box for non-repudiation.
+
+**Migration:** rows written before the chain existed carry `chain_hash =
+''` and are chained at boot, in seq order, each from its (by then chained)
+predecessor. No data is rewritten beyond filling the column.
+
+**Concurrency:** appends serialize — an in-process mutex (SQLite) or a
+transaction-scoped `pg_advisory_xact_lock(hashtext('audit_chain'))`
+(Postgres) — so read-prev/compute/insert never interleaves into a forked
+chain.
+
+#### Chain verification — `GET /api/v1/audit/verify`
+
+Replays the chain over a window and reports the first broken link.
+
+- **Auth:** same as the list endpoint (`Read` on `Target::Audit`).
+- **Query:** `from_seq` (default 1 — the whole trail from genesis; a
+  mid-trail window chains from the newest preceding row's stored hash),
+  `limit` (default 100 000, max 1 000 000 — bounded so a huge table can't
+  OOM the process; verify larger trails in successive windows).
+- **Response 200:** `{ "ok": true, "events_checked": 4182,
+  "first_broken_seq": null }`. `ok` is false and `first_broken_seq` is the
+  offending row's `seq` at the first mismatch; `events_checked` counts the
+  rows that verified before the replay stopped. Everything after a broken
+  link is untrustworthy by construction, so the replay stops there.
+
+#### Audit-read logging (#59)
+
+Every successful read of the audit surface — the JSON list, CSV exports,
+and `verify` — itself appends an `audit_read` event: handler-styled
+(`action`, no `method`), `decision: allow`, `status: 200`, the caller's
+`subject`, and `path` carrying the request's **query string** (an exception
+to the no-query-string convention: the filter params are the payload worth
+auditing, and `format=csv` in the query distinguishes exports). The
+recursion is deliberate — audit access is itself audited (SOC 2 CC7.2).
+The row is appended *after* the read completes, so a `verify` never
+perturbs the window it just checked. Failed reads (400/403/500) leave no
+`audit_read` row (403s are already denial rows of their own).
 
 ```json
 // AuditEvent — superset of the fields already emitted to mobula::audit
@@ -993,6 +1101,9 @@ registry even without a store).
 - `token_set` is the only token fact exposed: static Ray tokens are
   `skip_serializing` on `ClusterEndpoint` and must never appear in a
   response (security issue #4).
+- Registry TOML entries should set `auth_token_env` (name of an env var
+  read at startup, resolved fail-fast) instead of a plaintext
+  `auth_token`; exactly one of the two may be set per entry (issue #57).
 - `validation` is always `null` today (reserved for per-entry
   health/reachability): registry validation is fail-fast at startup, so
   served entries are valid by construction.

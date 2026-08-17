@@ -188,6 +188,7 @@ async fn roles_endpoint_returns_the_validators_mappings_to_admins_only() {
                 "operator": ["/sre"],
                 "developer": ["/ml-eng"],
                 "viewer": ["/observers"],
+                "auditor": ["/compliance"],
             },
             "source": "file",
             "editable": false,

@@ -38,6 +38,9 @@
     },
     {
       "name": "observers"
+    },
+    {
+      "name": "compliance"
     }
   ],
   "users": [
@@ -119,6 +122,24 @@
       "serviceAccountClientId": "mobula-service",
       "groups": [
         "/ml-eng"
+      ]
+    },
+    {
+      "username": "auditor",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "auditor@mobula.local",
+      "firstName": "Auditor",
+      "lastName": "Demo",
+      "credentials": [
+        {
+          "type": "password",
+          "secretData": "{\"value\": \"cjay6tGErdZ3ZGFZ344nzHvfIKeQRNf0M6ZLfmAlpkY=\", \"salt\": \"eZInXVvUt8bzX1yOm1O1Cg==\"}",
+          "credentialData": "{\"hashIterations\": 600000, \"algorithm\": \"pbkdf2-sha256\"}"
+        }
+      ],
+      "groups": [
+        "/compliance"
       ]
     }
   ],

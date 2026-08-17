@@ -23,5 +23,5 @@ pub use pool::{
     AllocationSpec, AllocationSpecError, FlavorSpec, FlavorSpecError, PoolSpec, PoolSpecError,
     TaintSpec, TaintSpecError,
 };
-pub use registry::{ClusterEndpoint, ClusterRegistry, RegistryError};
+pub use registry::{ClusterEndpoint, ClusterRegistry, RegistryError, TokenSourceNote};
 pub use service::{ServiceSpec, UpgradeStrategy};

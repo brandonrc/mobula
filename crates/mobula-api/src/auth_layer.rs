@@ -87,13 +87,14 @@ fn target_for_path(path: &str) -> Target {
         Target::Service
     } else if is_under("/api/v1/pools") {
         Target::Pool
-    } else if is_under("/api/v1/registry")
-        || is_under("/api/v1/audit")
-        || is_under("/api/v1/settings")
-    {
-        // Registry entries describe cluster routing, the audit trail is
-        // dominated by cluster decisions, and the governance policy
-        // (settings) drives cluster admission/costs; all three route
+    } else if is_under("/api/v1/audit") {
+        // #59: the audit surface is its own target so Role::Auditor (Read
+        // on Audit, nothing else) passes the same check here that the
+        // route handler enforces in-handler.
+        Target::Audit
+    } else if is_under("/api/v1/registry") || is_under("/api/v1/settings") {
+        // Registry entries describe cluster routing and the governance
+        // policy (settings) drives cluster admission/costs; both route
         // handlers enforce Admin themselves — this mapping is for the
         // ext_authz verb check.
         Target::Cluster
@@ -533,7 +534,8 @@ mod tests {
             target_for_path("/api/v1/pools/gpu/allocations/p"),
             Target::Pool
         );
-        assert_eq!(target_for_path("/api/v1/audit"), Target::Cluster);
+        assert_eq!(target_for_path("/api/v1/audit"), Target::Audit);
+        assert_eq!(target_for_path("/api/v1/audit/verify"), Target::Audit);
         assert_eq!(target_for_path("/api/v1/settings"), Target::Cluster);
         assert_eq!(target_for_path("/api/v1/settings/policy"), Target::Cluster);
         assert_eq!(target_for_path("/api/v1/settings-evil"), Target::Job);

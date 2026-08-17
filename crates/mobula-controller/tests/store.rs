@@ -660,6 +660,33 @@ async fn audit_conformance(store: &dyn Store) {
         .unwrap();
     assert!(page.is_empty());
     assert_eq!(next, None);
+
+    // #59 tamper-evidence chain: every appended row carries a chain hash,
+    // ascending replay from genesis verifies, and a mid-trail window chains
+    // from the preceding row's hash.
+    let window = store.audit_chain(None, 100).await.unwrap();
+    assert_eq!(window.head, mobula_controller::AUDIT_GENESIS_HASH);
+    assert_eq!(
+        window.rows.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert!(window.rows.iter().all(|(_, _, h)| h.len() == 64));
+    let v = mobula_controller::verify_audit_chain(&window.head, &window.rows);
+    assert!(v.ok() && v.events_checked == 3, "{v:?}");
+
+    // Window [2, 3]: head is row 1's hash; limit bounds the window.
+    let window = store.audit_chain(Some(2), 100).await.unwrap();
+    let full = store.audit_chain(None, 100).await.unwrap();
+    assert_eq!(window.head, full.rows[0].2);
+    assert_eq!(
+        window.rows.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+        [2, 3]
+    );
+    assert!(mobula_controller::verify_audit_chain(&window.head, &window.rows).ok());
+    let one = store.audit_chain(Some(2), 1).await.unwrap();
+    assert_eq!(one.rows.len(), 1);
+    assert_eq!(one.rows[0].0, 2);
+    assert!(mobula_controller::verify_audit_chain(&one.head, &one.rows).ok());
 }
 
 #[tokio::test]
@@ -671,6 +698,80 @@ async fn in_memory_store_audit_conforms() {
 async fn sqlite_store_audit_conforms() {
     let store = SqliteStore::in_memory().await.unwrap();
     audit_conformance(&store).await;
+}
+
+/// #59 migration: a database written by the pre-chain schema (audit_events
+/// WITHOUT `chain_hash`) gets the column added and every legacy row chained
+/// in seq order on first boot.
+#[tokio::test]
+async fn sqlite_audit_chain_backfills_pre_migration_rows() {
+    use mobula_core::{AuditDecision, AuditEvent};
+    let path = std::env::temp_dir().join(format!(
+        "mobula-audit-chain-migration-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let url = format!("sqlite:{}?mode=rwc", path.display());
+
+    // Write two rows through the OLD schema (no chain_hash column).
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE audit_events (
+            seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            INTEGER NOT NULL,
+            subject       TEXT,
+            decision      TEXT NOT NULL,
+            reason        TEXT,
+            action        TEXT,
+            cluster       TEXT,
+            method        TEXT,
+            path          TEXT,
+            status        INTEGER,
+            latency_ms    INTEGER,
+            required_json TEXT,
+            granted_roles TEXT NOT NULL DEFAULT '[]'
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (ts, subject) in [(100, "alice"), (200, "bob")] {
+        sqlx::query("INSERT INTO audit_events (ts, subject, decision) VALUES (?, ?, 'allow')")
+            .bind(ts)
+            .bind(subject)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    pool.close().await;
+
+    // First boot on the new binary: column migration + backfill.
+    let store = SqliteStore::connect(&url).await.unwrap();
+    let window = store.audit_chain(None, 100).await.unwrap();
+    assert_eq!(window.rows.len(), 2);
+    assert!(window.rows.iter().all(|(_, _, h)| h.len() == 64));
+    let v = mobula_controller::verify_audit_chain(&window.head, &window.rows);
+    assert!(v.ok() && v.events_checked == 2, "{v:?}");
+    assert_eq!(window.rows[0].1.decision, AuditDecision::Allow);
+    assert_eq!(window.rows[1].1.subject.as_deref(), Some("bob"));
+
+    // A row appended after the migration chains from the backfilled tail.
+    store
+        .record_audit(&AuditEvent {
+            ts: 300,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let window = store.audit_chain(None, 100).await.unwrap();
+    let v = mobula_controller::verify_audit_chain(&window.head, &window.rows);
+    assert!(v.ok() && v.events_checked == 3, "{v:?}");
+
+    drop(store);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Local-auth conformance (ADR-0011): user CRUD, lockout counters, and
@@ -1141,6 +1242,112 @@ mod postgres {
     pg_conformance!(postgres_store_audit_conforms, audit_conformance);
     pg_conformance!(postgres_store_local_auth_conforms, local_auth_conformance);
     pg_conformance!(postgres_store_assignment_conforms, assignment_conformance);
+
+    /// #59 migration, Postgres side: a schema written by the pre-chain
+    /// binary (audit_events WITHOUT `chain_hash`) gets the column via
+    /// `ALTER … IF NOT EXISTS` and every legacy row chained in seq order on
+    /// first boot.
+    #[tokio::test]
+    async fn postgres_audit_chain_backfills_pre_migration_rows() {
+        let url = match std::env::var("MOBULA_TEST_POSTGRES_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => return,
+        };
+        let schema = format!(
+            "legacy_{}_{}",
+            std::process::id(),
+            NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
+        );
+        let pool = PgPoolOptions::new()
+            .after_connect(move |conn, _meta| {
+                let schema = schema.clone();
+                Box::pin(async move {
+                    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query(&format!("SET search_path TO {schema}"))
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect to MOBULA_TEST_POSTGRES_URL");
+        // The OLD table shape (no chain_hash) with two legacy rows.
+        sqlx::query(
+            "CREATE TABLE audit_events (
+                seq           BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                ts            BIGINT NOT NULL,
+                subject       TEXT,
+                decision      TEXT NOT NULL,
+                reason        TEXT,
+                action        TEXT,
+                cluster       TEXT,
+                method        TEXT,
+                path          TEXT,
+                status        BIGINT,
+                latency_ms    BIGINT,
+                required_json TEXT,
+                granted_roles TEXT NOT NULL DEFAULT '[]'
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (ts, subject) in [(100, "alice"), (200, "bob")] {
+            sqlx::query(
+                "INSERT INTO audit_events (ts, subject, decision) VALUES ($1, $2, 'allow')",
+            )
+            .bind(ts)
+            .bind(subject)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // First boot on the new binary: ALTER + backfill.
+        let store = PostgresStore::from_pool(pool).await.unwrap();
+        let window = store.audit_chain(None, 100).await.unwrap();
+        assert_eq!(window.rows.len(), 2);
+        assert!(window.rows.iter().all(|(_, _, h)| h.len() == 64));
+        let v = mobula_controller::verify_audit_chain(&window.head, &window.rows);
+        assert!(v.ok() && v.events_checked == 2, "{v:?}");
+        assert_eq!(window.rows[1].1.subject.as_deref(), Some("bob"));
+    }
+
+    /// #59: concurrent audit appends serialize on the advisory lock, so the
+    /// chain never forks — every appended row chains from the true previous
+    /// row and the full trail verifies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_concurrent_audit_appends_keep_one_chain() {
+        let Some(store) = postgres_store().await else {
+            return;
+        };
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+        for i in 0..20u64 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                s.record_audit(&mobula_core::AuditEvent {
+                    ts: i,
+                    ..Default::default()
+                })
+                .await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        let window = store.audit_chain(None, 100).await.unwrap();
+        assert_eq!(window.rows.len(), 20);
+        assert_eq!(
+            window.rows.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+            (1..=20).collect::<Vec<_>>()
+        );
+        let v = mobula_controller::verify_audit_chain(&window.head, &window.rows);
+        assert!(v.ok() && v.events_checked == 20, "{v:?}");
+    }
 
     #[tokio::test]
     async fn postgres_store_policy_conforms() {

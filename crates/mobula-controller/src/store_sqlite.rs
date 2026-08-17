@@ -15,9 +15,9 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use mobula_core::JobRecord;
 
 use crate::store::{
-    json_err, now_unix, pool_spec_changed, spec_changed, DesiredState, IntentOutcome, IntentRecord,
-    IntentStatus, RoleAssignment, Store, StoreError, StoredCluster, StoredPolicy, StoredPool,
-    UsageSample, UsageSource,
+    audit_chain_hash, json_err, now_unix, pool_spec_changed, spec_changed, AuditChainWindow,
+    DesiredState, IntentOutcome, IntentRecord, IntentStatus, RoleAssignment, Store, StoreError,
+    StoredCluster, StoredPolicy, StoredPool, UsageSample, UsageSource, AUDIT_GENESIS_HASH,
 };
 
 const SCHEMA: &str = r#"
@@ -91,8 +91,11 @@ CREATE INDEX IF NOT EXISTS usage_samples_project_ts ON usage_samples (project, t
 -- Persisted audit trail (api-v1.md §5.9): append-only. `seq` is the
 -- pagination cursor (rows are read newest-first). Filter-facing fields are
 -- plain columns; `required_json` keeps the spec's JSON-text convention.
--- Postgres port: `INTEGER PRIMARY KEY AUTOINCREMENT` becomes an identity
--- column; the SELECT/INSERT statements below are standard SQL.
+-- `chain_hash` is the tamper-evidence chain (#59): sha256 over (previous
+-- row's chain_hash ‖ this row's canonical JSON), genesis chains from 64
+-- zeros; '' means "written before the chain existed" and is backfilled at
+-- boot. Postgres port: `INTEGER PRIMARY KEY AUTOINCREMENT` becomes an
+-- identity column; the SELECT/INSERT statements below are standard SQL.
 CREATE TABLE IF NOT EXISTS audit_events (
     seq           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts            INTEGER NOT NULL,
@@ -106,7 +109,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
     status        INTEGER,
     latency_ms    INTEGER,
     required_json TEXT,
-    granted_roles TEXT NOT NULL DEFAULT '[]'
+    granted_roles TEXT NOT NULL DEFAULT '[]',
+    chain_hash    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS audit_events_ts ON audit_events (ts);
 -- Local auth (ADR-0011): users and opaque API tokens. Mobula stores
@@ -165,10 +169,52 @@ const COLUMN_MIGRATIONS: &[&str] = &[
     "ALTER TABLE clusters ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE pools ADD COLUMN observed_json TEXT",
     "ALTER TABLE pools ADD COLUMN observed_at INTEGER",
+    "ALTER TABLE audit_events ADD COLUMN chain_hash TEXT NOT NULL DEFAULT ''",
 ];
 
 pub struct SqliteStore {
     pool: SqlitePool,
+    /// Serializes audit appends (#59): a new row's chain hash reads the
+    /// newest row's, so read-compute-insert must not interleave across the
+    /// pool's connections. (Single-process SQLite; cross-process shared
+    /// files were never a supported deployment.)
+    audit_lock: tokio::sync::Mutex<()>,
+}
+
+/// Chain rows written before the `chain_hash` column existed (#59
+/// migration), in seq order, each from its (already-chained) predecessor.
+/// Runs inside `init`, before the store serves, so there's no concurrency
+/// to guard against. `chain_hash = ''` marks a pre-chain row — a real hash
+/// is never empty.
+async fn backfill_audit_chain(pool: &SqlitePool) -> Result<(), StoreError> {
+    loop {
+        let row = sqlx::query(
+            "SELECT seq, ts, subject, decision, reason, action, cluster, method, path, \
+             status, latency_ms, required_json, granted_roles FROM audit_events \
+             WHERE chain_hash = '' ORDER BY seq ASC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?;
+        let Some(row) = row else { break };
+        let (seq, event) = row_to_audit_event(&row)?;
+        // Ascending order means the immediate predecessor is chained
+        // already (pre-existing, or just backfilled).
+        let prev: Option<String> = sqlx::query(
+            "SELECT chain_hash FROM audit_events WHERE seq < ? ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(seq as i64)
+        .fetch_optional(pool)
+        .await?
+        .map(|r| r.try_get::<String, _>(0))
+        .transpose()?;
+        let hash = audit_chain_hash(prev.as_deref().unwrap_or(AUDIT_GENESIS_HASH), &event);
+        sqlx::query("UPDATE audit_events SET chain_hash = ? WHERE seq = ?")
+            .bind(hash)
+            .bind(seq as i64)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 impl SqliteStore {
@@ -189,6 +235,7 @@ impl SqliteStore {
                 }
             }
         }
+        backfill_audit_chain(pool).await?;
         Ok(())
     }
 
@@ -196,7 +243,10 @@ impl SqliteStore {
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new().connect(url).await?;
         Self::init(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            audit_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// A private in-memory database for tests. `max_connections(1)` keeps
@@ -207,7 +257,10 @@ impl SqliteStore {
             .connect("sqlite::memory:")
             .await?;
         Self::init(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            audit_lock: tokio::sync::Mutex::new(()),
+        })
     }
 }
 
@@ -274,6 +327,39 @@ fn row_to_pool(row: SqliteRow) -> Result<StoredPool, StoreError> {
             .map(|v| v as u64),
         created_at: row.try_get::<i64, _>("created_at")? as u64,
     })
+}
+
+/// Map an `audit_events` row (selected as `seq, ts, subject, decision,
+/// reason, action, cluster, method, path, status, latency_ms,
+/// required_json, granted_roles`) to `(seq, event)`. Shared by `list_audit`,
+/// `audit_chain`, and the #59 chain backfill so all three agree on decoding.
+fn row_to_audit_event(row: &SqliteRow) -> Result<(u64, AuditEvent), StoreError> {
+    let required = match row.try_get::<Option<String>, _>("required_json")? {
+        Some(s) => Some(serde_json::from_str::<AuditRequired>(&s).map_err(json_err)?),
+        None => None,
+    };
+    let granted_roles =
+        serde_json::from_str::<Vec<String>>(&row.try_get::<String, _>("granted_roles")?)
+            .map_err(json_err)?;
+    let decision = AuditDecision::parse(&row.try_get::<String, _>("decision")?)
+        .ok_or_else(|| StoreError::Backend("bad audit decision".to_string()))?;
+    let event = AuditEvent {
+        ts: row.try_get::<i64, _>("ts")? as u64,
+        subject: row.try_get::<Option<String>, _>("subject")?,
+        decision,
+        reason: row.try_get::<Option<String>, _>("reason")?,
+        action: row.try_get::<Option<String>, _>("action")?,
+        cluster: row.try_get::<Option<String>, _>("cluster")?,
+        method: row.try_get::<Option<String>, _>("method")?,
+        path: row.try_get::<Option<String>, _>("path")?,
+        status: row.try_get::<Option<i64>, _>("status")?.map(|s| s as u16),
+        latency_ms: row
+            .try_get::<Option<i64>, _>("latency_ms")?
+            .map(|l| l as u64),
+        required,
+        granted_roles,
+    };
+    Ok((row.try_get::<i64, _>("seq")? as u64, event))
 }
 
 fn row_to_local_user(row: &SqliteRow) -> Result<LocalUserRecord, StoreError> {
@@ -869,13 +955,23 @@ impl Store for SqliteStore {
             None => None,
         };
         let granted_roles = serde_json::to_string(&event.granted_roles).map_err(json_err)?;
+        // #59: the new row chains from the newest existing row. The mutex
+        // serializes read-compute-insert across the pool's connections.
+        let _guard = self.audit_lock.lock().await;
+        let prev: Option<String> =
+            sqlx::query("SELECT chain_hash FROM audit_events ORDER BY seq DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|r| r.try_get::<String, _>(0))
+                .transpose()?;
+        let chain_hash = audit_chain_hash(prev.as_deref().unwrap_or(AUDIT_GENESIS_HASH), event);
         // RETURNING is standard SQL (SQLite 3.35+, Postgres) — one round
         // trip, no last_insert_rowid() coupling to the connection.
         let row = sqlx::query(
             "INSERT INTO audit_events \
              (ts, subject, decision, reason, action, cluster, method, path, \
-              status, latency_ms, required_json, granted_roles) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+              status, latency_ms, required_json, granted_roles, chain_hash) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
         )
         .bind(event.ts.min(i64::MAX as u64) as i64)
         .bind(&event.subject)
@@ -889,6 +985,7 @@ impl Store for SqliteStore {
         .bind(event.latency_ms.map(|l| l.min(i64::MAX as u64) as i64))
         .bind(required_json)
         .bind(granted_roles)
+        .bind(chain_hash)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get::<i64, _>("seq")? as u64)
@@ -952,36 +1049,8 @@ impl Store for SqliteStore {
 
         let limit = filter.effective_limit() as usize;
         let mut out: Vec<(u64, AuditEvent)> = rows
-            .into_iter()
-            .map(|row| {
-                let required = match row.try_get::<Option<String>, _>("required_json")? {
-                    Some(s) => Some(serde_json::from_str::<AuditRequired>(&s).map_err(json_err)?),
-                    None => None,
-                };
-                let granted_roles = serde_json::from_str::<Vec<String>>(
-                    &row.try_get::<String, _>("granted_roles")?,
-                )
-                .map_err(json_err)?;
-                let decision = AuditDecision::parse(&row.try_get::<String, _>("decision")?)
-                    .ok_or_else(|| StoreError::Backend("bad audit decision".to_string()))?;
-                let event = AuditEvent {
-                    ts: row.try_get::<i64, _>("ts")? as u64,
-                    subject: row.try_get::<Option<String>, _>("subject")?,
-                    decision,
-                    reason: row.try_get::<Option<String>, _>("reason")?,
-                    action: row.try_get::<Option<String>, _>("action")?,
-                    cluster: row.try_get::<Option<String>, _>("cluster")?,
-                    method: row.try_get::<Option<String>, _>("method")?,
-                    path: row.try_get::<Option<String>, _>("path")?,
-                    status: row.try_get::<Option<i64>, _>("status")?.map(|s| s as u16),
-                    latency_ms: row
-                        .try_get::<Option<i64>, _>("latency_ms")?
-                        .map(|l| l as u64),
-                    required,
-                    granted_roles,
-                };
-                Ok::<_, StoreError>((row.try_get::<i64, _>("seq")? as u64, event))
-            })
+            .iter()
+            .map(row_to_audit_event)
             .collect::<Result<_, _>>()?;
         let next_cursor = if out.len() > limit {
             out.truncate(limit);
@@ -990,6 +1059,47 @@ impl Store for SqliteStore {
             None
         };
         Ok((out, next_cursor))
+    }
+
+    async fn audit_chain(
+        &self,
+        from_seq: Option<u64>,
+        limit: u32,
+    ) -> Result<AuditChainWindow, StoreError> {
+        // The hash the window's first row must chain from: genesis at the
+        // start of the trail, else the newest preceding row's.
+        let head = match from_seq {
+            Some(from) if from > 1 => sqlx::query(
+                "SELECT chain_hash FROM audit_events WHERE seq < ? ORDER BY seq DESC LIMIT 1",
+            )
+            .bind(from.min(i64::MAX as u64) as i64)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|r| r.try_get::<String, _>(0))
+            .transpose()?
+            .unwrap_or_else(|| AUDIT_GENESIS_HASH.to_string()),
+            _ => AUDIT_GENESIS_HASH.to_string(),
+        };
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT seq, ts, subject, decision, reason, action, cluster, method, path, \
+             status, latency_ms, required_json, granted_roles, chain_hash FROM audit_events",
+        );
+        if let Some(from) = from_seq {
+            qb.push(" WHERE seq >= ")
+                .push_bind(from.min(i64::MAX as u64) as i64);
+        }
+        qb.push(" ORDER BY seq ASC LIMIT ").push_bind(limit as i64);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|row| {
+                let (seq, event) = row_to_audit_event(row)?;
+                Ok::<_, StoreError>((seq, event, row.try_get::<String, _>("chain_hash")?))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(AuditChainWindow { head, rows })
     }
 
     async fn create_local_user(

@@ -264,8 +264,9 @@ pub struct StoredPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RoleAssignment {
     pub principal: String,
-    /// Role name ("viewer" | "developer" | "operator" | "admin") — the
-    /// `mobula_auth::Role` wire form; the store stays free of the auth crate.
+    /// Role name ("viewer" | "developer" | "operator" | "admin" |
+    /// "auditor") — the `mobula_auth::Role` wire form; the store stays free
+    /// of the auth crate.
     pub role: String,
     /// `"*"` or `"project:<name>"`.
     pub scope: String,
@@ -326,6 +327,105 @@ pub fn next_login_failure_state(failed_logins: u32, now: u64) -> (u32, Option<u6
         (0, Some(now + LOCKOUT_SECS))
     } else {
         (failed, None)
+    }
+}
+
+// --- Audit tamper-evidence (#59, api-v1.md §5.9) ---
+//
+// The audit trail is hash-chained: every appended row carries a
+// `chain_hash` = sha256 over (previous row's chain_hash ‖ this row's
+// canonical serialization). A single `chain_hash` column suffices — the
+// previous row's hash is an *input* to this row's hash, so a separate
+// `prev_hash` column would be redundant (the previous row's `chain_hash`
+// IS the prev_hash). The genesis row chains from [`AUDIT_GENESIS_HASH`].
+// This is tamper-EVIDENCE, not tamper-proofing: there is no secret key, so
+// an attacker with write access to the table can recompute the chain — but
+// any edit, insert, or delete of a middle row breaks every later hash, and
+// `GET /api/v1/audit/verify` detects that. (Deleting the *newest* rows
+// leaves no gap to detect — a documented limitation; ship the JSONL export
+// off-box for non-repudiation.)
+
+/// The chain head the very first audit row (seq 1) chains from: 64 zero
+/// hex chars. Fixed-length like every other hash in the chain, so the
+/// hash input's concatenation is unambiguous without a separator.
+pub const AUDIT_GENESIS_HASH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// One audit row as the chain sees it: (seq, event, stored chain_hash).
+pub type ChainedAuditRow = (u64, AuditEvent, String);
+
+/// A window of the audit chain, ascending by seq, for verification.
+#[derive(Debug, Clone)]
+pub struct AuditChainWindow {
+    /// The hash the first row in `rows` must chain from:
+    /// [`AUDIT_GENESIS_HASH`] when the window starts at the beginning of
+    /// the trail, else the newest row before the window's `chain_hash`.
+    pub head: String,
+    /// (seq, event, chain_hash), ascending by seq.
+    pub rows: Vec<ChainedAuditRow>,
+}
+
+/// The chain hash of a row: sha256 hex over (prev_hash ‖ canonical event
+/// serialization). The canonical serialization is `serde_json` over
+/// [`AuditEvent`]: struct field order is fixed by declaration and `Option`
+/// fields always serialize (nulls present), so every store implementation
+/// — and the verifier — produces byte-identical input. `prev_hash` is
+/// always 64 lowercase hex chars (genesis included), making the
+/// concatenation unambiguous.
+pub fn audit_chain_hash(prev_hash: &str, event: &AuditEvent) -> String {
+    use sha2::Digest;
+    let canonical =
+        serde_json::to_vec(event).expect("AuditEvent is plain data; serialization cannot fail");
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(&canonical);
+    let digest = hasher.finalize();
+    use std::fmt::Write;
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        write!(out, "{b:02x}").unwrap();
+    }
+    out
+}
+
+/// The result of replaying a chain window ([`verify_audit_chain`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditChainVerification {
+    /// Rows that verified before the replay stopped (all rows on success;
+    /// the rows *before* the broken one on failure).
+    pub events_checked: u64,
+    /// Seq of the first row whose stored `chain_hash` doesn't match the
+    /// replay; `None` when the whole window verifies.
+    pub first_broken_seq: Option<u64>,
+}
+
+impl AuditChainVerification {
+    pub fn ok(&self) -> bool {
+        self.first_broken_seq.is_none()
+    }
+}
+
+/// Replay a chain window: recompute each row's hash from its predecessor
+/// (starting at `head`) and compare against the stored `chain_hash`. Stops
+/// at the first mismatch — everything after a broken link is untrustworthy
+/// by construction. Pure and shared by every store backend and the
+/// `/api/v1/audit/verify` endpoint.
+pub fn verify_audit_chain(head: &str, rows: &[ChainedAuditRow]) -> AuditChainVerification {
+    let mut prev = head;
+    let mut checked = 0u64;
+    for (seq, event, stored) in rows {
+        if audit_chain_hash(prev, event) != *stored {
+            return AuditChainVerification {
+                events_checked: checked,
+                first_broken_seq: Some(*seq),
+            };
+        }
+        prev = stored;
+        checked += 1;
+    }
+    AuditChainVerification {
+        events_checked: checked,
+        first_broken_seq: None,
     }
 }
 
@@ -491,6 +591,18 @@ pub trait Store: Send + Sync {
         filter: &AuditFilter,
     ) -> Result<(Vec<(u64, AuditEvent)>, Option<u64>), StoreError>;
 
+    /// Read the audit chain (#59) in ASCENDING seq order for verification:
+    /// rows with `seq >= from_seq` (the whole trail when `None`), at most
+    /// `limit`. The window's `head` is the hash the first row must chain
+    /// from — [`AUDIT_GENESIS_HASH`] at the start of the trail, else the
+    /// newest preceding row's `chain_hash` — so a mid-trail window verifies
+    /// against the same head the rows were written with.
+    async fn audit_chain(
+        &self,
+        from_seq: Option<u64>,
+        limit: u32,
+    ) -> Result<AuditChainWindow, StoreError>;
+
     // --- Local auth (ADR-0011) ---
 
     /// Create a local user. The store receives the bcrypt password hash,
@@ -635,6 +747,115 @@ mod tests {
         assert!(err.contains("bad usage source"), "{err}");
     }
 
+    // --- #59 audit chain ---
+
+    fn chain_event(ts: u64, subject: Option<&str>) -> AuditEvent {
+        AuditEvent {
+            ts,
+            subject: subject.map(String::from),
+            decision: mobula_core::AuditDecision::Allow,
+            action: Some("create_cluster".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Chain n events from genesis, returning rows as `(seq, event, hash)`.
+    fn chain_rows(events: Vec<AuditEvent>) -> Vec<ChainedAuditRow> {
+        let mut prev = AUDIT_GENESIS_HASH.to_string();
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let hash = audit_chain_hash(&prev, &e);
+                prev = hash.clone();
+                (i as u64 + 1, e, hash)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chain_hash_is_deterministic_and_prev_sensitive() {
+        let e = chain_event(100, Some("alice"));
+        let h1 = audit_chain_hash(AUDIT_GENESIS_HASH, &e);
+        assert_eq!(h1, audit_chain_hash(AUDIT_GENESIS_HASH, &e));
+        assert_eq!(h1.len(), 64, "lowercase hex sha256");
+        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
+        // A different predecessor yields a different hash for the same row.
+        assert_ne!(h1, audit_chain_hash(&h1, &e));
+        // A different row under the same predecessor differs too.
+        assert_ne!(
+            h1,
+            audit_chain_hash(AUDIT_GENESIS_HASH, &chain_event(101, Some("alice")))
+        );
+    }
+
+    #[test]
+    fn verify_accepts_an_intact_chain_from_genesis() {
+        let rows = chain_rows(vec![
+            chain_event(100, Some("alice")),
+            chain_event(200, None),
+            chain_event(300, Some("bob")),
+        ]);
+        let v = verify_audit_chain(AUDIT_GENESIS_HASH, &rows);
+        assert!(v.ok());
+        assert_eq!(v.events_checked, 3);
+        assert_eq!(v.first_broken_seq, None);
+        // An empty window trivially verifies (nothing to check).
+        let v = verify_audit_chain(AUDIT_GENESIS_HASH, &[]);
+        assert!(v.ok() && v.events_checked == 0);
+    }
+
+    #[test]
+    fn verify_flags_a_tampered_row_at_its_seq() {
+        let mut rows = chain_rows(vec![
+            chain_event(100, Some("alice")),
+            chain_event(200, None),
+            chain_event(300, Some("bob")),
+        ]);
+        // Tamper with the middle row's payload without fixing the chain.
+        rows[1].1.subject = Some("mallory".into());
+        let v = verify_audit_chain(AUDIT_GENESIS_HASH, &rows);
+        assert!(!v.ok());
+        assert_eq!(v.events_checked, 1, "row 1 verified, row 2 broke");
+        assert_eq!(v.first_broken_seq, Some(2));
+
+        // A forged hash on the last row is caught at that row.
+        let mut rows = chain_rows(vec![chain_event(100, None), chain_event(200, None)]);
+        rows[1].2 = "f".repeat(64);
+        let v = verify_audit_chain(AUDIT_GENESIS_HASH, &rows);
+        assert_eq!(v.first_broken_seq, Some(2));
+        assert_eq!(v.events_checked, 1);
+    }
+
+    #[test]
+    fn verify_flags_a_deleted_middle_row() {
+        let rows = chain_rows(vec![
+            chain_event(100, None),
+            chain_event(200, None),
+            chain_event(300, None),
+        ]);
+        // Drop the middle row: row 3's stored hash chains from row 2's, so
+        // replay from row 1 mismatches at seq 3.
+        let truncated = vec![rows[0].clone(), rows[2].clone()];
+        let v = verify_audit_chain(AUDIT_GENESIS_HASH, &truncated);
+        assert_eq!(v.first_broken_seq, Some(3));
+    }
+
+    #[test]
+    fn verify_a_mid_trail_window_against_its_head() {
+        let rows = chain_rows(vec![
+            chain_event(100, None),
+            chain_event(200, None),
+            chain_event(300, None),
+        ]);
+        // The window [2, 3] verifies against row 1's hash as head.
+        let v = verify_audit_chain(&rows[0].2, &rows[1..]);
+        assert!(v.ok() && v.events_checked == 2);
+        // The same window from genesis (the wrong head) breaks at seq 2.
+        let v = verify_audit_chain(AUDIT_GENESIS_HASH, &rows[1..]);
+        assert_eq!(v.first_broken_seq, Some(2));
+    }
+
     #[tokio::test]
     async fn queue_assignment_resolves_first_matching_allocation() {
         use mobula_core::FlavorSpec;
@@ -708,8 +929,9 @@ pub mod memory {
         /// Governance policy row (api-v1.md §5.16); `None` = never seeded
         /// nor edited.
         policy: Mutex<Option<StoredPolicy>>,
-        /// (seq, event) in insertion order; seq is 1-based from `audit_seq`.
-        audit: Mutex<Vec<(u64, AuditEvent)>>,
+        /// (seq, event, chain_hash) in insertion order; seq is 1-based from
+        /// `audit_seq`. The chain hash (#59) is computed at append time.
+        audit: Mutex<Vec<ChainedAuditRow>>,
         audit_seq: std::sync::atomic::AtomicU64,
         local_users: Mutex<HashMap<String, LocalUserRecord>>,
         api_tokens: Mutex<HashMap<String, ApiTokenRecord>>,
@@ -1001,9 +1223,37 @@ pub mod memory {
         }
 
         async fn record_audit(&self, event: &AuditEvent) -> Result<u64, StoreError> {
+            let mut rows = self.audit.lock().unwrap();
             let seq = self.audit_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            self.audit.lock().unwrap().push((seq, event.clone()));
+            let prev = rows
+                .last()
+                .map(|(_, _, h)| h.as_str())
+                .unwrap_or(AUDIT_GENESIS_HASH);
+            let chain_hash = audit_chain_hash(prev, event);
+            rows.push((seq, event.clone(), chain_hash));
             Ok(seq)
+        }
+
+        async fn audit_chain(
+            &self,
+            from_seq: Option<u64>,
+            limit: u32,
+        ) -> Result<AuditChainWindow, StoreError> {
+            let rows = self.audit.lock().unwrap();
+            let from = from_seq.unwrap_or(1);
+            let head = rows
+                .iter()
+                .rev()
+                .find(|(seq, _, _)| *seq < from)
+                .map(|(_, _, h)| h.clone())
+                .unwrap_or_else(|| AUDIT_GENESIS_HASH.to_string());
+            let window = rows
+                .iter()
+                .filter(|(seq, _, _)| *seq >= from)
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Ok(AuditChainWindow { head, rows: window })
         }
 
         async fn get_policy(&self) -> Result<Option<StoredPolicy>, StoreError> {
@@ -1034,8 +1284,8 @@ pub mod memory {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(seq, e)| filter.cursor.is_none_or(|c| *seq < c) && filter.matches(e))
-                .cloned()
+                .filter(|(seq, e, _)| filter.cursor.is_none_or(|c| *seq < c) && filter.matches(e))
+                .map(|(seq, e, _)| (*seq, e.clone()))
                 .collect();
             // Newest first; insertion order is ascending seq.
             rows.reverse();
@@ -1441,6 +1691,14 @@ pub(crate) mod testkit {
         async fn record_audit(&self, event: &AuditEvent) -> Result<u64, StoreError> {
             self.check("record_audit")?;
             self.inner.record_audit(event).await
+        }
+        async fn audit_chain(
+            &self,
+            from_seq: Option<u64>,
+            limit: u32,
+        ) -> Result<AuditChainWindow, StoreError> {
+            self.check("audit_chain")?;
+            self.inner.audit_chain(from_seq, limit).await
         }
         async fn get_policy(&self) -> Result<Option<StoredPolicy>, StoreError> {
             self.check("get_policy")?;

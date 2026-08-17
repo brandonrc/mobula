@@ -20,6 +20,13 @@ pub struct ClusterEndpoint {
     /// serialization so it can't leak through API responses.
     #[serde(default, skip_serializing)]
     pub auth_token: Option<String>,
+    /// Name of the environment variable to read the auth token from at
+    /// load time — secret indirection so the registry file holds no
+    /// plaintext credential (compliance issue #57). Mutually exclusive
+    /// with `auth_token`; unlike the token, the name is not a secret and
+    /// may serialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_env: Option<String>,
 }
 
 // Manual Debug: the auth token must never reach logs via `{:?}` — the
@@ -35,6 +42,7 @@ impl std::fmt::Debug for ClusterEndpoint {
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("auth_token_env", &self.auth_token_env)
             .finish()
     }
 }
@@ -67,6 +75,28 @@ pub enum RegistryError {
     CleartextToken(String),
     #[error("cluster {id}: invalid hostname {hostname:?}")]
     InvalidHostname { id: String, hostname: String },
+    #[error(
+        "cluster {0}: both auth_token and auth_token_env are set — exactly one token \
+         source is allowed (issue #57)"
+    )]
+    ConflictingTokenSource(String),
+    #[error(
+        "cluster {id}: auth_token_env {var:?} is unset or empty — refusing to start \
+         with a missing cluster credential"
+    )]
+    MissingTokenEnv { id: String, var: String },
+}
+
+/// Where a registry entry's southbound token comes from — surfaced as
+/// startup log lines (#57). Carries names (cluster id, env var) only,
+/// never token values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenSourceNote {
+    /// Plaintext token sitting in the registry file — works, but should
+    /// move to `auth_token_env`.
+    Plaintext { id: String },
+    /// Token is read from the named environment variable at load time.
+    Env { id: String, var: String },
 }
 
 impl ClusterRegistry {
@@ -81,6 +111,55 @@ impl ClusterRegistry {
 
     pub fn by_id(&self, id: &ClusterId) -> Option<&ClusterEndpoint> {
         self.clusters.iter().find(|c| &c.id == id)
+    }
+
+    /// Resolve `auth_token_env` indirections into `auth_token` at load
+    /// time (issue #57): each entry naming an env var has the token read
+    /// from the process environment, so downstream gateway code sees one
+    /// in-memory shape. Fails fast on a missing/empty variable, naming
+    /// the cluster and the variable — never a value. An entry setting
+    /// both token sources is rejected. `auth_token_env` is kept set
+    /// afterwards as provenance (it names the source; it is not a
+    /// secret).
+    pub fn resolve_auth_tokens(&mut self) -> Result<(), RegistryError> {
+        for c in &mut self.clusters {
+            if c.auth_token.is_some() && c.auth_token_env.is_some() {
+                return Err(RegistryError::ConflictingTokenSource(c.id.0.clone()));
+            }
+            if let Some(var) = c.auth_token_env.clone() {
+                match std::env::var(&var) {
+                    Ok(token) if !token.is_empty() => c.auth_token = Some(token),
+                    _ => {
+                        return Err(RegistryError::MissingTokenEnv {
+                            id: c.id.0.clone(),
+                            var,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Per-entry token-source notes for startup logging (#57): plaintext
+    /// entries get a nudge toward `auth_token_env`, env-sourced entries
+    /// are acknowledged. Names only — never values.
+    pub fn token_source_notes(&self) -> Vec<TokenSourceNote> {
+        self.clusters
+            .iter()
+            .filter_map(|c| {
+                if let Some(var) = &c.auth_token_env {
+                    Some(TokenSourceNote::Env {
+                        id: c.id.0.clone(),
+                        var: var.clone(),
+                    })
+                } else if c.auth_token.is_some() {
+                    Some(TokenSourceNote::Plaintext { id: c.id.0.clone() })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Validate the registry as security-sensitive input (issues #2/#8):
@@ -216,7 +295,18 @@ mod tests {
                 hostname: "demo.ray.example.com".into(),
                 api_base_url: "http://demo-head-svc:8265".into(),
                 auth_token: Some("secret".into()),
+                auth_token_env: None,
             }],
+        }
+    }
+
+    fn endpoint(id: &str) -> ClusterEndpoint {
+        ClusterEndpoint {
+            id: ClusterId(id.into()),
+            hostname: format!("{id}.ray.example.com"),
+            api_base_url: "https://demo-head-svc:8265".into(),
+            auth_token: None,
+            auth_token_env: None,
         }
     }
 
@@ -244,6 +334,7 @@ mod tests {
                 hostname: "fe80::1".into(),
                 api_base_url: "http://[fe80::1]:8265".into(),
                 auth_token: None,
+                auth_token_env: None,
             }],
         };
         assert!(r.by_hostname("fe80::1").is_some());
@@ -280,6 +371,7 @@ mod tests {
             hostname: "DEMO.ray.example.com".into(), // case-insensitive dup
             api_base_url: "https://x:1".into(),
             auth_token: None,
+            auth_token_env: None,
         });
         assert!(matches!(
             dup.validate(true),
@@ -292,6 +384,7 @@ mod tests {
             hostname: "other.example.com".into(),
             api_base_url: "https://x:1".into(),
             auth_token: None,
+            auth_token_env: None,
         });
         assert!(matches!(
             dup_id.validate(true),
@@ -374,5 +467,114 @@ mod tests {
         let json = serde_json::to_string(&registry()).unwrap();
         assert!(!json.contains("secret"));
         assert!(!json.contains("auth_token"));
+    }
+
+    #[test]
+    fn auth_token_env_serializes_but_token_never_does() {
+        // #57: the env var NAME is not a secret and may serialize; the
+        // token itself must not, even when env-sourced.
+        let mut r = ClusterRegistry {
+            clusters: vec![{
+                let mut e = endpoint("demo");
+                e.auth_token_env = Some("DEMO_RAY_TOKEN".into());
+                e
+            }],
+        };
+        std::env::set_var("DEMO_RAY_TOKEN", "env-secret");
+        r.resolve_auth_tokens().unwrap();
+        std::env::remove_var("DEMO_RAY_TOKEN");
+
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("auth_token_env"), "{json}");
+        assert!(json.contains("DEMO_RAY_TOKEN"), "{json}");
+        assert!(!json.contains("env-secret"), "{json}");
+    }
+
+    #[test]
+    fn resolve_auth_tokens_reads_env_into_auth_token() {
+        let mut r = ClusterRegistry {
+            clusters: vec![{
+                let mut e = endpoint("demo");
+                e.auth_token_env = Some("MOBULA_CORE_TEST_TOKEN_OK".into());
+                e
+            }],
+        };
+        std::env::set_var("MOBULA_CORE_TEST_TOKEN_OK", "resolved-secret");
+        r.resolve_auth_tokens().unwrap();
+        std::env::remove_var("MOBULA_CORE_TEST_TOKEN_OK");
+        // In-memory shape is unchanged: the gateway reads the resolved
+        // token from `auth_token`; the env name stays as provenance.
+        assert_eq!(r.clusters[0].auth_token.as_deref(), Some("resolved-secret"));
+        assert_eq!(
+            r.clusters[0].auth_token_env.as_deref(),
+            Some("MOBULA_CORE_TEST_TOKEN_OK")
+        );
+    }
+
+    #[test]
+    fn resolve_auth_tokens_fails_fast_on_missing_or_empty_env() {
+        for value in [None, Some("")] {
+            let mut r = ClusterRegistry {
+                clusters: vec![{
+                    let mut e = endpoint("demo");
+                    e.auth_token_env = Some("MOBULA_CORE_TEST_TOKEN_MISSING".into());
+                    e
+                }],
+            };
+            match value {
+                Some(v) => std::env::set_var("MOBULA_CORE_TEST_TOKEN_MISSING", v),
+                None => std::env::remove_var("MOBULA_CORE_TEST_TOKEN_MISSING"),
+            }
+            let err = r.resolve_auth_tokens().unwrap_err();
+            std::env::remove_var("MOBULA_CORE_TEST_TOKEN_MISSING");
+            assert_eq!(
+                err,
+                RegistryError::MissingTokenEnv {
+                    id: "demo".into(),
+                    var: "MOBULA_CORE_TEST_TOKEN_MISSING".into(),
+                }
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("demo") && msg.contains("MOBULA_CORE_TEST_TOKEN_MISSING"));
+        }
+    }
+
+    #[test]
+    fn resolve_auth_tokens_rejects_both_token_sources() {
+        let mut r = registry(); // plaintext token
+        r.clusters[0].auth_token_env = Some("SOME_VAR".into());
+        assert_eq!(
+            r.resolve_auth_tokens().unwrap_err(),
+            RegistryError::ConflictingTokenSource("demo".into())
+        );
+    }
+
+    #[test]
+    fn token_source_notes_flag_plaintext_and_acknowledge_env() {
+        let r = registry(); // plaintext token
+        assert_eq!(
+            r.token_source_notes(),
+            vec![TokenSourceNote::Plaintext { id: "demo".into() }]
+        );
+
+        let mut env_entry = endpoint("envdemo");
+        env_entry.auth_token_env = Some("ENVDEMO_RAY_TOKEN".into());
+        let r = ClusterRegistry {
+            clusters: vec![env_entry],
+        };
+        assert_eq!(
+            r.token_source_notes(),
+            vec![TokenSourceNote::Env {
+                id: "envdemo".into(),
+                var: "ENVDEMO_RAY_TOKEN".into(),
+            }]
+        );
+
+        // Tokenless entries produce no note.
+        assert!(ClusterRegistry {
+            clusters: vec![endpoint("bare")],
+        }
+        .token_source_notes()
+        .is_empty());
     }
 }

@@ -289,6 +289,156 @@ fn pod_template(
 
 pub const SERVICE_KIND: &str = "RayService";
 
+// ---------------------------------------------------------------------------
+// Namespace security posture (#56 tenant network isolation, #62 STIG
+// pod-security defaults). These are per-namespace objects — one set covers
+// every RayCluster Mobula applies into the namespace — translated here
+// (pure) and applied by the live client's `ensure_namespace_posture`.
+// ---------------------------------------------------------------------------
+
+pub const NETWORK_POLICY_API_VERSION: &str = "networking.k8s.io/v1";
+pub const NETWORK_POLICY_KIND: &str = "NetworkPolicy";
+/// The default-deny policy Mobula ensures. Distinct name so an admin's own
+/// default-deny is detectable (check-then-apply never overwrites it).
+pub const DEFAULT_DENY_POLICY_NAME: &str = "mobula-default-deny";
+/// The explicit-allow policy paired with the default-deny.
+pub const TENANT_ALLOW_POLICY_NAME: &str = "mobula-tenant-allow";
+/// Namespace label marking the namespace(s) the Mobula control plane
+/// (API / reconciler / job gateway) runs in. The tenant allow policy opens
+/// ingress from those namespaces so the control plane can reach the Ray
+/// head (dashboard/jobs/metrics 8265, Ray client 10001). Operators label
+/// the control-plane namespace once:
+/// `kubectl label namespace <ns> mobula.dev/control-plane=true`.
+pub const CONTROL_PLANE_NAMESPACE_LABEL: &str = "mobula.dev/control-plane";
+
+/// The default-deny NetworkPolicy (#56, research: compliance gap §4.3 —
+/// the single highest-impact isolation fix): select every pod in the
+/// namespace, deny all ingress and egress. NetworkPolicies are additive
+/// (union of allows), so pairing this with [`tenant_allow_network_policy`]
+/// yields exactly the allow rules and nothing else.
+pub fn default_deny_network_policy() -> Value {
+    json!({
+        "apiVersion": NETWORK_POLICY_API_VERSION,
+        "kind": NETWORK_POLICY_KIND,
+        "metadata": {
+            "name": DEFAULT_DENY_POLICY_NAME,
+            "labels": { MANAGED_BY_LABEL: FIELD_MANAGER },
+        },
+        "spec": {
+            "podSelector": {},
+            "policyTypes": ["Ingress", "Egress"],
+        },
+    })
+}
+
+/// The explicit allows a Ray cluster needs under the default-deny (#56):
+///
+/// - same-namespace pod-to-pod, all ports (Ray head↔workers: GCS 6379,
+///   dashboard 8265, client 10001, plus the raylet's dynamic ports — too
+///   many to enumerate, and they stay inside the tenant boundary);
+/// - ingress from Mobula control-plane namespaces
+///   ([`CONTROL_PLANE_NAMESPACE_LABEL`]) to the head's dashboard (8265) and
+///   Ray client (10001) ports only — GCS is not a control-plane surface;
+/// - egress to kube-dns (namespace `kube-system`, `k8s-app: kube-dns`,
+///   port 53 UDP+TCP) — default-deny otherwise breaks DNS
+///   (research §4.3). The `kubernetes.io/metadata.name` namespace label is
+///   API-server-managed since 1.22, so this needs no admin labeling.
+pub fn tenant_allow_network_policy() -> Value {
+    json!({
+        "apiVersion": NETWORK_POLICY_API_VERSION,
+        "kind": NETWORK_POLICY_KIND,
+        "metadata": {
+            "name": TENANT_ALLOW_POLICY_NAME,
+            "labels": { MANAGED_BY_LABEL: FIELD_MANAGER },
+        },
+        "spec": {
+            "podSelector": {},
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [
+                // Ray head↔workers, unrestricted ports inside the tenant.
+                { "from": [ { "podSelector": {} } ] },
+                // The Mobula control plane → Ray head dashboard/client.
+                {
+                    "from": [
+                        { "namespaceSelector": {
+                            "matchLabels": { CONTROL_PLANE_NAMESPACE_LABEL: "true" },
+                        } },
+                    ],
+                    "ports": [
+                        { "protocol": "TCP", "port": 8265 },
+                        { "protocol": "TCP", "port": 10001 },
+                    ],
+                },
+            ],
+            "egress": [
+                { "to": [ { "podSelector": {} } ] },
+                {
+                    "to": [
+                        {
+                            "namespaceSelector": {
+                                "matchLabels": { "kubernetes.io/metadata.name": "kube-system" },
+                            },
+                            "podSelector": {
+                                "matchLabels": { "k8s-app": "kube-dns" },
+                            },
+                        },
+                    ],
+                    "ports": [
+                        { "protocol": "UDP", "port": 53 },
+                        { "protocol": "TCP", "port": 53 },
+                    ],
+                },
+            ],
+        },
+    })
+}
+
+pub const PSS_ENFORCE_LABEL: &str = "pod-security.kubernetes.io/enforce";
+pub const PSS_WARN_LABEL: &str = "pod-security.kubernetes.io/warn";
+pub const PSS_AUDIT_LABEL: &str = "pod-security.kubernetes.io/audit";
+
+/// Pod Security Standards namespace labels (#62, K8s STIG V-242437).
+/// `enforce` is **baseline**, not restricted: KubeRay-generated Ray pods do
+/// not carry the full restricted securityContext (`runAsNonRoot`, seccomp,
+/// drop-all capabilities), so enforcing restricted would reject every Ray
+/// pod Mobula provisions. `warn`/`audit` at restricted still surface the
+/// gap (and the evidence trail) without breaking workloads; an admin can
+/// tighten `enforce` to `restricted` once tenant images comply — the live
+/// client never downgrades a stricter existing level.
+pub fn namespace_pss_labels() -> Value {
+    json!({
+        PSS_ENFORCE_LABEL: "baseline",
+        PSS_WARN_LABEL: "restricted",
+        PSS_AUDIT_LABEL: "restricted",
+    })
+}
+
+/// Structural check for check-then-apply (#56): does this NetworkPolicy
+/// object deny all ingress+egress for every pod in the namespace? Used to
+/// detect an admin-managed default-deny Mobula must not touch. `policy` is
+/// the full object (or its `data` for a dynamic object); the spec must have
+/// an empty `podSelector` (all pods), both policyTypes, and no allow rules.
+pub fn is_default_deny(policy: &Value) -> bool {
+    let Some(spec) = policy.get("spec") else {
+        return false;
+    };
+    let selects_all = spec
+        .get("podSelector")
+        .and_then(|s| s.as_object())
+        .is_some_and(|m| m.is_empty());
+    let types: Vec<&str> = spec
+        .get("policyTypes")
+        .and_then(|t| t.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let denies_both = types.contains(&"Ingress") && types.contains(&"Egress");
+    let no_rules = |key: &str| match spec.get(key) {
+        None => true,
+        Some(v) => v.as_array().is_some_and(|a| a.is_empty()),
+    };
+    selects_all && denies_both && no_rules("ingress") && no_rules("egress")
+}
+
 /// The partial manifest a suspend/resume call actuates (#51): a JSON merge
 /// patch flipping only `spec.suspend`. Deliberately NOT a server-side apply:
 /// a partial SSA apply with Mobula's field manager is fully-specified intent
@@ -658,5 +808,141 @@ mod tests {
         // replicas (the autoscaler sidecar owns it).
         assert!(m["spec"]["workerGroupSpecs"][0].get("replicas").is_none());
         assert_eq!(m["spec"]["workerGroupSpecs"][0]["maxReplicas"], 4);
+    }
+
+    #[test]
+    fn default_deny_policy_shape() {
+        // #56: select every pod, deny all ingress+egress, carry no allow
+        // rules — the allow rules live only in the tenant-allow policy.
+        let p = default_deny_network_policy();
+        assert_eq!(p["apiVersion"], "networking.k8s.io/v1");
+        assert_eq!(p["kind"], "NetworkPolicy");
+        assert_eq!(p["metadata"]["name"], DEFAULT_DENY_POLICY_NAME);
+        assert_eq!(p["metadata"]["labels"][MANAGED_BY_LABEL], "mobula");
+        let spec = &p["spec"];
+        assert_eq!(spec["podSelector"], json!({}));
+        assert_eq!(spec["policyTypes"], json!(["Ingress", "Egress"]));
+        assert!(spec.get("ingress").is_none());
+        assert!(spec.get("egress").is_none());
+        // Our own default-deny is recognized by the check-then-apply probe.
+        assert!(is_default_deny(&p));
+    }
+
+    #[test]
+    fn tenant_allow_policy_shape() {
+        // #56: exactly the allows a Ray cluster needs — same-namespace
+        // pod-to-pod, control-plane ingress to the head's dashboard/client
+        // ports, kube-dns egress — and nothing else.
+        let p = tenant_allow_network_policy();
+        assert_eq!(p["metadata"]["name"], TENANT_ALLOW_POLICY_NAME);
+        assert_eq!(p["metadata"]["labels"][MANAGED_BY_LABEL], "mobula");
+        let spec = &p["spec"];
+        assert_eq!(spec["podSelector"], json!({}));
+        assert_eq!(spec["policyTypes"], json!(["Ingress", "Egress"]));
+        // An allow policy is not a default-deny (the probe must not skip
+        // posture setup because of it).
+        assert!(!is_default_deny(&p));
+
+        let ingress = spec["ingress"].as_array().unwrap();
+        assert_eq!(ingress.len(), 2);
+        // Ray head↔workers: same-namespace pods, all ports (GCS 6379,
+        // dashboard 8265, client 10001, raylet dynamic ports).
+        assert_eq!(ingress[0]["from"], json!([{ "podSelector": {} }]));
+        assert!(ingress[0].get("ports").is_none());
+        // Control plane → head: dashboard (8265) + Ray client (10001) only,
+        // from namespaces carrying the documented control-plane label.
+        assert_eq!(
+            ingress[1]["from"],
+            json!([{ "namespaceSelector": {
+                "matchLabels": { CONTROL_PLANE_NAMESPACE_LABEL: "true" },
+            } }])
+        );
+        assert_eq!(
+            ingress[1]["ports"],
+            json!([
+                { "protocol": "TCP", "port": 8265 },
+                { "protocol": "TCP", "port": 10001 },
+            ])
+        );
+
+        let egress = spec["egress"].as_array().unwrap();
+        assert_eq!(egress.len(), 2);
+        // Same-namespace pod-to-pod (workers → head).
+        assert_eq!(egress[0]["to"], json!([{ "podSelector": {} }]));
+        assert!(egress[0].get("ports").is_none());
+        // kube-dns only: kube-system namespace + kube-dns pods, 53 UDP+TCP.
+        assert_eq!(
+            egress[1]["to"],
+            json!([{
+                "namespaceSelector": {
+                    "matchLabels": { "kubernetes.io/metadata.name": "kube-system" },
+                },
+                "podSelector": { "matchLabels": { "k8s-app": "kube-dns" } },
+            }])
+        );
+        assert_eq!(
+            egress[1]["ports"],
+            json!([
+                { "protocol": "UDP", "port": 53 },
+                { "protocol": "TCP", "port": 53 },
+            ])
+        );
+    }
+
+    #[test]
+    fn pss_labels_enforce_baseline_warn_audit_restricted() {
+        // #62 (K8s STIG V-242437): enforce=baseline (restricted would reject
+        // KubeRay-generated Ray pods), warn+audit=restricted to surface the
+        // gap without breaking workloads.
+        let labels = namespace_pss_labels();
+        assert_eq!(labels[PSS_ENFORCE_LABEL], "baseline");
+        assert_eq!(labels[PSS_WARN_LABEL], "restricted");
+        assert_eq!(labels[PSS_AUDIT_LABEL], "restricted");
+    }
+
+    #[test]
+    fn is_default_deny_recognizes_foreign_deny_all() {
+        // #56 check-then-apply: an admin-managed deny-all (any name, no
+        // Mobula labels) must be detected so Mobula leaves the stricter
+        // posture untouched.
+        let foreign = json!({
+            "metadata": { "name": "org-deny-all" },
+            "spec": { "podSelector": {}, "policyTypes": ["Egress", "Ingress"] },
+        });
+        assert!(is_default_deny(&foreign));
+        // Explicit empty rule arrays still count as deny-all.
+        let explicit_empty = json!({
+            "spec": {
+                "podSelector": {},
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [],
+                "egress": [],
+            },
+        });
+        assert!(is_default_deny(&explicit_empty));
+
+        // Not default-deny: has allow rules, selects specific pods, covers
+        // only one direction, or is malformed.
+        let with_rules = json!({
+            "spec": {
+                "podSelector": {},
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [{ "from": [{ "podSelector": {} }] }],
+            },
+        });
+        assert!(!is_default_deny(&with_rules));
+        let selective = json!({
+            "spec": {
+                "podSelector": { "matchLabels": { "app": "x" } },
+                "policyTypes": ["Ingress", "Egress"],
+            },
+        });
+        assert!(!is_default_deny(&selective));
+        let ingress_only = json!({
+            "spec": { "podSelector": {}, "policyTypes": ["Ingress"] },
+        });
+        assert!(!is_default_deny(&ingress_only));
+        assert!(!is_default_deny(&json!({})));
+        assert!(!is_default_deny(&json!({ "spec": {} })));
     }
 }

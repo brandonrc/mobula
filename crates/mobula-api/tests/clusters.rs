@@ -178,6 +178,13 @@ impl Store for SlowListStore {
     ) -> Result<(Vec<(u64, mobula_core::AuditEvent)>, Option<u64>), StoreError> {
         self.inner.list_audit(filter).await
     }
+    async fn audit_chain(
+        &self,
+        from_seq: Option<u64>,
+        limit: u32,
+    ) -> Result<mobula_controller::AuditChainWindow, StoreError> {
+        self.inner.audit_chain(from_seq, limit).await
+    }
     async fn create_local_user(
         &self,
         username: &str,

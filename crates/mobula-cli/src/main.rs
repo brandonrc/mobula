@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use mobula_auth::{flows, AuthConfig, Validator};
-use mobula_core::ClusterRegistry;
+use mobula_core::{ClusterRegistry, TokenSourceNote};
 
 #[derive(Parser)]
 #[command(
@@ -25,8 +25,10 @@ enum Command {
         bind: std::net::SocketAddr,
         /// TOML cluster registry for the job gateway (Phase 1 static
         /// registry; the lifecycle controller replaces this in Phase 3).
-        /// When the file contains auth_tokens, a warning is logged if its
-        /// permissions are more permissive than 0600 (#4).
+        /// Prefer `auth_token_env` (name of an env var read at startup)
+        /// over a plaintext `auth_token` (#57). When the file contains
+        /// plaintext auth_tokens, a warning is logged if its permissions
+        /// are more permissive than 0600 (#4).
         #[arg(long)]
         registry: Option<std::path::PathBuf>,
         /// TOML auth config (OIDC issuer, audience, role mappings).
@@ -1059,26 +1061,53 @@ fn load_credentials() -> std::io::Result<Credentials> {
 
 fn load_registry(path: &std::path::Path) -> std::io::Result<ClusterRegistry> {
     let raw = std::fs::read_to_string(path)?;
-    let registry: ClusterRegistry = toml::from_str(&raw).map_err(|e| {
+    let mut registry: ClusterRegistry = toml::from_str(&raw).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid registry {}: {e}", path.display()),
         )
     })?;
+    // Token-source bookkeeping (#57): warn on plaintext tokens, acknowledge
+    // env-sourced ones — names only, never values.
+    for note in registry.token_source_notes() {
+        match note {
+            TokenSourceNote::Plaintext { id } => tracing::warn!(
+                cluster = %id,
+                "plaintext token in registry file; prefer auth_token_env — issue #57"
+            ),
+            TokenSourceNote::Env { id, var } => {
+                tracing::info!(cluster = %id, env_var = %var, "token source: env")
+            }
+        }
+    }
     if let Some(warning) = registry_permission_warning(path, &registry) {
         tracing::warn!("{warning}");
     }
+    // Fail fast before serving: an unresolved env indirection means a
+    // missing cluster credential.
+    registry.resolve_auth_tokens().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid registry {}: {e}", path.display()),
+        )
+    })?;
     Ok(registry)
 }
 
-/// A registry file carrying `auth_token`s holds bearer-equivalent secrets,
-/// like credentials.json — warn (never fail) when group/other can read it
-/// (#4). `None` when no tokens are present or the mode is 0600 or tighter.
+/// A registry file carrying plaintext `auth_token`s holds bearer-equivalent
+/// secrets, like credentials.json — warn (never fail) when group/other can
+/// read it (#4). Entries using `auth_token_env` hold no secret in the file
+/// (#57) and don't need the warning. `None` when no plaintext tokens are
+/// present or the mode is 0600 or tighter.
 fn registry_permission_warning(
     path: &std::path::Path,
     registry: &ClusterRegistry,
 ) -> Option<String> {
-    if !registry.clusters.iter().any(|c| c.auth_token.is_some()) {
+    if !registry
+        .clusters
+        .iter()
+        .any(|c| c.auth_token.is_some() && c.auth_token_env.is_none())
+    {
         return None;
     }
     #[cfg(unix)]
@@ -1241,6 +1270,61 @@ dev = { cpu = 200, memory = 400, "nvidia.com/gpu" = 8 }
     }
 
     #[test]
+    fn load_registry_resolves_auth_token_env() {
+        let dir = std::env::temp_dir().join(format!("mobula-cli-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("env.toml");
+        std::fs::write(
+            &path,
+            "[[clusters]]\nid = \"a\"\nhostname = \"a.test\"\n\
+             api_base_url = \"http://a:8265\"\n\
+             auth_token_env = \"MOBULA_CLI_TEST_REGISTRY_TOKEN\"\n",
+        )
+        .unwrap();
+
+        // Missing var → fail fast, naming the entry and the var.
+        std::env::remove_var("MOBULA_CLI_TEST_REGISTRY_TOKEN");
+        let err = load_registry(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains('a') && msg.contains("MOBULA_CLI_TEST_REGISTRY_TOKEN"),
+            "{msg}"
+        );
+
+        // Set var → token resolved into auth_token at load time (#57).
+        std::env::set_var("MOBULA_CLI_TEST_REGISTRY_TOKEN", "cli-env-secret");
+        let reg = load_registry(&path).unwrap();
+        std::env::remove_var("MOBULA_CLI_TEST_REGISTRY_TOKEN");
+        assert_eq!(
+            reg.clusters[0].auth_token.as_deref(),
+            Some("cli-env-secret")
+        );
+        assert_eq!(
+            reg.clusters[0].auth_token_env.as_deref(),
+            Some("MOBULA_CLI_TEST_REGISTRY_TOKEN")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_registry_rejects_conflicting_token_sources() {
+        let dir = std::env::temp_dir().join(format!("mobula-cli-both-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("both.toml");
+        std::fs::write(
+            &path,
+            "[[clusters]]\nid = \"a\"\nhostname = \"a.test\"\n\
+             api_base_url = \"http://a:8265\"\n\
+             auth_token = \"secret\"\nauth_token_env = \"SOME_VAR\"\n",
+        )
+        .unwrap();
+        let err = load_registry(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exactly one"), "{}", err);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn registry_toml_round_trip() {
         let toml = r#"
             [[clusters]]
@@ -1397,6 +1481,18 @@ dev = { cpu = 200, memory = 400, "nvidia.com/gpu" = 8 }
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(registry_permission_warning(&path, &bare).is_none());
+
+        // Env-referenced entries hold no secret in the file (#57) — no
+        // warning even once the token is resolved in memory.
+        let env_sourced: ClusterRegistry = ::toml::from_str(
+            "[[clusters]]\nid = \"a\"\nhostname = \"a.test\"\n\
+             api_base_url = \"http://a:8265\"\nauth_token_env = \"A_RAY_TOKEN\"\n",
+        )
+        .unwrap();
+        assert!(registry_permission_warning(&path, &env_sourced).is_none());
+        let mut resolved = env_sourced.clone();
+        resolved.clusters[0].auth_token = Some("resolved".into());
+        assert!(registry_permission_warning(&path, &resolved).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

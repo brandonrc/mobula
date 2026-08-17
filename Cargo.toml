@@ -42,6 +42,9 @@ bcrypt = "0.19"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# sha2 for the audit-trail hash chain (#59). Pure Rust, MIT OR Apache-2.0 —
+# already in the tree transitively (jsonwebtoken/rustls stack).
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tower = { version = "0.5", features = ["util", "limit"] }

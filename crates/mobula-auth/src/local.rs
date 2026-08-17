@@ -166,6 +166,7 @@ fn to_role(role: LocalRole) -> Role {
         LocalRole::Developer => Role::Developer,
         LocalRole::Operator => Role::Operator,
         LocalRole::Admin => Role::Admin,
+        LocalRole::Auditor => Role::Auditor,
     }
 }
 

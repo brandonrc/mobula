@@ -123,6 +123,38 @@ kind-based dev-stack instead: `./scripts/dev-stack.sh up` then `serve` + `ui`
 (see `docs/dev-stack.md`). This compose stack is purely for fast local UI/API
 iteration.
 
+## Registry secrets (cluster auth tokens)
+
+The static cluster registry (`serve --registry clusters.toml`) routes jobs to
+Ray heads; entries may carry the head's Ray auth token. **Don't put the token
+in the file** — reference an environment variable instead (issue #57, PCI
+8.6.2 / IA-5):
+
+```toml
+[[clusters]]
+id = "demo"
+hostname = "demo.ray.example.com"
+api_base_url = "https://demo-head-svc:8265"
+auth_token_env = "DEMO_RAY_AUTH_TOKEN"   # the env var NAME, not the token
+```
+
+Exactly one of `auth_token` / `auth_token_env` may be set per entry. The var
+is read once at startup: missing or empty → the server refuses to start,
+naming the cluster and the variable (never a value). A plaintext
+`auth_token` still works for local dev but logs a startup warning per entry
+and, if the file is group/other-readable, the chmod-600 warning (#4).
+
+In production on Kubernetes, the env var comes from a Secret via
+`secretKeyRef` — the registry TOML then lives in a ConfigMap with no secret
+material at all:
+
+```yaml
+env:
+  - name: DEMO_RAY_AUTH_TOKEN
+    valueFrom:
+      secretKeyRef: { name: ray-head-auth, key: demo-token }
+```
+
 **Pools:** pools/Kueue are optional here. Kueue is a Kubernetes component and
 this stack has no Kubernetes, so pools run in **in-process quota-only** mode
 (ADR-0010's fallback): the pools API, allocations, and usage screens all work,

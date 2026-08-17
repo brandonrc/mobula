@@ -18,16 +18,22 @@
 //! `allow`: a request Mobula refuses never reaches the gateway (its deny
 //! row comes from the refuser), and an upstream 4xx/5xx is the cluster's
 //! answer to an allowed request — the outcome lives in `status`.
+//!
+//! Tamper-evidence and access (#59, api-v1.md §5.9): the store hash-chains
+//! every appended row (sha256 of prev-hash ‖ canonical row);
+//! `GET /api/v1/audit/verify` replays it. Reads (list, CSV export, verify)
+//! themselves append `audit_read` rows. Both endpoints need `Read` on
+//! `Target::Audit` — Admin's catch-all or `Role::Auditor`, nothing else.
 
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use mobula_auth::{Identity, PermissionType, Role, Target};
-use mobula_controller::Store;
+use mobula_controller::{now_unix, verify_audit_chain, Store};
 use mobula_core::{AuditDecision, AuditEvent, AuditFilter};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -52,6 +58,7 @@ pub(crate) fn target_str(target: Target) -> String {
         Target::Cluster => "cluster",
         Target::Service => "service",
         Target::Pool => "pool",
+        Target::Audit => "audit",
     }
     .to_string()
 }
@@ -63,6 +70,7 @@ pub(crate) fn role_str(role: &Role) -> String {
         Role::Developer => "developer",
         Role::Operator => "operator",
         Role::Admin => "admin",
+        Role::Auditor => "auditor",
     }
     .to_string()
 }
@@ -200,7 +208,34 @@ fn render_csv(rows: &[(u64, AuditEvent)]) -> String {
     out
 }
 
-/// List the persisted audit trail, Admin-only (api-v1.md §5.9).
+/// Emit the `audit_read` event for a successful audit-surface read (#59,
+/// SOC 2 CC7.2): reading the trail itself appends a row — deliberate
+/// recursion, so audit access is itself auditable. Emitted for JSON reads,
+/// CSV exports, and `/api/v1/audit/verify` alike. The row is
+/// handler-styled (action, no method); its `path` carries the request's
+/// query string — an exception to the usual no-query-string convention,
+/// because the filter params ARE the payload worth auditing.
+async fn emit_audit_read(store: &Arc<dyn Store>, identity: Option<&Identity>, uri: &Uri) {
+    let path = match uri.query() {
+        Some(query) if !query.is_empty() => format!("{}?{query}", uri.path()),
+        _ => uri.path().to_string(),
+    };
+    emit(
+        Some(store),
+        AuditEvent {
+            ts: now_unix(),
+            subject: identity.map(|i| i.subject.clone()),
+            decision: AuditDecision::Allow,
+            action: Some("audit_read".into()),
+            path: Some(path),
+            status: Some(StatusCode::OK.as_u16()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+/// List the persisted audit trail, Admin/Auditor-only (api-v1.md §5.9).
 #[utoipa::path(
     get, path = "/api/v1/audit", tag = "audit",
     params(AuditQuery),
@@ -209,23 +244,25 @@ fn render_csv(rows: &[(u64, AuditEvent)]) -> String {
              `?format=csv` returns text/csv instead.", body = AuditListResponse),
         (status = 400, description = "Bad query (e.g. from > to, unknown format)"),
         (status = 401, description = "No/invalid token"),
-        (status = 403, description = "Admin only — audit subjects are Admin data"),
+        (status = 403, description = "Admin or Auditor only — audit subjects are Admin data"),
     ),
     security(("bearer" = []))
 )]
 async fn list_audit_events(
     State(st): State<AuditApiState>,
     identity: Option<Extension<Identity>>,
+    uri: Uri,
     Query(q): Query<AuditQuery>,
 ) -> Response {
-    // Admin-only, same as the registry route: audit subjects are Admin
-    // data (api-v1.md §2.2); Target::Cluster because the trail is dominated
-    // by cluster routing/lifecycle decisions.
+    // Admin or Auditor (#59): audit reads need Read on Target::Audit,
+    // which Admin's catch-all and Auditor's only grant both cover. Audit
+    // subjects are Admin data (api-v1.md §2.2), so Viewer is explicitly
+    // excluded from this target.
     if let Some(deny) = authorize(
         Some(&st.store),
         identity.as_ref().map(|e| &e.0),
-        PermissionType::Admin,
-        Target::Cluster,
+        PermissionType::Read,
+        Target::Audit,
     )
     .await
     {
@@ -257,6 +294,10 @@ async fn list_audit_events(
     };
     match st.store.list_audit(&filter).await {
         Ok((rows, next_cursor)) => {
+            // Successful reads are themselves audited (#59) — CSV exports
+            // included; the export is distinguishable by `format=csv` in
+            // the recorded path's query string.
+            emit_audit_read(&st.store, identity.as_ref().map(|e| &e.0), &uri).await;
             if csv {
                 (
                     [
@@ -284,9 +325,92 @@ async fn list_audit_events(
     }
 }
 
+/// Query for `GET /api/v1/audit/verify` (api-v1.md §5.9).
+#[derive(Deserialize, IntoParams)]
+pub struct AuditVerifyQuery {
+    /// First `seq` to check (default 1 — the whole trail from genesis).
+    /// The window chains from the newest preceding row's stored hash, so a
+    /// mid-trail window verifies against the same head it was written with.
+    pub from_seq: Option<u64>,
+    /// Max rows to replay (default 100_000, clamped to 1_000_000). Trails
+    /// larger than one window verify in successive `from_seq` windows.
+    pub limit: Option<u32>,
+}
+
+/// Response of `GET /api/v1/audit/verify`.
+#[derive(Serialize, ToSchema)]
+pub struct AuditVerifyResponse {
+    /// True when every row in the window matched the replayed chain.
+    pub ok: bool,
+    /// Rows that verified before the replay stopped (the whole window on
+    /// success; the rows before the broken one on failure).
+    pub events_checked: u64,
+    /// Seq of the first row whose stored `chain_hash` doesn't match the
+    /// replay; `null` when the window verifies clean.
+    pub first_broken_seq: Option<u64>,
+}
+
+/// Default and hard cap for one verify window (#59): "all" in practice for
+/// any realistic trail, bounded so a huge table can't OOM the process.
+const VERIFY_DEFAULT_LIMIT: u32 = 100_000;
+const VERIFY_MAX_LIMIT: u32 = 1_000_000;
+
+/// Replay the audit hash chain over a window, Admin/Auditor-only (#59).
+#[utoipa::path(
+    get, path = "/api/v1/audit/verify", tag = "audit",
+    params(AuditVerifyQuery),
+    responses(
+        (status = 200, description = "Chain replay result", body = AuditVerifyResponse),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Admin or Auditor only"),
+    ),
+    security(("bearer" = []))
+)]
+async fn verify_audit_trail(
+    State(st): State<AuditApiState>,
+    identity: Option<Extension<Identity>>,
+    uri: Uri,
+    Query(q): Query<AuditVerifyQuery>,
+) -> Response {
+    if let Some(deny) = authorize(
+        Some(&st.store),
+        identity.as_ref().map(|e| &e.0),
+        PermissionType::Read,
+        Target::Audit,
+    )
+    .await
+    {
+        return deny;
+    }
+    let limit = q
+        .limit
+        .unwrap_or(VERIFY_DEFAULT_LIMIT)
+        .clamp(1, VERIFY_MAX_LIMIT);
+    match st.store.audit_chain(q.from_seq, limit).await {
+        Ok(window) => {
+            let v = verify_audit_chain(&window.head, &window.rows);
+            // Verify reads the trail, so it too leaves an audit_read row
+            // (#59) — appended after the replay, so the event itself never
+            // perturbs the window it just checked.
+            emit_audit_read(&st.store, identity.as_ref().map(|e| &e.0), &uri).await;
+            Json(AuditVerifyResponse {
+                ok: v.ok(),
+                events_checked: v.events_checked,
+                first_broken_seq: v.first_broken_seq,
+            })
+            .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "audit store error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+        }
+    }
+}
+
 pub fn router(store: Arc<dyn Store>) -> Router {
     Router::new()
         .route("/api/v1/audit", get(list_audit_events))
+        .route("/api/v1/audit/verify", get(verify_audit_trail))
         .with_state(AuditApiState { store })
 }
 
@@ -351,7 +475,9 @@ mod tests {
     fn permission_target_role_strings_are_snake_case() {
         assert_eq!(permission_str(PermissionType::Write), "write");
         assert_eq!(target_str(Target::Cluster), "cluster");
+        assert_eq!(target_str(Target::Audit), "audit");
         assert_eq!(role_str(&Role::Viewer), "viewer");
         assert_eq!(role_str(&Role::Admin), "admin");
+        assert_eq!(role_str(&Role::Auditor), "auditor");
     }
 }

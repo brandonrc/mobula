@@ -28,6 +28,7 @@ async fn validator_for(idp: &Idp) -> Arc<Validator> {
             operator: vec!["/sre".into()],
             developer: vec!["/ml-eng".into()],
             viewer: vec!["/observers".into()],
+            auditor: vec![],
         },
     };
     Arc::new(
@@ -125,6 +126,7 @@ fn registry_for(id: &str, base_url: &str, token: Option<&str>) -> ClusterRegistr
             hostname: format!("{id}.ray.example.com"),
             api_base_url: base_url.into(),
             auth_token: token.map(String::from),
+            auth_token_env: None,
         }],
     }
 }

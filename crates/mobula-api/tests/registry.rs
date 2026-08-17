@@ -16,12 +16,14 @@ fn registry() -> ClusterRegistry {
                 hostname: "demo.ray.example.com".into(),
                 api_base_url: "https://demo-head:8265".into(),
                 auth_token: Some("super-secret-ray-token".into()),
+                auth_token_env: None,
             },
             ClusterEndpoint {
                 id: ClusterId("open".into()),
                 hostname: "open.ray.example.com".into(),
                 api_base_url: "https://open-head:8265".into(),
                 auth_token: None,
+                auth_token_env: None,
             },
         ],
     }
@@ -37,6 +39,7 @@ async fn app(idp: &common::Idp) -> axum::Router {
             operator: vec!["/sre".into()],
             developer: vec!["/ml-eng".into()],
             viewer: vec!["/observers".into()],
+            auditor: vec![],
         },
     };
     let validator = mobula_auth::Validator::discover(config, reqwest::Client::new(), true)
@@ -126,6 +129,7 @@ async fn empty_registry_returns_an_empty_list() {
             operator: vec![],
             developer: vec![],
             viewer: vec![],
+            auditor: vec![],
         },
     };
     let validator = mobula_auth::Validator::discover(config, reqwest::Client::new(), true)

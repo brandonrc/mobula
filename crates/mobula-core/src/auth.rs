@@ -20,6 +20,8 @@ pub enum LocalRole {
     Developer,
     Operator,
     Admin,
+    /// Audit-trail read access only (separation of duties, issue #59).
+    Auditor,
 }
 
 impl LocalRole {
@@ -29,6 +31,7 @@ impl LocalRole {
             LocalRole::Developer => "developer",
             LocalRole::Operator => "operator",
             LocalRole::Admin => "admin",
+            LocalRole::Auditor => "auditor",
         }
     }
 
@@ -38,6 +41,7 @@ impl LocalRole {
             "developer" => Some(LocalRole::Developer),
             "operator" => Some(LocalRole::Operator),
             "admin" => Some(LocalRole::Admin),
+            "auditor" => Some(LocalRole::Auditor),
             _ => None,
         }
     }

@@ -134,6 +134,7 @@ async fn validator_for(idp: &Idp) -> Arc<Validator> {
             operator: vec!["/sre".into()],
             developer: vec!["/ml-eng".into()],
             viewer: vec!["/observers".into()],
+            auditor: vec![],
         },
     };
     Arc::new(
@@ -164,6 +165,7 @@ async fn authed_app(idp: &Idp) -> (Router, SocketAddr) {
                 hostname: "demo.ray.test".into(),
                 api_base_url: format!("http://{head}"),
                 auth_token: None,
+                auth_token_env: None,
             }],
         },
         Some(validator_for(idp).await),

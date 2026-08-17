@@ -40,6 +40,11 @@ pub enum Target {
     /// Capacity pools and their allocations (ADR-0010) — platform
     /// configuration, not app lifecycle, so mutations are Admin-only.
     Pool,
+    /// The persisted audit trail (#59, api-v1.md §5.9). Its own target so
+    /// `Role::Auditor` can hold Read here and nothing anywhere else —
+    /// separation of duties: auditors inspect the trail without holding
+    /// Admin (which audit reads required before #59).
+    Audit,
 }
 
 /// Built-in v0 roles (ADR-0003). Roles are permission-sets over
@@ -53,6 +58,11 @@ pub enum Role {
     Developer,
     Operator,
     Admin,
+    /// Read-only on the audit surface and nothing else (#59) — a
+    /// compliance reader who must NOT get cluster/job/registry access.
+    /// Granted via the `auditor` group mapping; scoped role assignments
+    /// don't apply (the audit trail isn't project-scoped).
+    Auditor,
 }
 
 impl Role {
@@ -63,14 +73,22 @@ impl Role {
         match (self, target) {
             // Admin: everything, everywhere.
             (Role::Admin, _) => true,
-            // Viewer: read-only, any target.
+            // Viewer: read-only, any target EXCEPT the audit trail — audit
+            // subjects are Admin data (api-v1.md §2.2), and #59 keeps them
+            // to Admin/Auditor only.
+            (Role::Viewer, Audit) => false,
             (Role::Viewer, _) => action == Read,
+            // Auditor (#59): reads the audit surface, nothing else — no
+            // cluster reads, no registry, no writes anywhere.
+            (Role::Auditor, Audit) => action == Read,
+            (Role::Auditor, _) => false,
             // Developer: full job + service access (both are "code"),
             // read-only clusters and pools.
             (Role::Developer, Job) | (Role::Developer, Service) => {
                 matches!(action, Read | Write | Delete)
             }
             (Role::Developer, Cluster) | (Role::Developer, Pool) => action == Read,
+            (Role::Developer, Audit) => false,
             // Operator: full cluster lifecycle, read-only code surfaces and
             // pool topology (pools are platform config — mutations are
             // Admin-only).
@@ -78,6 +96,7 @@ impl Role {
             (Role::Operator, Job) | (Role::Operator, Service) | (Role::Operator, Pool) => {
                 action == Read
             }
+            (Role::Operator, Audit) => false,
         }
     }
 
@@ -89,6 +108,7 @@ impl Role {
             Role::Developer => "developer",
             Role::Operator => "operator",
             Role::Admin => "admin",
+            Role::Auditor => "auditor",
         }
     }
 
@@ -99,6 +119,7 @@ impl Role {
             "developer" => Some(Role::Developer),
             "operator" => Some(Role::Operator),
             "admin" => Some(Role::Admin),
+            "auditor" => Some(Role::Auditor),
             _ => None,
         }
     }
@@ -189,6 +210,10 @@ pub struct RoleMappings {
     pub developer: Vec<String>,
     #[serde(default)]
     pub viewer: Vec<String>,
+    /// #59: audit-trail readers (compliance). Serde-defaulted so existing
+    /// auth.toml files without the key keep parsing.
+    #[serde(default)]
+    pub auditor: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -490,9 +515,15 @@ impl Validator {
 impl RoleMappings {
     /// Whether any role maps a `"*"` wildcard.
     pub fn has_wildcard(&self) -> bool {
-        [&self.admin, &self.operator, &self.developer, &self.viewer]
-            .iter()
-            .any(|patterns| patterns.iter().any(|p| p == "*"))
+        [
+            &self.admin,
+            &self.operator,
+            &self.developer,
+            &self.viewer,
+            &self.auditor,
+        ]
+        .iter()
+        .any(|patterns| patterns.iter().any(|p| p == "*"))
     }
 
     /// Every role whose group mapping matches (a caller holds the union of
@@ -517,6 +548,9 @@ impl RoleMappings {
         if matches(&self.viewer) {
             roles.push(Role::Viewer);
         }
+        if matches(&self.auditor) {
+            roles.push(Role::Auditor);
+        }
         roles
     }
 }
@@ -531,6 +565,7 @@ mod tests {
             operator: vec!["/sre".into()],
             developer: vec!["/ml-eng".into(), "/data-sci".into()],
             viewer: vec!["*".into()],
+            auditor: vec!["/compliance".into()],
         }
     }
 
@@ -540,6 +575,7 @@ mod tests {
         use Target::*;
         // Admin: everything.
         assert!(Role::Admin.grants(Admin, Cluster) && Role::Admin.grants(Write, Job));
+        assert!(Role::Admin.grants(Read, Audit));
         // Developer: job code yes, cluster lifecycle no.
         assert!(Role::Developer.grants(Write, Job));
         assert!(!Role::Developer.grants(Write, Cluster));
@@ -562,9 +598,26 @@ mod tests {
         assert!(Role::Admin.grants(Write, Pool) && Role::Admin.grants(Delete, Pool));
         assert!(Role::Viewer.grants(Read, Pool));
         assert!(!Role::Viewer.grants(Write, Pool));
-        // Viewer: read-only everywhere.
+        // Viewer: read-only everywhere — EXCEPT the audit trail (#59):
+        // audit subjects are Admin data, kept to Admin/Auditor.
         assert!(Role::Viewer.grants(Read, Cluster));
         assert!(!Role::Viewer.grants(Write, Job));
+        assert!(!Role::Viewer.grants(Read, Audit));
+        assert!(!Role::Developer.grants(Read, Audit));
+        assert!(!Role::Operator.grants(Read, Audit));
+        // Auditor (#59): reads the audit surface and NOTHING else — the
+        // separation-of-duties tripwires: no cluster create, no registry
+        // (registry reads check Admin on Cluster), no cluster reads at all.
+        assert!(Role::Auditor.grants(Read, Audit));
+        assert!(!Role::Auditor.grants(Write, Audit));
+        assert!(!Role::Auditor.grants(Delete, Audit));
+        assert!(!Role::Auditor.grants(Admin, Audit));
+        assert!(!Role::Auditor.grants(Write, Cluster));
+        assert!(!Role::Auditor.grants(Read, Cluster));
+        assert!(!Role::Auditor.grants(Admin, Cluster));
+        assert!(!Role::Auditor.grants(Read, Job));
+        assert!(!Role::Auditor.grants(Read, Service));
+        assert!(!Role::Auditor.grants(Read, Pool));
     }
 
     #[test]
@@ -604,6 +657,10 @@ mod tests {
             "wildcard, no groups"
         );
         assert!(m.resolve(&["/sre".into()]).contains(&Role::Operator));
+        // #59: the auditor group resolves to the audit-only role (plus the
+        // wildcard viewer every authenticated caller holds).
+        let r = m.resolve(&["/compliance".into()]);
+        assert!(r.contains(&Role::Auditor), "{r:?}");
     }
 
     #[test]
@@ -618,7 +675,13 @@ mod tests {
 
     #[test]
     fn role_wire_names_round_trip() {
-        for r in [Role::Viewer, Role::Developer, Role::Operator, Role::Admin] {
+        for r in [
+            Role::Viewer,
+            Role::Developer,
+            Role::Operator,
+            Role::Admin,
+            Role::Auditor,
+        ] {
             assert_eq!(Role::parse(r.as_str()), Some(r));
         }
         assert_eq!(Role::parse("superuser"), None);
