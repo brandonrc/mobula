@@ -18,8 +18,8 @@ pub use pool_reconcile::{PoolAction, PoolReconciler};
 pub use reconcile::{Action, RateLimits, ReconcileError, Reconciler};
 pub use store::{
     memory::InMemoryStore, now_unix, queue_assignment_for_project, DesiredState, IntentOutcome,
-    IntentRecord, IntentStatus, Store, StoreError, StoredCluster, StoredPolicy, StoredPool,
-    UsageSample, UsageSource, LOCKOUT_SECS, LOGIN_LOCKOUT_THRESHOLD,
+    IntentRecord, IntentStatus, RoleAssignment, Store, StoreError, StoredCluster, StoredPolicy,
+    StoredPool, UsageSample, UsageSource, LOCKOUT_SECS, LOGIN_LOCKOUT_THRESHOLD,
 };
 #[cfg(feature = "postgres")]
 pub use store_postgres::PostgresStore;

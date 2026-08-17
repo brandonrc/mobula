@@ -37,7 +37,8 @@ TypeScript types from in CI — an endpoint that isn't in the OpenAPI document
 does not exist as far as the UI is concerned.
 
 **What exists today.** `GET/POST /api/v1/clusters`, `GET/DELETE
-/api/v1/clusters/{id}` are already implemented behind `Store`
+/api/v1/clusters/{id}`, and `POST /api/v1/clusters/{id}/suspend` + `/resume`
+(#51) are already implemented behind `Store`
 (`clusters.rs`), with quota admission wired. Everything else in this document
 is greenfield. Where the proposal changes existing behavior, §8 calls it out.
 
@@ -60,10 +61,9 @@ is greenfield. Where the proposal changes existing behavior, §8 calls it out.
 
 The code's model (ADR-0009, `mobula-auth/src/lib.rs`) is **permission-sets**,
 not an ordinal rank: `PermissionType {Read, Write, Delete, Admin}` ×
-`Target {Job, Cluster, Service, Pool}`, four built-in roles. Enforcement is
-flat in v0 (a
-role applies globally); cluster/project-scoped bindings land with the Phase 3
-`role_assignments` tables without changing the wire contract.
+`Target {Job, Cluster, Service, Pool}`, four built-in roles. The baseline is
+flat group→role mapping (a group-derived role applies globally); on top of
+that, **scoped role bindings** (below) grant roles per principal at a scope.
 
 Effective v1 matrix (from `Role::grants`):
 
@@ -79,6 +79,31 @@ Effective v1 matrix (from `Role::grants`):
 
 Pools and allocations are **platform configuration** (capacity topology), not
 app lifecycle — hence Admin-only mutations where clusters are Operator+Admin.
+
+#### Scoped role bindings (ADR-0009 addendum, #49)
+
+A binding `(principal, role, scope)` grants `role` to `principal` (the
+Identity `sub` / local username) at `scope`: `"*"` (global — same coverage as
+a group-derived role) or `"project:<name>"`. Bindings are stored in the
+`role_assignments` table and administered via:
+
+| Route | Authz | Effect |
+|---|---|---|
+| `GET /api/v1/access/assignments` | Admin | List all bindings |
+| `PUT /api/v1/access/assignments/{principal}` `{ "role", "scope" }` | Admin | Upsert one binding (400 on unknown role / bad scope grammar) |
+| `DELETE /api/v1/access/assignments/{principal}?role=&scope=` | Admin | Remove one binding (404 if absent) |
+
+Semantics are **additive grants only** — a binding can add permissions, never
+subtract; there are no deny rules. A principal with no bindings gets exactly
+the flat group→role mapping above; a principal with bindings gets the union
+of their group-derived roles and the binding roles whose scope covers the
+target's project. Enforced in v0 only on the cluster routes
+(`POST/GET/DELETE /api/v1/clusters…` — the check is scoped to the spec's /
+stored cluster's project; `GET /api/v1/clusters` is filtered per-project for
+callers without global `Read`). All other routes keep the flat checks;
+extending enforcement (and group-principal bindings, which belong to the
+OIDC-mapping layer) is follow-up work. Evaluation is one indexed
+`role_assignments` read per request that fails the flat fast path.
 
 > **Delta vs ui-ux-spec §5.3:** the spec's persona table has *Developers*
 > creating clusters. Current code grants `Developer` only `Read` on
@@ -398,22 +423,35 @@ diff review, §5.4). **New.**
 
 Lifecycle actions. Back the detail-page action buttons and list-page action
 menus, rendered from `can_transition()` client-side and enforced server-side.
-**New.**
+**`suspend` and `resume` are implemented** (`clusters.rs`, #51);
+`terminate` remains the DELETE route below.
 
 - **Auth:** `Write` on `Target::Cluster` (Operator, Admin).
 - **Semantics:** each sets desired state along a legal edge of
   `ClusterState::can_transition`:
   - `suspend`: `running → suspending` (compute released, spec + state kept).
+    The reconciler actuates `spec.suspend: true` through the provisioner's
+    suspend call — Mobula owns that field (ADR-0007).
   - `resume`: `suspended → provisioning` — reprovision; no fast path to
-    running (the tooltip copy in ui-ux-spec §6 is exactly this rule).
+    running (the tooltip copy in ui-ux-spec §6 is exactly this rule). The
+    reconciler converges via the normal generation-keyed apply, which writes
+    `suspend: false`.
   - `terminate`: any non-terminal state → `terminating`; `terminated` is
     terminal, so terminating a `terminated` cluster is a 409, not a no-op.
+- **Kueue interaction (ADR-0010):** for a cluster whose project is admitted
+  through a pool queue, Kueue owns `spec.suspend` (gang scheduling holds
+  unadmitted workloads suspended). `suspend`/`resume` on such a cluster are
+  rejected with **409 `queue_owned_suspend`** — detach the project's pool
+  allocation first if a manual suspend is really wanted. The reconciler
+  likewise never "repairs" a queued cluster's Suspended state.
 - **Response 202:** `{ "id": "demo", "state": "suspending", "generation": 4 }`.
   Actions are long-running: the UI transitions optimistically to the
   intermediate state and polls `GET /clusters/{id}` (SSE later) until
   `observed_state` settles (ui-ux-spec §6 async-action pattern).
 - **Errors:** 403, 404, 409 `illegal_state_transition` with
-  `{ "from": ..., "to": ... }`.
+  `{ "from": ..., "to": ... }` (meaningless commands — e.g. suspending an
+  already-suspended or not-yet-provisioned cluster, resuming a running one),
+  409 `queue_owned_suspend` (above). Both 409s are audited as denies.
 - **Note:** the existing `DELETE /api/v1/clusters/{id}` (`clusters.rs:228`)
   is terminate-equivalent (desired = Terminated). It stays for CLI
   back-compat; the POST action is canonical for the UI. Same permission,
@@ -888,16 +926,58 @@ Consumption **reporting**, so the permission is `Read` on `Target::Cluster`
 
 #### `GET /api/v1/metrics`
 
-Prometheus text exposition (no client library — one hand-rendered gauge):
+Prometheus text exposition (no client library — hand-rendered gauges):
 
 ```
 # HELP mobula_pool_resource_usage Latest metered resource usage …
 # TYPE mobula_pool_resource_usage gauge
 mobula_pool_resource_usage{pool="gpu-pool",project="proj-a",resource="cpu"} 10
+# HELP mobula_clusters_total Managed clusters by observed state …
+# TYPE mobula_clusters_total gauge
+mobula_clusters_total{state="running"} 3
+# TYPE mobula_clusters_by_project gauge
+mobula_clusters_by_project{project="proj-a"} 2
+# TYPE mobula_pool_nominal gauge
+mobula_pool_nominal{pool="gpu-pool",resource="cpu"} 64
 ```
 
 - **Auth:** `Read` on `Target::Cluster` (a scrape token is a Bearer JWT).
-- Values are the latest sample per (pool, project, resource) label set.
+- `mobula_pool_resource_usage` values are the latest sample per (pool,
+  project, resource) label set.
+- **Control-plane gauges (#52)** are computed from the store at scrape time:
+  - `mobula_clusters_total{state}` — managed clusters by **observed** state
+    (`unknown` until the reconcile engine's first observation); Terminated
+    rows count until the store reaps them.
+  - `mobula_clusters_by_project{project}` — managed clusters per spec
+    project.
+  - `mobula_pool_nominal{pool,resource}` — each pool's nominal quota summed
+    across flavor specs (`parse_quantity`, same math as
+    `PoolView.total_nominal`); a resource key that fails to parse on any
+    flavor is omitted entirely rather than summed partially.
+
+#### `GET /api/v1/clusters/{id}/metrics` — Ray head passthrough (#52)
+
+Proxies the Ray head's own Prometheus exposition (`/metrics` on the
+dashboard port 8265) through the control plane, so one scrape/config path
+covers the control-plane gauges above and every cluster's Ray metrics.
+
+- **Auth:** `Read` on `Target::Cluster` (Viewer+).
+- **Head URL:** `Provisioner::metrics_endpoint(id)` — for KubeRay
+  `http://{name}-head-svc.{namespace}.svc:8265/metrics` (the head service
+  KubeRay creates is `<name>-head-svc`). The demo provisioner names no
+  endpoint → **404 `metrics unavailable`**.
+- **Credential discipline (ADR-0003, same as the job gateway):** the
+  southbound request is built from scratch — no inbound header is
+  forwarded, so the caller's JWT never reaches the cluster — and the only
+  credential injected is the cluster's static token from the registry
+  (`Authorization: Bearer …`), when one is registered.
+- **Response:** the upstream status with the exposition body as
+  `text/plain; version=0.0.4`. Southbound timeouts are 5s connect / 30s
+  read; the body is capped at 4MiB (a larger response → 502
+  `metrics response too large`); an unreachable head → 502
+  `metrics upstream error`. Redirects are never followed.
+- **Out of scope for this slice** (the #52 epic's future work):
+  SSE/event streaming of cluster state and OpenTelemetry export.
 
 ### 5.14 Registry — `GET /api/v1/registry/clusters`
 
@@ -1012,7 +1092,7 @@ a follow-up, same tracking as the quota-admission transaction note in
 | `GET /api/v1/clusters/{id}` | B | §5.4 | exists (+ ✱ fields) |
 | `POST /api/v1/clusters` | B | §5.3 | exists (incl. quota admission) |
 | `PATCH /api/v1/clusters/{id}` | B | §5.3/§5.4 edit | new |
-| `POST …/suspend` `/resume` `/terminate` | B | §5.4 actions | new (DELETE exists) |
+| `POST …/suspend` `/resume` `/terminate` | B | §5.4 actions | suspend/resume **exist** (#51); terminate = DELETE (exists) |
 | `GET /api/v1/overview` | B | §5.1 | new |
 | `GET /api/v1/audit` | B | §5.7 | **exists** (audit.rs, persisted + CSV) |
 | `GET /api/v1/access/roles` | B | §5.8 | **exists** (access.rs; `mappings: null`/`source: "local"` without OIDC) |

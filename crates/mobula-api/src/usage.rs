@@ -177,6 +177,108 @@ fn prom_escape(v: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// Label value for a cluster's observed state. `ClusterState` serializes
+/// snake_case; reuse the serde mapping instead of a parallel match that
+/// could drift from the enum.
+fn state_label(s: mobula_core::ClusterState) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Render cluster-fleet gauges from the store at scrape time (#52):
+/// `mobula_clusters_total{state}` counts by observed state (`unknown` until
+/// the reconcile engine's first observation lands) and
+/// `mobula_clusters_by_project{project}` counts per spec project. Both
+/// reflect the store as it is — Terminated rows count until the store reaps
+/// them.
+fn render_cluster_gauges(clusters: &[mobula_controller::StoredCluster]) -> String {
+    use std::fmt::Write;
+    let mut by_state: BTreeMap<String, u64> = BTreeMap::new();
+    let mut by_project: BTreeMap<&str, u64> = BTreeMap::new();
+    for c in clusters {
+        let state = c
+            .observed_state
+            .map(state_label)
+            .unwrap_or_else(|| "unknown".into());
+        *by_state.entry(state).or_insert(0) += 1;
+        *by_project.entry(c.spec.project.as_str()).or_insert(0) += 1;
+    }
+    let mut out = String::from(
+        "# HELP mobula_clusters_total Managed clusters by observed state \
+         ('unknown' before the reconcile engine's first observation).\n\
+         # TYPE mobula_clusters_total gauge\n",
+    );
+    for (state, n) in by_state {
+        let _ = writeln!(
+            out,
+            "mobula_clusters_total{{state=\"{}\"}} {}",
+            prom_escape(&state),
+            n
+        );
+    }
+    let _ = write!(
+        out,
+        "# HELP mobula_clusters_by_project Managed clusters per project.\n\
+         # TYPE mobula_clusters_by_project gauge\n"
+    );
+    for (project, n) in by_project {
+        let _ = writeln!(
+            out,
+            "mobula_clusters_by_project{{project=\"{}\"}} {}",
+            prom_escape(project),
+            n
+        );
+    }
+    out
+}
+
+/// Render `mobula_pool_nominal{pool,resource}` (#52): each pool's nominal
+/// quota, summed across flavors with `parse_quantity` — the same math as
+/// `pools::PoolView::total_nominal`, including its fail-soft policy: a
+/// resource key that fails to parse on ANY flavor is omitted entirely (a
+/// partial sum would misreport capacity) and logged.
+fn render_pool_nominal_gauge(pools: &[mobula_controller::StoredPool]) -> String {
+    use std::fmt::Write;
+    let mut out = String::from(
+        "# HELP mobula_pool_nominal Pool nominal quota per resource, summed \
+         across the pool's flavor specs.\n\
+         # TYPE mobula_pool_nominal gauge\n",
+    );
+    for p in pools {
+        let mut sums: BTreeMap<&str, f64> = BTreeMap::new();
+        let mut unparseable: std::collections::BTreeSet<&str> = Default::default();
+        for f in &p.spec.flavors {
+            for (k, v) in &f.resources {
+                match mobula_policy::quantity::parse_quantity(v) {
+                    Ok(q) => *sums.entry(k.as_str()).or_insert(0.0) += q,
+                    Err(e) => {
+                        tracing::warn!(
+                            pool = %p.name, flavor = %f.name, resource = %k, error = %e,
+                            "unparseable flavor quantity omitted from mobula_pool_nominal"
+                        );
+                        unparseable.insert(k.as_str());
+                    }
+                }
+            }
+        }
+        for (k, total) in sums {
+            if unparseable.contains(k) {
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "mobula_pool_nominal{{pool=\"{}\",resource=\"{}\"}} {}",
+                prom_escape(&p.name),
+                prom_escape(k),
+                total
+            );
+        }
+    }
+    out
+}
+
 /// Render the latest usage sample per (pool, project, resource) as
 /// Prometheus text exposition. Hand-rolled on purpose: the workspace has no
 /// metrics dependency, the text format for one gauge is a dozen lines, and
@@ -209,7 +311,7 @@ fn render_usage_gauge(samples: &[mobula_controller::UsageSample]) -> String {
 
 #[utoipa::path(
     get, path = "/api/v1/metrics", tag = "usage",
-    responses((status = 200, description = "Prometheus text exposition of usage gauges", body = String, content_type = "text/plain"),
+    responses((status = 200, description = "Prometheus text exposition of usage and control-plane gauges", body = String, content_type = "text/plain"),
               (status = 401, description = "No/invalid token"),
               (status = 403, description = "Missing Read on cluster")),
     security(("bearer" = []))
@@ -232,12 +334,28 @@ async fn metrics(
         Ok(s) => s,
         Err(e) => return store_err(e),
     };
+    // Control-plane gauges (#52): cluster fleet and pool capacity, computed
+    // from the store at scrape time — no sampling loop involved.
+    let clusters = match st.store.list().await {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    let pools = match st.store.list_pools().await {
+        Ok(p) => p,
+        Err(e) => return store_err(e),
+    };
+    let text = format!(
+        "{}{}{}",
+        render_usage_gauge(&samples),
+        render_cluster_gauges(&clusters),
+        render_pool_nominal_gauge(&pools)
+    );
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        render_usage_gauge(&samples),
+        text,
     )
         .into_response()
 }
@@ -252,7 +370,7 @@ pub fn router(store: Arc<dyn Store>, policy: Arc<PolicyConfig>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mobula_controller::{UsageSample, UsageSource};
+    use mobula_controller::{DesiredState, StoredCluster, StoredPool, UsageSample, UsageSource};
 
     fn sample(ts: u64, pool: &str, project: &str, resource: &str, qty: f64) -> UsageSample {
         UsageSample {
@@ -295,5 +413,98 @@ mod tests {
         let text = render_usage_gauge(&[]);
         assert!(text.contains("# HELP"));
         assert!(!text.contains("mobula_pool_resource_usage{"));
+    }
+
+    fn stored_cluster(project: &str, observed: Option<mobula_core::ClusterState>) -> StoredCluster {
+        StoredCluster {
+            id: mobula_core::ClusterId(format!("c-{}", project.len())),
+            spec: mobula_core::ClusterSpec {
+                name: "c".into(),
+                project: project.into(),
+                ray_version: "2.57.0".into(),
+                image: "img".into(),
+                head_cpu: "1".into(),
+                head_memory: "2Gi".into(),
+                worker_groups: vec![],
+                ttl_seconds: None,
+            },
+            generation: 1,
+            desired: DesiredState::Running,
+            observed_state: observed,
+            observed_generation: 0,
+            condition: None,
+            failure_count: 0,
+            next_attempt_at: 0,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn cluster_gauges_count_by_state_and_project() {
+        use mobula_core::ClusterState;
+        let text = render_cluster_gauges(&[
+            stored_cluster("proj-a", Some(ClusterState::Running)),
+            stored_cluster("proj-a", Some(ClusterState::Suspended)),
+            stored_cluster("proj-b", None),
+        ]);
+        assert!(text.contains("# TYPE mobula_clusters_total gauge"));
+        assert!(text.contains("mobula_clusters_total{state=\"running\"} 1"));
+        assert!(text.contains("mobula_clusters_total{state=\"suspended\"} 1"));
+        assert!(
+            text.contains("mobula_clusters_total{state=\"unknown\"} 1"),
+            "unobserved clusters count as unknown: {text}"
+        );
+        assert!(text.contains("# TYPE mobula_clusters_by_project gauge"));
+        assert!(text.contains("mobula_clusters_by_project{project=\"proj-a\"} 2"));
+        assert!(text.contains("mobula_clusters_by_project{project=\"proj-b\"} 1"));
+    }
+
+    #[test]
+    fn pool_nominal_gauge_sums_flavors_and_omits_unparseable() {
+        let pool = |name: &str, resources: BTreeMap<String, String>| StoredPool {
+            name: name.into(),
+            spec: mobula_core::PoolSpec {
+                name: name.into(),
+                flavors: vec![mobula_core::FlavorSpec {
+                    name: "f".into(),
+                    resources,
+                    node_labels: BTreeMap::new(),
+                    taints: vec![],
+                }],
+                cohort: "c".into(),
+                fair_sharing_weight: 1.0,
+                elastic: false,
+            },
+            generation: 1,
+            observed_json: None,
+            observed_at: None,
+            created_at: 0,
+        };
+        let text = render_pool_nominal_gauge(&[
+            pool(
+                "gpu",
+                BTreeMap::from([
+                    ("cpu".to_string(), "64".to_string()),
+                    ("memory".to_string(), "256Gi".to_string()),
+                ]),
+            ),
+            pool(
+                "bad",
+                BTreeMap::from([("cpu".to_string(), "not-a-quantity".to_string())]),
+            ),
+        ]);
+        assert!(text.contains("# TYPE mobula_pool_nominal gauge"));
+        assert!(text.contains("mobula_pool_nominal{pool=\"gpu\",resource=\"cpu\"} 64"));
+        let gib = 256.0 * 1024.0 * 1024.0 * 1024.0;
+        assert!(
+            text.contains(&format!(
+                "mobula_pool_nominal{{pool=\"gpu\",resource=\"memory\"}} {gib}"
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains("pool=\"bad\""),
+            "unparseable quantity omits the resource: {text}"
+        );
     }
 }

@@ -54,11 +54,13 @@ enum Command {
         /// loop (Phase 3, ADR-0006).
         #[arg(long)]
         kuberay_namespace: Option<String>,
-        /// SQLite database for desired cluster state (used with
-        /// --kuberay-namespace). Defaults to in-memory (state lost on
-        /// restart) if unset.
+        /// Database for desired cluster state (used with
+        /// --kuberay-namespace, --demo, --local-auth): either a SQLite
+        /// file path (created if missing) or a postgres:// /
+        /// postgresql:// URL (schema auto-created on connect). Defaults
+        /// to in-memory (state lost on restart) if unset.
         #[arg(long)]
-        db: Option<std::path::PathBuf>,
+        db: Option<String>,
         /// Reconcile resync interval, seconds (with --kuberay-namespace).
         #[arg(long, default_value = "30")]
         reconcile_interval_secs: u64,
@@ -227,225 +229,64 @@ async fn main() -> std::io::Result<()> {
             let mut service_provisioner: Option<
                 std::sync::Arc<dyn mobula_provision::ServiceProvisioner>,
             > = None;
+            let mut cluster_provisioner: Option<std::sync::Arc<dyn mobula_provision::Provisioner>> =
+                None;
             let store: Option<std::sync::Arc<dyn mobula_controller::Store>> =
                 match &kuberay_namespace {
                     Some(ns) => {
-                        // Concrete Arc for the reconciler (it is generic over
-                        // the store type); a clone coerces to Arc<dyn Store>
-                        // for the API routes.
-                        let concrete = std::sync::Arc::new(match &db {
-                            Some(path) => mobula_controller::SqliteStore::connect(&format!(
-                                "sqlite://{}?mode=rwc",
-                                path.display()
-                            ))
-                            .await
-                            .map_err(|e| std::io::Error::other(e.to_string()))?,
-                            None => {
-                                tracing::warn!(
-                                    "no --db: cluster state is in-memory and lost on restart"
-                                );
-                                mobula_controller::SqliteStore::in_memory()
-                                    .await
-                                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                        // --db selects the backend (SQLite path or
+                        // postgres:// URL); start_lifecycle is generic over
+                        // the concrete store type the reconciler requires.
+                        let handle = connect_store(
+                            db.as_deref(),
+                            "no --db: cluster state is in-memory and lost on restart",
+                        )
+                        .await?;
+                        let (store, svc_prov, cluster_prov) = match handle {
+                            StoreHandle::Sqlite(s) => {
+                                start_lifecycle(
+                                    s,
+                                    ns,
+                                    reconcile_interval_secs,
+                                    metering_interval_secs,
+                                )
+                                .await?
                             }
-                        });
-                        let provisioner = std::sync::Arc::new(
-                            mobula_provision::KubeRayProvisioner::connect(ns.clone(), false)
-                                .await
-                                .map_err(|e| std::io::Error::other(e.to_string()))?,
-                        );
+                            StoreHandle::Postgres(s) => {
+                                start_lifecycle(
+                                    s,
+                                    ns,
+                                    reconcile_interval_secs,
+                                    metering_interval_secs,
+                                )
+                                .await?
+                            }
+                        };
                         // The same provisioner backs both the reconcile loop
                         // (clusters) and the Serve-service routes.
-                        service_provisioner = Some(provisioner.clone());
-                        // Global actuation rate limit (#43): cap provider
-                        // apply calls so a burst of failing clusters can't
-                        // hammer the Kubernetes API. Generous enough for
-                        // normal ops (per-cluster exponential backoff is the
-                        // primary throttle); this is defense-in-depth.
-                        let reconciler = mobula_controller::Reconciler::with_limits(
-                            concrete.clone(),
-                            provisioner,
-                            mobula_controller::RateLimits {
-                                capacity: 20.0,
-                                refill_per_sec: 5.0,
-                            },
-                        );
-                        // ADR-0007 restore quarantine (#41): before actuating,
-                        // check whether the store was restored behind reality
-                        // (a backing cluster newer than the DB). If so, the
-                        // reconciler quarantines itself and only observes until
-                        // an operator clears it.
-                        match reconciler.detect_stale_restore().await {
-                            Ok(true) => tracing::error!(
-                                "started QUARANTINED after detecting a stale DB restore; not actuating until cleared"
-                            ),
-                            Ok(false) => {}
-                            Err(e) => tracing::warn!(error = %e, "stale-restore boot check failed"),
-                        }
-                        let interval = std::time::Duration::from_secs(reconcile_interval_secs);
-                        tokio::spawn(async move {
-                            reconciler
-                                .run(interval, async {
-                                    let _ = tokio::signal::ctrl_c().await;
-                                })
-                                .await;
-                        });
-                        // ADR-0010: pool reconcile loop — converges each
-                        // pool's Kueue objects (Cohort/ResourceFlavor/
-                        // ClusterQueue/LocalQueue) and records ClusterQueue
-                        // status observations. Inert when the Kueue CRDs are
-                        // absent (pools stay in-process quota only).
-                        let kueue = std::sync::Arc::new(
-                            mobula_provision::KueueClient::connect()
-                                .await
-                                .map_err(|e| std::io::Error::other(e.to_string()))?,
-                        );
-                        let pool_reconciler =
-                            mobula_controller::PoolReconciler::new(concrete.clone(), kueue.clone());
-                        tokio::spawn(async move {
-                            pool_reconciler
-                                .run(interval, async {
-                                    let _ = tokio::signal::ctrl_c().await;
-                                })
-                                .await;
-                        });
-                        // Slice 4: usage metering — samples the Kueue
-                        // reservation ledger (ClusterQueue + LocalQueue
-                        // flavorsUsage) into the store for /api/v1/usage and
-                        // /api/v1/metrics.
-                        let metering = mobula_controller::Metering::new(
-                            concrete.clone(),
-                            Some(kueue),
-                            std::time::Duration::from_secs(metering_interval_secs),
-                        );
-                        tokio::spawn(async move {
-                            metering
-                                .run(async {
-                                    let _ = tokio::signal::ctrl_c().await;
-                                })
-                                .await;
-                        });
-                        tracing::info!(namespace = %ns, "cluster lifecycle controller + services enabled");
-                        Some(concrete)
+                        service_provisioner = Some(svc_prov);
+                        cluster_provisioner = Some(cluster_prov);
+                        Some(store)
                     }
                     // DEMO: full cluster/service API on a mock provisioner —
                     // no Kubernetes (local testing / compose). Uses --db when
                     // set so demo state (incl. local-auth users/tokens and
                     // usage history) survives restarts; in-memory otherwise.
                     None if demo => {
-                        use mobula_controller::Store as _;
-                        let concrete = std::sync::Arc::new(match &db {
-                            Some(path) => mobula_controller::SqliteStore::connect(&format!(
-                                "sqlite://{}?mode=rwc",
-                                path.display()
-                            ))
-                            .await
-                            .map_err(|e| std::io::Error::other(e.to_string()))?,
-                            None => {
-                                tracing::warn!(
-                                    "no --db: demo state is in-memory and lost on restart"
-                                );
-                                mobula_controller::SqliteStore::in_memory()
-                                    .await
-                                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                        let handle = connect_store(
+                            db.as_deref(),
+                            "no --db: demo state is in-memory and lost on restart",
+                        )
+                        .await?;
+                        let (store, svc_prov, cluster_prov) = match handle {
+                            StoreHandle::Sqlite(s) => start_demo(s, metering_interval_secs).await?,
+                            StoreHandle::Postgres(s) => {
+                                start_demo(s, metering_interval_secs).await?
                             }
-                        });
-                        // Seed cross-cluster job history so the dashboard's
-                        // Jobs screen has data (incl. a record whose cluster
-                        // no longer exists, showing history outlives
-                        // clusters). Skip when the store already has jobs
-                        // (a persisted --db survives restarts; seeding again
-                        // would duplicate).
-                        if concrete
-                            .list_jobs()
-                            .await
-                            .map(|j| j.is_empty())
-                            .unwrap_or(true)
-                        {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            for (id, cluster, submitter, status, duration_secs, ago) in [
-                                (
-                                    "raysubmit_a1b2",
-                                    "demo-alpha",
-                                    "alice@example.com",
-                                    "SUCCEEDED",
-                                    Some(742u64),
-                                    3600u64,
-                                ),
-                                (
-                                    "raysubmit_c3d4",
-                                    "demo-alpha",
-                                    "bob@example.com",
-                                    "RUNNING",
-                                    None,
-                                    120,
-                                ),
-                                (
-                                    "raysubmit_e5f6",
-                                    "retired-beta",
-                                    "alice@example.com",
-                                    "FAILED",
-                                    Some(51),
-                                    7200,
-                                ),
-                                (
-                                    "raysubmit_g7h8",
-                                    "demo-gamma",
-                                    "carol@example.com",
-                                    "STOPPED",
-                                    Some(310),
-                                    1800,
-                                ),
-                            ] {
-                                let _ = concrete
-                                    .record_job(mobula_core::JobRecord {
-                                        id: id.into(),
-                                        cluster: cluster.into(),
-                                        submitter: submitter.into(),
-                                        status: status.into(),
-                                        duration_secs,
-                                        submitted_at: now.saturating_sub(ago),
-                                    })
-                                    .await;
-                            }
-                        }
-                        let provisioner =
-                            std::sync::Arc::new(mobula_provision::DemoProvisioner::new());
-                        service_provisioner = Some(provisioner.clone());
-                        let reconciler =
-                            mobula_controller::Reconciler::new(concrete.clone(), provisioner);
-                        // Snappy tick so created clusters show Running quickly.
-                        let interval = std::time::Duration::from_secs(2);
-                        tokio::spawn(async move {
-                            reconciler
-                                .run(interval, async {
-                                    let _ = tokio::signal::ctrl_c().await;
-                                })
-                                .await;
-                        });
-                        // Slice 4: usage metering without Kubernetes — the
-                        // Kueue-absent path meters the min-demand baseline of
-                        // desired cluster specs, so the demo's usage endpoints
-                        // have data.
-                        let metering = mobula_controller::Metering::new(
-                            concrete.clone(),
-                            None,
-                            std::time::Duration::from_secs(metering_interval_secs),
-                        );
-                        tokio::spawn(async move {
-                            metering
-                                .run(async {
-                                    let _ = tokio::signal::ctrl_c().await;
-                                })
-                                .await;
-                        });
-                        tracing::warn!(
-                            "DEMO mode: in-memory mock provisioner — nothing is actually provisioned"
-                        );
-                        Some(concrete)
+                        };
+                        service_provisioner = Some(svc_prov);
+                        cluster_provisioner = Some(cluster_prov);
+                        Some(store)
                     }
                     None => None,
                 };
@@ -455,24 +296,13 @@ async fn main() -> std::io::Result<()> {
             // open --db (or an in-memory store, with a loud warning).
             let mut store = store;
             if local_auth && store.is_none() {
-                let concrete: std::sync::Arc<dyn mobula_controller::Store> =
-                    std::sync::Arc::new(match &db {
-                        Some(path) => mobula_controller::SqliteStore::connect(&format!(
-                            "sqlite://{}?mode=rwc",
-                            path.display()
-                        ))
-                        .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))?,
-                        None => {
-                            tracing::warn!(
-                                "--local-auth without --db: users and tokens are in-memory \
-                                 and lost on restart"
-                            );
-                            mobula_controller::SqliteStore::in_memory()
-                                .await
-                                .map_err(|e| std::io::Error::other(e.to_string()))?
-                        }
-                    });
+                let concrete: std::sync::Arc<dyn mobula_controller::Store> = connect_store(
+                    db.as_deref(),
+                    "--local-auth without --db: users and tokens are in-memory \
+                     and lost on restart",
+                )
+                .await?
+                .into_dyn();
                 store = Some(concrete);
             }
             let local_authenticator = if local_auth {
@@ -480,7 +310,13 @@ async fn main() -> std::io::Result<()> {
                     .as_ref()
                     .expect("local auth store ensured above")
                     .clone();
-                bootstrap_local_admin(&store, db.as_deref()).await?;
+                // The bootstrap password file is written next to the DB —
+                // only meaningful when --db is a filesystem path.
+                let db_path = db.as_deref().and_then(|d| match db_target(Some(d)) {
+                    DbTarget::Sqlite(_) => Some(std::path::Path::new(d)),
+                    _ => None,
+                });
+                bootstrap_local_admin(&store, db_path).await?;
                 tracing::info!("local auth enabled (ADR-0011): /api/v1/auth/login");
                 Some(std::sync::Arc::new(
                     mobula_auth::local::LocalAuthenticator::new(store, 86_400, 90),
@@ -505,6 +341,7 @@ async fn main() -> std::io::Result<()> {
                     store,
                     policy: policy_config,
                     services: service_provisioner,
+                    provisioner: cluster_provisioner,
                 },
             )
             .await
@@ -553,11 +390,269 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
-/// Bootstrap the first local admin when the users table is empty
-/// (ADR-0011, artifact-keeper pattern): a random 20-char password written
-/// 0600 next to the database AND printed once to the log, unless
-/// MOBULA_LOCAL_ADMIN_PASSWORD is set (demos only — then the env value is
-/// used and nothing is printed).
+/// Which store backend `--db` selects (pure; no connections). A
+/// `postgres://` / `postgresql://` URL picks Postgres; anything else is a
+/// SQLite file path (the pre-Postgres behavior, `mode=rwc`). `None` means
+/// the in-memory store.
+#[derive(Debug, PartialEq, Eq)]
+enum DbTarget {
+    InMemory,
+    /// Full `sqlite://…?mode=rwc` connection URL.
+    Sqlite(String),
+    /// The `postgres://` / `postgresql://` URL as given.
+    Postgres(String),
+}
+
+fn db_target(db: Option<&str>) -> DbTarget {
+    match db {
+        None => DbTarget::InMemory,
+        Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => {
+            DbTarget::Postgres(url.to_string())
+        }
+        Some(path) => DbTarget::Sqlite(format!("sqlite://{path}?mode=rwc")),
+    }
+}
+
+/// The connected store, keeping the concrete type so the reconciler /
+/// metering generics (which require `S: Store`) stay monomorphized.
+enum StoreHandle {
+    Sqlite(std::sync::Arc<mobula_controller::SqliteStore>),
+    Postgres(std::sync::Arc<mobula_controller::PostgresStore>),
+}
+
+impl StoreHandle {
+    fn into_dyn(self) -> std::sync::Arc<dyn mobula_controller::Store> {
+        match self {
+            StoreHandle::Sqlite(s) => s,
+            StoreHandle::Postgres(s) => s,
+        }
+    }
+}
+
+/// Shared `--db` wiring for the kuberay, demo, and local-auth call sites:
+/// connect the backend selected by [`db_target`], or an in-memory SQLite
+/// store (with a warning) when `--db` is unset.
+async fn connect_store(db: Option<&str>, in_memory_warning: &str) -> std::io::Result<StoreHandle> {
+    match db_target(db) {
+        DbTarget::InMemory => {
+            tracing::warn!("{in_memory_warning}");
+            Ok(StoreHandle::Sqlite(std::sync::Arc::new(
+                mobula_controller::SqliteStore::in_memory()
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+            )))
+        }
+        DbTarget::Sqlite(url) => Ok(StoreHandle::Sqlite(std::sync::Arc::new(
+            mobula_controller::SqliteStore::connect(&url)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        ))),
+        DbTarget::Postgres(url) => Ok(StoreHandle::Postgres(std::sync::Arc::new(
+            mobula_controller::PostgresStore::connect(&url)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        ))),
+    }
+}
+
+/// Phase 3 lifecycle bring-up (ADR-0006), generic over the store backend so
+/// `--db` can pick SQLite or Postgres: KubeRay provisioner, reconcile loop,
+/// pool reconcile loop, and usage metering. Returns the store (erased to
+/// `dyn Store` for the API routes), the service provisioner, and the cluster
+/// provisioner (the metrics passthrough's endpoint source, #52).
+async fn start_lifecycle<S: mobula_controller::Store + 'static>(
+    concrete: std::sync::Arc<S>,
+    ns: &str,
+    reconcile_interval_secs: u64,
+    metering_interval_secs: u64,
+) -> std::io::Result<(
+    std::sync::Arc<dyn mobula_controller::Store>,
+    std::sync::Arc<dyn mobula_provision::ServiceProvisioner>,
+    std::sync::Arc<dyn mobula_provision::Provisioner>,
+)> {
+    let provisioner = std::sync::Arc::new(
+        mobula_provision::KubeRayProvisioner::connect(ns.to_string(), false)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?,
+    );
+    // The same provisioner backs the reconcile loop (clusters), the
+    // Serve-service routes, and the cluster metrics passthrough.
+    let service_provisioner: std::sync::Arc<dyn mobula_provision::ServiceProvisioner> =
+        provisioner.clone();
+    let cluster_provisioner: std::sync::Arc<dyn mobula_provision::Provisioner> =
+        provisioner.clone();
+    // Global actuation rate limit (#43): cap provider apply calls so a burst
+    // of failing clusters can't hammer the Kubernetes API. Generous enough
+    // for normal ops (per-cluster exponential backoff is the primary
+    // throttle); this is defense-in-depth.
+    let reconciler = mobula_controller::Reconciler::with_limits(
+        concrete.clone(),
+        provisioner,
+        mobula_controller::RateLimits {
+            capacity: 20.0,
+            refill_per_sec: 5.0,
+        },
+    );
+    // ADR-0007 restore quarantine (#41): before actuating, check whether the
+    // store was restored behind reality (a backing cluster newer than the
+    // DB). If so, the reconciler quarantines itself and only observes until
+    // an operator clears it.
+    match reconciler.detect_stale_restore().await {
+        Ok(true) => tracing::error!(
+            "started QUARANTINED after detecting a stale DB restore; not actuating until cleared"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "stale-restore boot check failed"),
+    }
+    let interval = std::time::Duration::from_secs(reconcile_interval_secs);
+    tokio::spawn(async move {
+        reconciler
+            .run(interval, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await;
+    });
+    // ADR-0010: pool reconcile loop — converges each pool's Kueue objects
+    // (Cohort/ResourceFlavor/ClusterQueue/LocalQueue) and records
+    // ClusterQueue status observations. Inert when the Kueue CRDs are absent
+    // (pools stay in-process quota only).
+    let kueue = std::sync::Arc::new(
+        mobula_provision::KueueClient::connect()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?,
+    );
+    let pool_reconciler = mobula_controller::PoolReconciler::new(concrete.clone(), kueue.clone());
+    tokio::spawn(async move {
+        pool_reconciler
+            .run(interval, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await;
+    });
+    // Slice 4: usage metering — samples the Kueue reservation ledger
+    // (ClusterQueue + LocalQueue flavorsUsage) into the store for
+    // /api/v1/usage and /api/v1/metrics.
+    let metering = mobula_controller::Metering::new(
+        concrete.clone(),
+        Some(kueue),
+        std::time::Duration::from_secs(metering_interval_secs),
+    );
+    tokio::spawn(async move {
+        metering
+            .run(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await;
+    });
+    tracing::info!(namespace = %ns, "cluster lifecycle controller + services enabled");
+    Ok((concrete, service_provisioner, cluster_provisioner))
+}
+
+/// DEMO bring-up, generic over the store backend: seed the dashboard's job
+/// history, then run the mock provisioner, reconcile loop, and metering on
+/// a snappy tick.
+async fn start_demo<S: mobula_controller::Store + 'static>(
+    concrete: std::sync::Arc<S>,
+    metering_interval_secs: u64,
+) -> std::io::Result<(
+    std::sync::Arc<dyn mobula_controller::Store>,
+    std::sync::Arc<dyn mobula_provision::ServiceProvisioner>,
+    std::sync::Arc<dyn mobula_provision::Provisioner>,
+)> {
+    // Seed cross-cluster job history so the dashboard's Jobs screen has data
+    // (incl. a record whose cluster no longer exists, showing history
+    // outlives clusters). Skip when the store already has jobs (a persisted
+    // --db survives restarts; seeding again would duplicate).
+    if concrete
+        .list_jobs()
+        .await
+        .map(|j| j.is_empty())
+        .unwrap_or(true)
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for (id, cluster, submitter, status, duration_secs, ago) in [
+            (
+                "raysubmit_a1b2",
+                "demo-alpha",
+                "alice@example.com",
+                "SUCCEEDED",
+                Some(742u64),
+                3600u64,
+            ),
+            (
+                "raysubmit_c3d4",
+                "demo-alpha",
+                "bob@example.com",
+                "RUNNING",
+                None,
+                120,
+            ),
+            (
+                "raysubmit_e5f6",
+                "retired-beta",
+                "alice@example.com",
+                "FAILED",
+                Some(51),
+                7200,
+            ),
+            (
+                "raysubmit_g7h8",
+                "demo-gamma",
+                "carol@example.com",
+                "STOPPED",
+                Some(310),
+                1800,
+            ),
+        ] {
+            let _ = concrete
+                .record_job(mobula_core::JobRecord {
+                    id: id.into(),
+                    cluster: cluster.into(),
+                    submitter: submitter.into(),
+                    status: status.into(),
+                    duration_secs,
+                    submitted_at: now.saturating_sub(ago),
+                })
+                .await;
+        }
+    }
+    let provisioner = std::sync::Arc::new(mobula_provision::DemoProvisioner::new());
+    let service_provisioner: std::sync::Arc<dyn mobula_provision::ServiceProvisioner> =
+        provisioner.clone();
+    let cluster_provisioner: std::sync::Arc<dyn mobula_provision::Provisioner> =
+        provisioner.clone();
+    let reconciler = mobula_controller::Reconciler::new(concrete.clone(), provisioner);
+    // Snappy tick so created clusters show Running quickly.
+    let interval = std::time::Duration::from_secs(2);
+    tokio::spawn(async move {
+        reconciler
+            .run(interval, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await;
+    });
+    // Slice 4: usage metering without Kubernetes — the Kueue-absent path
+    // meters the min-demand baseline of desired cluster specs, so the demo's
+    // usage endpoints have data.
+    let metering = mobula_controller::Metering::new(
+        concrete.clone(),
+        None,
+        std::time::Duration::from_secs(metering_interval_secs),
+    );
+    tokio::spawn(async move {
+        metering
+            .run(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await;
+    });
+    tracing::warn!("DEMO mode: in-memory mock provisioner — nothing is actually provisioned");
+    Ok((concrete, service_provisioner, cluster_provisioner))
+}
+
 /// Parse the `--policy` TOML: `[prices]` resource→$/hour and
 /// `[quotas] project = { resource = amount }` (Phase 4 governance).
 fn parse_policy(raw: &str) -> Result<mobula_api::clusters::PolicyConfig, toml::de::Error> {
@@ -573,6 +668,11 @@ fn parse_policy(raw: &str) -> Result<mobula_api::clusters::PolicyConfig, toml::d
     })
 }
 
+/// Bootstrap the first local admin when the users table is empty
+/// (ADR-0011, artifact-keeper pattern): a random 20-char password written
+/// 0600 next to the database AND printed once to the log, unless
+/// MOBULA_LOCAL_ADMIN_PASSWORD is set (demos only — then the env value is
+/// used and nothing is printed).
 async fn bootstrap_local_admin(
     store: &std::sync::Arc<dyn mobula_controller::Store>,
     db: Option<&std::path::Path>,
@@ -1062,6 +1162,30 @@ mod tests {
         // The env password actually verifies (via the auth module).
         let auth = mobula_auth::local::LocalAuthenticator::new(store, 3600, 90);
         assert!(auth.login("admin", "bootstrap-test-pw").await.is_ok());
+    }
+
+    #[test]
+    fn db_target_selects_backend_without_connecting() {
+        // No --db → in-memory.
+        assert_eq!(db_target(None), DbTarget::InMemory);
+        // Plain paths (relative and absolute) → SQLite, mode=rwc preserved.
+        assert_eq!(
+            db_target(Some("state.db")),
+            DbTarget::Sqlite("sqlite://state.db?mode=rwc".into())
+        );
+        assert_eq!(
+            db_target(Some("/var/lib/mobula/state.db")),
+            DbTarget::Sqlite("sqlite:///var/lib/mobula/state.db?mode=rwc".into())
+        );
+        // postgres:// and postgresql:// URLs → Postgres, URL passed through.
+        assert_eq!(
+            db_target(Some("postgres://mobula:mobula@localhost:5432/mobula")),
+            DbTarget::Postgres("postgres://mobula:mobula@localhost:5432/mobula".into())
+        );
+        assert_eq!(
+            db_target(Some("postgresql://mobula@db.internal/mobula")),
+            DbTarget::Postgres("postgresql://mobula@db.internal/mobula".into())
+        );
     }
 
     #[test]

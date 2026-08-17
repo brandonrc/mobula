@@ -51,6 +51,20 @@ impl Provisioner for MockProvisioner {
             .insert(id.0.clone(), ClusterState::Terminated);
         Ok(())
     }
+    async fn suspend(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        self.state
+            .lock()
+            .unwrap()
+            .insert(id.0.clone(), ClusterState::Suspended);
+        Ok(())
+    }
+    async fn resume(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        self.state
+            .lock()
+            .unwrap()
+            .insert(id.0.clone(), ClusterState::Running);
+        Ok(())
+    }
     async fn observe(&self, id: &ClusterId) -> Result<ObservedCluster, ProvisionError> {
         match self.state.lock().unwrap().get(&id.0) {
             Some(state) => Ok(ObservedCluster {

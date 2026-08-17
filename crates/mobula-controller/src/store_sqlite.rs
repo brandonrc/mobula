@@ -16,8 +16,8 @@ use mobula_core::JobRecord;
 
 use crate::store::{
     json_err, now_unix, pool_spec_changed, spec_changed, DesiredState, IntentOutcome, IntentRecord,
-    IntentStatus, Store, StoreError, StoredCluster, StoredPolicy, StoredPool, UsageSample,
-    UsageSource,
+    IntentStatus, RoleAssignment, Store, StoreError, StoredCluster, StoredPolicy, StoredPool,
+    UsageSample, UsageSource,
 };
 
 const SCHEMA: &str = r#"
@@ -137,6 +137,17 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     last_used_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS api_tokens_username ON api_tokens (username);
+-- Scoped role assignments (ADR-0009 addendum, #49): `scope` is '*' (global)
+-- or 'project:<name>'; `role` is the mobula_auth::Role wire name. Keyed by
+-- the full triple so re-upsert replaces; the (principal) prefix serves the
+-- per-request authz lookup.
+CREATE TABLE IF NOT EXISTS role_assignments (
+    principal  TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    scope      TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (principal, role, scope)
+);
 "#;
 
 /// Additive column migrations for databases created by an older schema (#39
@@ -210,6 +221,7 @@ fn intent_status_from_str(s: &str) -> IntentStatus {
 fn desired_to_str(d: DesiredState) -> &'static str {
     match d {
         DesiredState::Running => "running",
+        DesiredState::Suspended => "suspended",
         DesiredState::Terminated => "terminated",
     }
 }
@@ -217,6 +229,7 @@ fn desired_to_str(d: DesiredState) -> &'static str {
 fn desired_from_str(s: &str) -> Result<DesiredState, StoreError> {
     match s {
         "running" => Ok(DesiredState::Running),
+        "suspended" => Ok(DesiredState::Suspended),
         "terminated" => Ok(DesiredState::Terminated),
         other => Err(StoreError::Backend(format!("bad desired state {other:?}"))),
     }
@@ -1167,6 +1180,76 @@ impl Store for SqliteStore {
             .bind(prefix)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    async fn upsert_role_assignment(
+        &self,
+        principal: &str,
+        role: &str,
+        scope: &str,
+    ) -> Result<(), StoreError> {
+        // Re-upsert preserves the original created_at (DO NOTHING on the
+        // triple's PK), matching the in-memory impl.
+        sqlx::query(
+            "INSERT INTO role_assignments (principal, role, scope, created_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(principal, role, scope) DO NOTHING",
+        )
+        .bind(principal)
+        .bind(role)
+        .bind(scope)
+        .bind(now_unix() as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_role_assignments(
+        &self,
+        principal: Option<&str>,
+    ) -> Result<Vec<RoleAssignment>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT principal, role, scope, created_at FROM role_assignments \
+             WHERE (? IS NULL OR principal = ?) \
+             ORDER BY principal ASC, scope ASC, role ASC",
+        )
+        .bind(principal)
+        .bind(principal)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok::<_, StoreError>(RoleAssignment {
+                    principal: row.try_get::<String, _>("principal")?,
+                    role: row.try_get::<String, _>("role")?,
+                    scope: row.try_get::<String, _>("scope")?,
+                    created_at: row.try_get::<i64, _>("created_at")? as u64,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_role_assignment(
+        &self,
+        principal: &str,
+        role: &str,
+        scope: &str,
+    ) -> Result<(), StoreError> {
+        let affected = sqlx::query(
+            "DELETE FROM role_assignments WHERE principal = ? AND role = ? AND scope = ?",
+        )
+        .bind(principal)
+        .bind(role)
+        .bind(scope)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::Backend(format!(
+                "no such assignment {principal}/{role}/{scope}"
+            )));
+        }
         Ok(())
     }
 }

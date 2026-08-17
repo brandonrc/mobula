@@ -255,6 +255,32 @@ impl Store for SlowListStore {
     async fn touch_api_token(&self, prefix: &str, now: u64) -> Result<(), StoreError> {
         self.inner.touch_api_token(prefix, now).await
     }
+    async fn upsert_role_assignment(
+        &self,
+        principal: &str,
+        role: &str,
+        scope: &str,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .upsert_role_assignment(principal, role, scope)
+            .await
+    }
+    async fn list_role_assignments(
+        &self,
+        principal: Option<&str>,
+    ) -> Result<Vec<mobula_controller::RoleAssignment>, StoreError> {
+        self.inner.list_role_assignments(principal).await
+    }
+    async fn delete_role_assignment(
+        &self,
+        principal: &str,
+        role: &str,
+        scope: &str,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .delete_role_assignment(principal, role, scope)
+            .await
+    }
 }
 
 fn create_body(id: &str) -> serde_json::Value {
@@ -615,4 +641,449 @@ async fn unauthenticated_and_unmapped_are_denied_on_cluster_routes() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+/// POST with an empty body (lifecycle actions take no payload).
+fn post_empty(path: &str, host: &str, token: &str) -> Request<Body> {
+    Request::post(path)
+        .header(header::HOST, host)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn suspend_resume_lifecycle_202_and_409s() {
+    // #51: suspend/resume flip desired state (202) along legal
+    // can_transition edges of the OBSERVED state; meaningless commands 409.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_store(&idp, store.clone()).await;
+    let operator = idp_token(&idp, &["/sre"]);
+    let id = ClusterId("c1".into());
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &operator,
+            create_body("c1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // Not yet observed (never reconciled) → suspending is meaningless.
+    let res = app
+        .clone()
+        .oneshot(post_empty(
+            "/api/v1/clusters/c1/suspend",
+            "mobula.example.com",
+            &operator,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT, "unprovisioned → 409");
+
+    // Observed Running → suspend accepted; desired flips, response carries
+    // the transitional state (api-v1.md §5.1).
+    store
+        .record_observation(&id, Some(ClusterState::Running), 1)
+        .await
+        .unwrap();
+    let res = app
+        .clone()
+        .oneshot(post_empty(
+            "/api/v1/clusters/c1/suspend",
+            "mobula.example.com",
+            &operator,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["state"], "suspending");
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().desired,
+        DesiredState::Suspended
+    );
+
+    // Already suspended → 409 illegal_state_transition.
+    store
+        .record_observation(&id, Some(ClusterState::Suspended), 1)
+        .await
+        .unwrap();
+    let res = app
+        .clone()
+        .oneshot(post_empty(
+            "/api/v1/clusters/c1/suspend",
+            "mobula.example.com",
+            &operator,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "already suspended → 409"
+    );
+
+    // Resume from Suspended → 202, desired back to Running.
+    let res = app
+        .clone()
+        .oneshot(post_empty(
+            "/api/v1/clusters/c1/resume",
+            "mobula.example.com",
+            &operator,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["state"], "provisioning", "resume re-provisions");
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().desired,
+        DesiredState::Running
+    );
+
+    // Resuming a Running cluster is meaningless → 409.
+    store
+        .record_observation(&id, Some(ClusterState::Running), 1)
+        .await
+        .unwrap();
+    let res = app
+        .clone()
+        .oneshot(post_empty(
+            "/api/v1/clusters/c1/resume",
+            "mobula.example.com",
+            &operator,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT, "running → resume 409");
+
+    // Terminated is terminal for both commands.
+    store
+        .record_observation(&id, Some(ClusterState::Terminated), 1)
+        .await
+        .unwrap();
+    for verb in ["suspend", "resume"] {
+        let res = app
+            .clone()
+            .oneshot(post_empty(
+                &format!("/api/v1/clusters/c1/{verb}"),
+                "mobula.example.com",
+                &operator,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::CONFLICT,
+            "terminated → {verb} 409"
+        );
+    }
+
+    // Unknown cluster → 404.
+    let res = app
+        .oneshot(post_empty(
+            "/api/v1/clusters/ghost/suspend",
+            "mobula.example.com",
+            &operator,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn suspend_resume_require_cluster_write_permission() {
+    // #51 + #26: Write on Target::Cluster is Operator/Admin only — a
+    // Developer (job surface) gets 403 on both lifecycle actions.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_store(&idp, store.clone()).await;
+    let operator = idp_token(&idp, &["/sre"]);
+    let developer = idp_token(&idp, &["/ml-eng"]);
+
+    app.clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &operator,
+            create_body("c1"),
+        ))
+        .await
+        .unwrap();
+    store
+        .record_observation(&ClusterId("c1".into()), Some(ClusterState::Running), 1)
+        .await
+        .unwrap();
+
+    for verb in ["suspend", "resume"] {
+        let res = app
+            .clone()
+            .oneshot(post_empty(
+                &format!("/api/v1/clusters/c1/{verb}"),
+                "mobula.example.com",
+                &developer,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "developer → {verb} 403"
+        );
+    }
+}
+
+#[tokio::test]
+async fn queue_assigned_cluster_rejects_suspend_and_resume() {
+    // #51 + ADR-0010: Kueue owns spec.suspend for a cluster whose project is
+    // admitted through a pool queue — both lifecycle commands are 409.
+    use mobula_core::{AllocationSpec, FlavorSpec, PoolSpec};
+    use std::collections::BTreeMap;
+
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    store
+        .upsert_pool(
+            "gpu",
+            PoolSpec {
+                name: "gpu".into(),
+                flavors: vec![FlavorSpec {
+                    name: "cpu".into(),
+                    resources: BTreeMap::from([("cpu".to_string(), "4".to_string())]),
+                    node_labels: BTreeMap::new(),
+                    taints: vec![],
+                }],
+                cohort: "research".into(),
+                fair_sharing_weight: 1.0,
+                elastic: false,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_allocation(AllocationSpec {
+            pool: "gpu".into(),
+            project: "demo".into(),
+            namespace: "demo".into(),
+            nominal: BTreeMap::new(),
+            borrowing_limit: BTreeMap::new(),
+            lending_limit: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    let app = authed_app_with_store(&idp, store.clone()).await;
+    let operator = idp_token(&idp, &["/sre"]);
+
+    app.clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &operator,
+            create_body("c1"),
+        ))
+        .await
+        .unwrap();
+    store
+        .record_observation(&ClusterId("c1".into()), Some(ClusterState::Running), 1)
+        .await
+        .unwrap();
+
+    let res = app
+        .clone()
+        .oneshot(post_empty(
+            "/api/v1/clusters/c1/suspend",
+            "mobula.example.com",
+            &operator,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT, "queued → suspend 409");
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"], "queue_owned_suspend");
+
+    let res = app
+        .oneshot(post_empty(
+            "/api/v1/clusters/c1/resume",
+            "mobula.example.com",
+            &operator,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT, "queued → resume 409");
+
+    // Neither command touched desired state.
+    assert_eq!(
+        store
+            .get(&ClusterId("c1".into()))
+            .await
+            .unwrap()
+            .unwrap()
+            .desired,
+        DesiredState::Running
+    );
+}
+
+fn create_body_in(id: &str, project: &str) -> serde_json::Value {
+    let mut b = create_body(id);
+    b["spec"]["project"] = serde_json::json!(project);
+    b
+}
+
+/// Scoped RBAC (ADR-0009 addendum, #49): a developer holding an `operator`
+/// assignment at `project:ml-team` can manage ml-team clusters but gets 403
+/// elsewhere; admins and assignment-less viewers are unchanged; a caller
+/// with no global roles sees only their scoped projects in the list.
+#[tokio::test]
+async fn scoped_assignments_gate_cluster_lifecycle_per_project() {
+    use common::idp_token_sub;
+
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_role_assignment("dev-1", "operator", "project:ml-team")
+        .await
+        .unwrap();
+    // "solo" holds NO group-derived role (viewer maps to /observers, no "*"
+    // wildcard) — only the ml-team assignment.
+    store
+        .upsert_role_assignment("solo", "operator", "project:ml-team")
+        .await
+        .unwrap();
+    let app = authed_app_with_store(&idp, store.clone()).await;
+
+    let dev = idp_token_sub(&idp, "dev-1", &["/ml-eng"]);
+
+    // Create in the assigned project succeeds (scoped Write on Cluster).
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.test",
+            &dev,
+            create_body_in("c-ml", "ml-team"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "scoped create");
+
+    // Create in any other project is denied — the assignment doesn't cover it
+    // and the flat Developer role has only Read on Cluster.
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.test",
+            &dev,
+            create_body_in("c-nope", "other"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "out-of-scope create");
+
+    // Get/delete follow the same scoping.
+    let res = app
+        .clone()
+        .oneshot(get("/api/v1/clusters/c-ml", "mobula.test", Some(&dev)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "scoped get");
+    let res = app
+        .clone()
+        .oneshot(
+            Request::delete("/api/v1/clusters/c-ml")
+                .header(header::HOST, "mobula.test")
+                .header(header::AUTHORIZATION, format!("Bearer {dev}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED, "scoped delete");
+
+    // Admin is unaffected: full lifecycle in any project, no assignments.
+    let admin = idp_token(&idp, &["/platform-admins"]);
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.test",
+            &admin,
+            create_body_in("c-admin", "other"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "admin create");
+
+    // Viewer with no assignments is unchanged: reads pass globally, writes 403.
+    let viewer = idp_token_sub(&idp, "view-1", &["/observers"]);
+    let res = app
+        .clone()
+        .oneshot(get("/api/v1/clusters", "mobula.test", Some(&viewer)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "viewer list");
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.test",
+            &viewer,
+            create_body_in("c-v", "ml-team"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "viewer create");
+
+    // List filtering: "solo" has no global roles, only the ml-team
+    // assignment → sees exactly the ml-team clusters.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/api/v1/clusters",
+            "mobula.test",
+            Some(&idp_token_sub(&idp, "solo", &[])),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "scoped list");
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let ids: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["c-ml"], "scoped caller sees only ml-team clusters");
+
+    // A caller with no roles AND no assignments is still denied, as before.
+    let nobody = idp_token_sub(&idp, "nobody", &[]);
+    let res = app
+        .clone()
+        .oneshot(get("/api/v1/clusters", "mobula.test", Some(&nobody)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "role-less list");
+    let res = app
+        .oneshot(get("/api/v1/clusters/c-ml", "mobula.test", Some(&nobody)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "role-less get");
 }

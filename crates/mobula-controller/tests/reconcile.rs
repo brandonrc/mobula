@@ -34,6 +34,8 @@ struct MockProvisioner {
     /// Queue assignment each apply call received (ADR-0010 wiring check).
     apply_queues: Mutex<Vec<Option<mobula_provision::QueueAssignment>>>,
     terminate_calls: Mutex<Vec<String>>,
+    /// Ids the engine asked to suspend (#51), in call order.
+    suspend_calls: Mutex<Vec<String>>,
 }
 
 impl MockProvisioner {
@@ -98,6 +100,23 @@ impl Provisioner for MockProvisioner {
             .lock()
             .unwrap()
             .insert(id.0.clone(), ClusterState::Terminated);
+        Ok(())
+    }
+
+    async fn suspend(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        self.suspend_calls.lock().unwrap().push(id.0.clone());
+        self.state
+            .lock()
+            .unwrap()
+            .insert(id.0.clone(), ClusterState::Suspended);
+        Ok(())
+    }
+
+    async fn resume(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        self.state
+            .lock()
+            .unwrap()
+            .insert(id.0.clone(), ClusterState::Running);
         Ok(())
     }
 
@@ -430,6 +449,12 @@ impl Provisioner for LaggingProvisioner {
         })
     }
     async fn terminate(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
+        Ok(())
+    }
+    async fn suspend(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
+        Ok(())
+    }
+    async fn resume(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
         Ok(())
     }
     async fn observe(&self, id: &ClusterId) -> Result<ObservedCluster, ProvisionError> {
@@ -771,4 +796,148 @@ async fn terminate_desired_tears_down_then_noop() {
     // Already terminated → no repeated teardown.
     let r = rec.reconcile_all().await;
     assert_eq!(r[0].1.as_ref().unwrap(), &Action::NoOp);
+}
+
+#[tokio::test]
+async fn suspend_desired_suspends_running_cluster_then_noop() {
+    // #51: desired Suspended + observed Running → the provisioner's suspend
+    // call (NOT a generation-keyed apply) drives the cluster to Suspended;
+    // a converged cluster is a NoOp and never re-suspends.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    rec.reconcile_all().await;
+    assert_eq!(prov.apply_count(), 1);
+
+    store
+        .set_desired(&id, DesiredState::Suspended)
+        .await
+        .unwrap();
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Suspended);
+    assert_eq!(
+        prov.suspend_calls.lock().unwrap().as_slice(),
+        ["demo".to_string()],
+        "suspend actuates through Provisioner::suspend"
+    );
+    // Suspension changes no spec field → no new apply, no new intent key.
+    assert_eq!(prov.apply_count(), 1, "suspend must not re-apply the spec");
+    let stored = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.observed_state, Some(ClusterState::Suspended));
+
+    // Converged: desired Suspended + observed Suspended → NoOp.
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::NoOp);
+    assert_eq!(prov.suspend_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn resume_flips_desired_back_and_apply_converges() {
+    // #51: resume is not a separate actuation — the API flips desired back to
+    // Running and the existing Running arm re-applies (to_raycluster owns
+    // spec.suspend=false), so the cluster leaves Suspended.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    rec.reconcile_all().await;
+
+    store
+        .set_desired(&id, DesiredState::Suspended)
+        .await
+        .unwrap();
+    rec.reconcile_all().await;
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().observed_state,
+        Some(ClusterState::Suspended)
+    );
+
+    store.set_desired(&id, DesiredState::Running).await.unwrap();
+    let r = rec.reconcile_all().await;
+    assert_eq!(
+        r[0].1.as_ref().unwrap(),
+        &Action::Applied,
+        "resume rides the generation-keyed apply path"
+    );
+    assert_eq!(prov.apply_count(), 2);
+    let stored = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.observed_state, Some(ClusterState::Running));
+
+    // Steady state restored: no further actuation.
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::NoOp);
+    assert_eq!(prov.apply_count(), 2);
+}
+
+#[tokio::test]
+async fn suspended_desired_on_gone_or_absent_cluster_is_noop() {
+    // #51: nothing provisioned (or already terminated) means nothing to
+    // suspend — the engine must not resurrect the cluster just to suspend it.
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    store
+        .set_desired(&id, DesiredState::Suspended)
+        .await
+        .unwrap();
+
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::NoOp);
+    assert_eq!(prov.apply_count(), 0, "suspend must not provision");
+    assert!(prov.suspend_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn queued_cluster_is_never_suspended_by_the_engine() {
+    // #51 + ADR-0010: Kueue owns spec.suspend for queue-assigned clusters.
+    // The API rejects user suspend there, so desired=Suspended should never
+    // co-occur with a queue assignment — but if it somehow does, the engine
+    // must not fight the queue.
+    let (store, prov, rec) = setup();
+    use mobula_core::{AllocationSpec, FlavorSpec, PoolSpec};
+    use std::collections::BTreeMap;
+    store
+        .upsert_pool(
+            "gpu",
+            PoolSpec {
+                name: "gpu".into(),
+                flavors: vec![FlavorSpec {
+                    name: "cpu".into(),
+                    resources: BTreeMap::from([("cpu".to_string(), "4".to_string())]),
+                    node_labels: BTreeMap::new(),
+                    taints: vec![],
+                }],
+                cohort: "research".into(),
+                fair_sharing_weight: 1.0,
+                elastic: true,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_allocation(AllocationSpec {
+            pool: "gpu".into(),
+            project: "demo".into(),
+            namespace: "demo".into(),
+            nominal: BTreeMap::new(),
+            borrowing_limit: BTreeMap::new(),
+            lending_limit: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+
+    let id = ClusterId("demo".into());
+    store.upsert_desired(&id, spec("demo", 1)).await.unwrap();
+    rec.reconcile_all().await;
+    assert_eq!(prov.apply_count(), 1);
+
+    store
+        .set_desired(&id, DesiredState::Suspended)
+        .await
+        .unwrap();
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::NoOp);
+    assert!(
+        prov.suspend_calls.lock().unwrap().is_empty(),
+        "Kueue owns suspend for queued clusters — the engine stays out"
+    );
 }

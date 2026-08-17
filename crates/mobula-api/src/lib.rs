@@ -10,6 +10,7 @@ pub mod auth_layer;
 pub mod clusters;
 pub mod gateway;
 pub mod local_auth;
+pub mod metrics;
 pub mod pools;
 pub mod registry;
 pub mod services;
@@ -43,7 +44,10 @@ use utoipa_swagger_ui::SwaggerUi;
         clusters::get_cluster,
         clusters::create_cluster,
         clusters::delete_cluster,
+        clusters::suspend_cluster,
+        clusters::resume_cluster,
         clusters::list_jobs,
+        metrics::cluster_metrics,
         pools::list_pools,
         pools::get_pool,
         pools::create_pool,
@@ -73,6 +77,9 @@ use utoipa_swagger_ui::SwaggerUi;
         local_auth::update_user,
         access::identity,
         access::list_roles,
+        access::list_assignments,
+        access::upsert_assignment,
+        access::delete_assignment,
     ),
     components(
         schemas(
@@ -89,6 +96,8 @@ use utoipa_swagger_ui::SwaggerUi;
             access::IdentityResponse,
             access::RolesResponse,
             access::RoleMappingsView,
+            access::AssignmentView,
+            access::UpsertAssignment,
             mobula_core::ApiTokenView,
             mobula_core::LocalRole,
             mobula_core::LocalUserView,
@@ -286,6 +295,7 @@ pub fn build_app_with_serve_limits(
         None,
         true,
         limits,
+        None,
     )
     .expect("test limits carry no unreadable CA bundle")
 }
@@ -339,6 +349,35 @@ pub fn build_app_full_svc(
         local,
         true,
         ServeLimits::default(),
+        None,
+    )
+    .expect("default limits carry no CA bundle")
+}
+
+/// As [`build_app_full_svc`], plus the cluster [`mobula_provision::Provisioner`]
+/// backing the per-cluster metrics passthrough (#52).
+///
+/// Gated behind `test-util`/`test` for the same reason as the other
+/// builders: it defaults `allow_unauthenticated = true` (#45).
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn build_app_full_prov(
+    registry: ClusterRegistry,
+    validator: Option<Arc<Validator>>,
+    store: Option<Arc<dyn mobula_controller::Store>>,
+    policy: clusters::PolicyConfig,
+    provisioner: Option<Arc<dyn mobula_provision::Provisioner>>,
+) -> Router {
+    build_app_full_svc_inner(
+        registry,
+        validator,
+        store,
+        policy,
+        None,
+        None,
+        true,
+        ServeLimits::default(),
+        provisioner,
     )
     .expect("default limits carry no CA bundle")
 }
@@ -375,7 +414,9 @@ async fn refuse_non_loopback(req: Request, next: Next) -> Response {
 /// (ADR-0011) is present it is never needed; when both are absent and NOT
 /// explicitly allowed, the outermost [`refuse_non_loopback`] layer keeps
 /// the control plane closed to remote peers even if an embedder
-/// `axum::serve`s this router directly.
+/// `axum::serve`s this router directly. `provisioner` backs the per-cluster
+/// metrics passthrough (`/api/v1/clusters/{id}/metrics`, #52); `None`
+/// leaves the route mounted but answering 404 `metrics unavailable`.
 #[allow(clippy::too_many_arguments)]
 fn build_app_full_svc_inner(
     registry: ClusterRegistry,
@@ -386,6 +427,7 @@ fn build_app_full_svc_inner(
     local: Option<Arc<mobula_auth::local::LocalAuthenticator>>,
     allow_unauthenticated: bool,
     limits: ServeLimits,
+    provisioner: Option<Arc<dyn mobula_provision::Provisioner>>,
 ) -> std::io::Result<Router> {
     let registry = Arc::new(registry);
     let gw = gateway::GatewayState::try_with_limits(
@@ -438,6 +480,11 @@ fn build_app_full_svc_inner(
             .merge(pools::router(store.clone()))
             .merge(usage::router(store.clone(), policy.clone()))
             .merge(settings::router(store.clone(), policy))
+            .merge(metrics::router(
+                store.clone(),
+                registry.clone(),
+                provisioner,
+            ))
             .merge(audit::router(store));
     }
     if let Some(services) = services {
@@ -541,6 +588,11 @@ pub struct ServeOptions {
     /// Serve-service provisioner; when present, the `/api/v1/services`
     /// routes are mounted (Phase 4).
     pub services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
+    /// Cluster provisioner backing the per-cluster metrics passthrough
+    /// (`/api/v1/clusters/{id}/metrics`, #52) via
+    /// [`mobula_provision::Provisioner::metrics_endpoint`]. `None` leaves
+    /// the route answering 404 `metrics unavailable`.
+    pub provisioner: Option<Arc<dyn mobula_provision::Provisioner>>,
 }
 
 /// Serve the API until ctrl-c.
@@ -603,6 +655,7 @@ pub async fn serve_with_shutdown_and_limits(
         opts.local_auth,
         opts.allow_unauthenticated,
         limits,
+        opts.provisioner,
     )?;
     axum::serve(
         listener,
@@ -647,6 +700,7 @@ mod tests {
                 store: None,
                 policy: Default::default(),
                 services: None,
+                provisioner: None,
             },
             async {
                 let _ = rx.await;
@@ -713,6 +767,8 @@ mod tests {
         assert!(doc["paths"]["/api/v1/pools/{name}/usage"]["get"].is_object());
         assert!(doc["paths"]["/api/v1/usage"]["get"].is_object());
         assert!(doc["paths"]["/api/v1/metrics"]["get"].is_object());
+        // The per-cluster Ray metrics passthrough (#52).
+        assert!(doc["paths"]["/api/v1/clusters/{id}/metrics"]["get"].is_object());
         assert!(doc["components"]["schemas"]["UsageReport"].is_object());
         assert!(doc["components"]["schemas"]["PoolUsageView"].is_object());
         // The settings/policy contract (Admin-only, api-v1.md §5.16).
@@ -748,6 +804,12 @@ mod tests {
         // The identity & access contract (api-v1.md §5.8).
         assert!(doc["paths"]["/api/v1/identity"]["get"].is_object());
         assert!(doc["paths"]["/api/v1/access/roles"]["get"].is_object());
+        // Scoped role bindings (ADR-0009 addendum, #49).
+        assert!(doc["paths"]["/api/v1/access/assignments"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/access/assignments/{principal}"]["put"].is_object());
+        assert!(doc["paths"]["/api/v1/access/assignments/{principal}"]["delete"].is_object());
+        assert!(doc["components"]["schemas"]["AssignmentView"].is_object());
+        assert!(doc["components"]["schemas"]["UpsertAssignment"].is_object());
         assert!(doc["components"]["schemas"]["IdentityResponse"].is_object());
         assert!(doc["components"]["schemas"]["RolesResponse"].is_object());
         assert!(doc["components"]["schemas"]["RoleMappingsView"].is_object());
@@ -824,6 +886,7 @@ mod tests {
             None,
             false,
             ServeLimits::default(),
+            None,
         )
         .expect("default limits carry no CA bundle");
         let req = with_peer(
@@ -850,6 +913,7 @@ mod tests {
             None,
             false,
             ServeLimits::default(),
+            None,
         )
         .expect("default limits carry no CA bundle");
         let req = with_peer(
@@ -873,6 +937,7 @@ mod tests {
             None,
             false,
             ServeLimits::default(),
+            None,
         )
         .expect("default limits carry no CA bundle");
         let req = with_peer(

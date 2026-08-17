@@ -54,3 +54,33 @@ accidental), the vocabulary is already the scoped one, and Phase 3 fills in
 tables without a type-system rewrite. REQUIREMENTS §3.7's org/project
 dimension is realized only when a deployment (or NIC) defines project
 groups; until then `target = cluster` is the enforced scope.
+
+## Addendum (2026-08-17, #49): scoped bindings landed, additive-only
+
+The deferred `role_assignments` half shipped ahead of the full Phase 3
+table set, in the smallest form that delivers value:
+
+- **Schema:** `role_assignments (principal TEXT, role TEXT, scope TEXT)`,
+  keyed by the triple. `principal` is the Identity `sub` (or local-auth
+  username); `role` is a built-in role name; `scope` is `"*"` (global —
+  today's flat behavior) or `"project:<name>"`. Cluster-scoped bindings and
+  custom-role rows remain Phase 3.
+- **Semantics — additive grants only.** A binding can add permissions, never
+  subtract; there are no deny rules. A principal with **no** bindings falls
+  back to exactly the flat group→role mapping. A principal **with** bindings
+  gets the union of (flat global roles from groups) and (binding roles whose
+  scope covers the target's project). Evaluation: `Identity::permits` stays
+  the global fast path; `permits_scoped(action, target, assignments,
+  project)` ORs in bindings with `scope == "*"` or `scope == "project:<name>"`.
+- **Lookup cost:** bindings are resolved per request from the store via an
+  `AssignmentSource` trait (`mobula-auth`), implemented over `Store` in
+  mobula-api's `auth_layer` — one indexed row read per request that misses
+  the flat fast path. Caching is a deliberate follow-up, not built.
+- **Enforcement rollout:** v0 wires scoped checks into the cluster routes
+  only (`create`/`get`/`delete` scoped to the cluster's project; `list`
+  filters per-project for callers lacking global `Read`). All other routes
+  keep flat checks; the admin API is `GET/PUT/DELETE
+  /api/v1/access/assignments…` (Admin-only, audited — api-v1.md §2.2).
+- **Out of scope, by design:** group-principal bindings are the OIDC-mapping
+  layer's job (they collapse into group→role mapping), and per-cluster
+  bindings wait for the Phase 3 `permissions`/`roles` tables.

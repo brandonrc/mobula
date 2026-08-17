@@ -97,12 +97,18 @@ pub async fn spawn_idp() -> Idp {
 }
 
 pub fn idp_token(idp: &Idp, groups: &[&str]) -> String {
+    idp_token_sub(idp, "user-123", groups)
+}
+
+/// Like [`idp_token`] but with an explicit `sub` — scoped-RBAC (#49) tests
+/// need distinct principals so assignments bind to one caller only.
+pub fn idp_token_sub(idp: &Idp, sub: &str, groups: &[&str]) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
     let claims = serde_json::json!({
-        "sub": "user-123", "email": "user@example.com",
+        "sub": sub, "email": "user@example.com",
         "iss": idp.issuer, "aud": "mobula",
         "exp": now + 300, "iat": now, "groups": groups,
     });
@@ -579,5 +585,34 @@ impl mobula_controller::Store for FailingStore {
     ) -> Result<(), mobula_controller::StoreError> {
         self.check("touch_api_token")?;
         self.inner.touch_api_token(prefix, now).await
+    }
+    async fn upsert_role_assignment(
+        &self,
+        principal: &str,
+        role: &str,
+        scope: &str,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("upsert_role_assignment")?;
+        self.inner
+            .upsert_role_assignment(principal, role, scope)
+            .await
+    }
+    async fn list_role_assignments(
+        &self,
+        principal: Option<&str>,
+    ) -> Result<Vec<mobula_controller::RoleAssignment>, mobula_controller::StoreError> {
+        self.check("list_role_assignments")?;
+        self.inner.list_role_assignments(principal).await
+    }
+    async fn delete_role_assignment(
+        &self,
+        principal: &str,
+        role: &str,
+        scope: &str,
+    ) -> Result<(), mobula_controller::StoreError> {
+        self.check("delete_role_assignment")?;
+        self.inner
+            .delete_role_assignment(principal, role, scope)
+            .await
     }
 }

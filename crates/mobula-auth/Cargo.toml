@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 mobula-core.workspace = true
 mobula-controller.workspace = true
+async-trait.workspace = true
 bcrypt.workspace = true
 jsonwebtoken.workspace = true
 rand = "0.8"

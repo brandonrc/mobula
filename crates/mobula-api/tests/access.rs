@@ -456,3 +456,209 @@ async fn user_management_is_admin_only() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+// --- Scoped role bindings (ADR-0009 addendum, #49) ---
+
+fn delete_req(path: &str, token: &str) -> Request<Body> {
+    Request::delete(path)
+        .header(header::HOST, "mobula.test")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn assignments_crud_is_admin_only_validated_and_audited() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_store(&idp, store.clone()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    // Empty initially.
+    let res = app
+        .clone()
+        .oneshot(get_auth("/api/v1/access/assignments", Some(&admin)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_json(res).await, serde_json::json!([]));
+
+    // Validation: unknown role, bad scope grammar, bad role type.
+    for body in [
+        serde_json::json!({"role": "superuser", "scope": "*"}),
+        serde_json::json!({"role": "operator", "scope": "cluster:c1"}),
+        serde_json::json!({"role": "operator", "scope": "project:"}),
+        serde_json::json!({"role": "operator"}),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(json_req(
+                "PUT",
+                "/api/v1/access/assignments/dev-1",
+                &admin,
+                body,
+            ))
+            .await
+            .unwrap();
+        assert!(res.status().is_client_error(), "rejected {res:?}");
+    }
+
+    // Upsert two bindings for dev-1 and one for bob.
+    let res = app
+        .clone()
+        .oneshot(json_req(
+            "PUT",
+            "/api/v1/access/assignments/dev-1",
+            &admin,
+            serde_json::json!({"role": "operator", "scope": "project:ml-team"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    assert_eq!(body["principal"], "dev-1");
+    assert_eq!(body["role"], "operator");
+    assert_eq!(body["scope"], "project:ml-team");
+    assert!(body["created_at"].as_u64().unwrap() > 0);
+    let first_created = body["created_at"].as_u64().unwrap();
+
+    for (principal, role, scope) in [
+        ("dev-1", "viewer", "*"),
+        ("bob", "developer", "project:data"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(json_req(
+                "PUT",
+                &format!("/api/v1/access/assignments/{principal}"),
+                &admin,
+                serde_json::json!({"role": role, "scope": scope}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{principal}");
+    }
+
+    // Re-upsert of the same triple is idempotent (created_at preserved).
+    let res = app
+        .clone()
+        .oneshot(json_req(
+            "PUT",
+            "/api/v1/access/assignments/dev-1",
+            &admin,
+            serde_json::json!({"role": "operator", "scope": "project:ml-team"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_json(res).await["created_at"], first_created);
+
+    // List shows all three, ordered by (principal, scope, role).
+    let res = app
+        .clone()
+        .oneshot(get_auth("/api/v1/access/assignments", Some(&admin)))
+        .await
+        .unwrap();
+    let rows = body_json(res).await;
+    let triples: Vec<(&str, &str, &str)> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["principal"].as_str().unwrap(),
+                r["role"].as_str().unwrap(),
+                r["scope"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        triples,
+        [
+            ("bob", "developer", "project:data"),
+            ("dev-1", "viewer", "*"),
+            ("dev-1", "operator", "project:ml-team"),
+        ]
+    );
+
+    // Delete one; deleting it again (or an unknown triple) 404s.
+    let res = app
+        .clone()
+        .oneshot(delete_req(
+            "/api/v1/access/assignments/dev-1?role=viewer&scope=*",
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let res = app
+        .clone()
+        .oneshot(delete_req(
+            "/api/v1/access/assignments/dev-1?role=viewer&scope=*",
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "re-delete 404");
+
+    // Non-admins are locked out of all three routes; no token → 401.
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .clone()
+        .oneshot(get_auth("/api/v1/access/assignments", Some(&viewer)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "viewer list");
+    let res = app
+        .clone()
+        .oneshot(json_req(
+            "PUT",
+            "/api/v1/access/assignments/mallory",
+            &viewer,
+            serde_json::json!({"role": "admin", "scope": "*"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "viewer grant");
+    let res = app
+        .clone()
+        .oneshot(delete_req(
+            "/api/v1/access/assignments/dev-1?role=operator&scope=project:ml-team",
+            &viewer,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "viewer delete");
+    let res = app
+        .clone()
+        .oneshot(get_auth("/api/v1/access/assignments", None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // Mutations are audited: two distinct principals' upserts + one delete
+    // (the idempotent re-upsert also writes a row).
+    let (events, _) = store
+        .list_audit(&mobula_core::AuditFilter::default())
+        .await
+        .unwrap();
+    let upserts = events
+        .iter()
+        .filter(|(_, e)| e.action.as_deref() == Some("upsert_assignment"))
+        .count();
+    let deletes = events
+        .iter()
+        .filter(|(_, e)| e.action.as_deref() == Some("delete_assignment"))
+        .count();
+    assert_eq!(upserts, 4, "upsert audit rows: {events:?}");
+    assert_eq!(deletes, 1, "delete audit rows: {events:?}");
+    // The admin's denials of the viewer are audited too.
+    let denies = events
+        .iter()
+        .filter(|(_, e)| {
+            e.decision == mobula_core::AuditDecision::Deny
+                && e.subject.as_deref() == Some("user-123")
+        })
+        .count();
+    assert_eq!(denies, 3, "viewer denial rows: {events:?}");
+}

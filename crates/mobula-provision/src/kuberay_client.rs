@@ -82,6 +82,20 @@ impl KubeRayProvisioner {
     fn api_base_url(&self, id: &str) -> String {
         format!("http://{id}-head-svc.{}.svc:8265", self.namespace)
     }
+
+    /// Flip only `spec.suspend` (#51) via a JSON merge patch — see
+    /// [`kuberay::suspend_patch`] for why this is not a partial SSA apply.
+    async fn set_suspend(&self, id: &ClusterId, suspend: bool) -> Result<(), ProvisionError> {
+        let patch = kuberay::suspend_patch(suspend);
+        self.api()
+            .patch(&id.0, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        tracing::info!(
+            target: "mobula::audit",
+            cluster = %id, suspend, "raycluster suspend field set"
+        );
+        Ok(())
+    }
 }
 
 /// Read the Mobula generation an observed RayCluster carries (ADR-0006, #40)
@@ -157,6 +171,14 @@ impl Provisioner for KubeRayProvisioner {
         }
     }
 
+    async fn suspend(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        self.set_suspend(id, true).await
+    }
+
+    async fn resume(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        self.set_suspend(id, false).await
+    }
+
     async fn observe(&self, id: &ClusterId) -> Result<ObservedCluster, ProvisionError> {
         let obj = self
             .api()
@@ -202,6 +224,13 @@ impl Provisioner for KubeRayProvisioner {
                 })
             })
             .collect())
+    }
+
+    fn metrics_endpoint(&self, id: &ClusterId) -> Option<String> {
+        // The head service KubeRay creates is `<name>-head-svc` (same
+        // derivation as `api_base_url`); the Ray head serves its Prometheus
+        // exposition at /metrics on the dashboard port 8265.
+        Some(format!("{}/metrics", self.api_base_url(&id.0)))
     }
 }
 

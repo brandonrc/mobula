@@ -101,6 +101,10 @@ pub enum Action {
     Applied,
     /// Requested teardown.
     Terminated,
+    /// Suspended the cluster (#51): compute released, spec and store state
+    /// kept. Actuated through the provisioner's `suspend` call, not the
+    /// generation-keyed apply path.
+    Suspended,
     /// Observed divergence that re-applying can't fix (Degraded, or an
     /// out-of-band spec edit) — raised as an alarm, not silently converged
     /// (ADR-0004, #41/#47). A drift condition is persisted.
@@ -290,6 +294,37 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                     self.provisioner.terminate(&c.id).await?;
                     Action::Terminated
                 } else {
+                    Action::NoOp
+                }
+            }
+            DesiredState::Suspended => {
+                // #51: drive the backing cluster to spec.suspend=true. The
+                // actuation is a level-triggered, idempotent provisioner call
+                // like terminate above — deliberately NOT the generation-keyed
+                // apply path: suspension changes no spec field, and the outbox
+                // key `{id}/{generation}` must always map to the same
+                // actuation parameters (ADR-0007). Resume is the reverse: the
+                // API flips desired back to Running and the Running arm's
+                // apply (which writes suspend:false) converges it.
+                new_condition = None;
+                if queue.is_some() {
+                    // Kueue owns spec.suspend for queue-assigned clusters
+                    // (ADR-0010); the API rejects user suspend/resume there,
+                    // so this combination should never occur — if it does,
+                    // never fight the queue.
+                    Action::NoOp
+                } else if observed_state.is_some_and(|s| {
+                    !matches!(
+                        s,
+                        ClusterState::Suspended
+                            | ClusterState::Terminated
+                            | ClusterState::Terminating
+                    )
+                }) {
+                    self.provisioner.suspend(&c.id).await?;
+                    Action::Suspended
+                } else {
+                    // Already suspended, or nothing/gone — nothing to suspend.
                     Action::NoOp
                 }
             }
@@ -588,6 +623,12 @@ mod tests {
         async fn terminate(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
             Ok(())
         }
+        async fn suspend(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
+            Ok(())
+        }
+        async fn resume(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
+            Ok(())
+        }
         async fn observe(
             &self,
             _id: &ClusterId,
@@ -622,6 +663,12 @@ mod tests {
             })
         }
         async fn terminate(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
+            Ok(())
+        }
+        async fn suspend(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
+            Ok(())
+        }
+        async fn resume(&self, _id: &ClusterId) -> Result<(), ProvisionError> {
             Ok(())
         }
         async fn observe(

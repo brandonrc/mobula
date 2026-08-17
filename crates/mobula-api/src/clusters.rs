@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use mobula_auth::{Identity, PermissionType, Target};
 use mobula_controller::{now_unix, DesiredState, Store};
@@ -23,8 +23,9 @@ use mobula_policy::{admit, cluster_demand, PriceSheet, ResourceMap};
 use std::collections::HashMap;
 
 use crate::audit::emit;
-use crate::auth_layer::authorize;
+use crate::auth_layer::{authorize, authorize_scoped, StoreAssignments};
 use crate::settings::{config_from_stored, effective_policy};
+use mobula_auth::AssignmentSource;
 
 /// Governance config for the cluster API (Phase 4): an optional price
 /// sheet for cost estimates, and per-project quota limits for admission.
@@ -77,7 +78,7 @@ pub struct ClusterView {
     pub id: String,
     /// Bumps when the spec changes; drives the reconcile idempotency key.
     pub generation: u64,
-    /// "running" | "terminated" — the operator's intent.
+    /// "running" | "suspended" | "terminated" — the operator's intent.
     pub desired: String,
     /// Observed lifecycle state, if the cluster has been reconciled.
     pub observed_state: Option<String>,
@@ -102,6 +103,7 @@ impl ClusterView {
             generation: c.generation,
             desired: match c.desired {
                 DesiredState::Running => "running".into(),
+                DesiredState::Suspended => "suspended".into(),
                 DesiredState::Terminated => "terminated".into(),
             },
             observed_state: c
@@ -142,16 +144,36 @@ async fn list_clusters(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
 ) -> Response {
-    if let Some(deny) = authorize(
-        Some(&st.store),
-        ident(&identity),
-        PermissionType::Read,
-        Target::Cluster,
-    )
-    .await
-    {
-        return deny;
-    }
+    // Scoped RBAC (#49): the global `Read` on Cluster gets the full list
+    // (fast path, unchanged). A caller without it — e.g. an operator scoped
+    // to `project:ml-team` — gets the list filtered to the projects their
+    // assignments cover. Additive-only: nothing is ever hidden from someone
+    // the flat model would have shown it to.
+    let id = ident(&identity);
+    let scoped_assignments = match id {
+        None => None,
+        Some(i) if i.permits(PermissionType::Read, Target::Cluster) => None,
+        Some(i) => {
+            let assignments = StoreAssignments(st.store.as_ref())
+                .assignments_for(&i.subject)
+                .await;
+            if assignments.is_empty() {
+                // No global role and no assignments at all: exactly today's
+                // flat-model denial, audit row included.
+                if let Some(deny) = authorize(
+                    Some(&st.store),
+                    Some(i),
+                    PermissionType::Read,
+                    Target::Cluster,
+                )
+                .await
+                {
+                    return deny;
+                }
+            }
+            Some(assignments)
+        }
+    };
     match st.store.list().await {
         Ok(clusters) => {
             // Effective policy is store-backed and read per request, so
@@ -163,6 +185,15 @@ async fn list_clusters(
             let prices = policy.prices.as_ref();
             let views: Vec<_> = clusters
                 .into_iter()
+                .filter(|c| match (&scoped_assignments, id) {
+                    (Some(assignments), Some(i)) => i.permits_scoped(
+                        PermissionType::Read,
+                        Target::Cluster,
+                        assignments,
+                        &c.spec.project,
+                    ),
+                    _ => true,
+                })
                 .map(|c| ClusterView::from_stored(c, prices))
                 .collect();
             Json(views).into_response()
@@ -185,18 +216,21 @@ async fn get_cluster(
     identity: Option<Extension<Identity>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(
-        Some(&st.store),
-        ident(&identity),
-        PermissionType::Read,
-        Target::Cluster,
-    )
-    .await
-    {
-        return deny;
-    }
+    // Scoped RBAC (#49): fetch first — the check needs the cluster's
+    // project — then require Read on Cluster scoped to that project.
     match st.store.get(&ClusterId(id)).await {
         Ok(Some(c)) => {
+            if let Some(deny) = authorize_scoped(
+                Some(&st.store),
+                ident(&identity),
+                PermissionType::Read,
+                Target::Cluster,
+                &c.spec.project,
+            )
+            .await
+            {
+                return deny;
+            }
             let policy = match effective_policy(&st.store, &st.policy).await {
                 Ok(p) => p.map(|p| config_from_stored(&p)).unwrap_or_default(),
                 Err(e) => return store_err(e),
@@ -226,11 +260,14 @@ async fn create_cluster(
     identity: Option<Extension<Identity>>,
     Json(body): Json<CreateCluster>,
 ) -> Response {
-    if let Some(deny) = authorize(
+    // Scoped RBAC (#49): Write on Cluster granted globally (Operator/Admin)
+    // or by an assignment covering the spec's project.
+    if let Some(deny) = authorize_scoped(
         Some(&st.store),
         ident(&identity),
         PermissionType::Write,
         Target::Cluster,
+        &body.spec.project,
     )
     .await
     {
@@ -395,17 +432,26 @@ async fn delete_cluster(
     identity: Option<Extension<Identity>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(deny) = authorize(
-        Some(&st.store),
-        ident(&identity),
-        PermissionType::Write,
-        Target::Cluster,
-    )
-    .await
-    {
-        return deny;
-    }
     let id = ClusterId(id);
+    // Scoped RBAC (#49): fetch first — the check needs the cluster's
+    // project — then require Write on Cluster scoped to that project.
+    match st.store.get(&id).await {
+        Ok(Some(c)) => {
+            if let Some(deny) = authorize_scoped(
+                Some(&st.store),
+                ident(&identity),
+                PermissionType::Write,
+                Target::Cluster,
+                &c.spec.project,
+            )
+            .await
+            {
+                return deny;
+            }
+        }
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such cluster").into_response(),
+        Err(e) => return store_err(e),
+    }
     // Desired = Terminated; the reconciler tears down the backing resources.
     match st.store.set_desired(&id, DesiredState::Terminated).await {
         Ok(()) => {
@@ -432,6 +478,207 @@ async fn delete_cluster(
         }
         Err(e) => store_err(e),
     }
+}
+
+/// The user-issued lifecycle command behind `POST .../suspend` and
+/// `.../resume` (#51). Each only flips *desired* state in the store; the
+/// reconcile engine actuates (suspend via the provisioner's `suspend` call,
+/// resume via the generation-keyed apply that writes `suspend: false`).
+#[derive(Clone, Copy)]
+enum LifecycleCommand {
+    Suspend,
+    Resume,
+}
+
+impl LifecycleCommand {
+    fn desired(self) -> DesiredState {
+        match self {
+            LifecycleCommand::Suspend => DesiredState::Suspended,
+            LifecycleCommand::Resume => DesiredState::Running,
+        }
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            LifecycleCommand::Suspend => "suspend_cluster",
+            LifecycleCommand::Resume => "resume_cluster",
+        }
+    }
+
+    /// The intermediate observed state the command moves the cluster
+    /// through (api-v1.md §5.1): suspending releases compute; resuming
+    /// re-provisions (no fast path Suspended → Running).
+    fn transitional_state(self) -> mobula_core::ClusterState {
+        match self {
+            LifecycleCommand::Suspend => mobula_core::ClusterState::Suspending,
+            LifecycleCommand::Resume => mobula_core::ClusterState::Provisioning,
+        }
+    }
+}
+
+/// Shared implementation of the suspend/resume routes. Validation is
+/// against the *observed* state machine (`ClusterState::can_transition` is
+/// defined for exactly this — user-issued lifecycle commands): the command
+/// must start a legal edge from the observed state, and a cluster whose
+/// desired state is already Terminated can be neither suspended nor
+/// resumed.
+async fn lifecycle_command(
+    st: &ClusterApiState,
+    identity: &Option<Extension<Identity>>,
+    id: ClusterId,
+    cmd: LifecycleCommand,
+) -> Response {
+    if let Some(deny) = authorize(
+        Some(&st.store),
+        ident(identity),
+        PermissionType::Write,
+        Target::Cluster,
+    )
+    .await
+    {
+        return deny;
+    }
+    let cluster = match st.store.get(&id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such cluster").into_response(),
+        Err(e) => return store_err(e),
+    };
+
+    // Kueue owns `spec.suspend` for queue-assigned clusters (ADR-0010):
+    // admission holds unadmitted workloads Suspended and clears it, so a
+    // user suspend/resume would fight the queue. Reject with 409; detach
+    // the project from its pool allocation first if a manual suspend is
+    // really wanted.
+    match mobula_controller::queue_assignment_for_project(st.store.as_ref(), &cluster.spec.project)
+        .await
+    {
+        Ok(Some(q)) => {
+            emit(
+                Some(&st.store),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Deny,
+                    reason: Some("queue_owned_suspend".into()),
+                    action: Some(cmd.action().into()),
+                    cluster: Some(id.to_string()),
+                    status: Some(StatusCode::CONFLICT.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "queue_owned_suspend",
+                    "message": format!(
+                        "cluster's project is admitted through queue '{}' — Kueue owns suspend there",
+                        q.queue_name
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => return store_err(e),
+    }
+
+    let to = cmd.transitional_state();
+    let legal = cluster.desired != DesiredState::Terminated
+        && cluster.observed_state.is_some_and(|s| s.can_transition(to));
+    if !legal {
+        emit(
+            Some(&st.store),
+            AuditEvent {
+                ts: now_unix(),
+                subject: ident(identity).map(|i| i.subject.clone()),
+                decision: AuditDecision::Deny,
+                reason: Some("illegal_state_transition".into()),
+                action: Some(cmd.action().into()),
+                cluster: Some(id.to_string()),
+                status: Some(StatusCode::CONFLICT.as_u16()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let from = cluster
+            .observed_state
+            .map(|s| serde_json::to_value(s).unwrap_or_default())
+            .unwrap_or(serde_json::Value::Null);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "illegal_state_transition",
+                "from": from,
+                "to": serde_json::to_value(to).unwrap_or_default(),
+            })),
+        )
+            .into_response();
+    }
+
+    match st.store.set_desired(&id, cmd.desired()).await {
+        Ok(()) => {
+            emit(
+                Some(&st.store),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Allow,
+                    action: Some(cmd.action().into()),
+                    cluster: Some(id.to_string()),
+                    status: Some(StatusCode::ACCEPTED.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "id": id.0,
+                    "state": serde_json::to_value(to).unwrap_or_default(),
+                    "generation": cluster.generation,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => store_err(e),
+    }
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/clusters/{id}/suspend", tag = "clusters",
+    params(("id" = String, Path, description = "Cluster id")),
+    responses((status = 202, description = "Desired state set to suspended; reconciler releases compute (spec.suspend=true)"),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Write on cluster (Operator/Admin only)"),
+              (status = 404, description = "No such cluster"),
+              (status = 409, description = "Illegal state transition, or the cluster's project is queue-assigned (Kueue owns suspend)")),
+    security(("bearer" = []))
+)]
+async fn suspend_cluster(
+    State(st): State<ClusterApiState>,
+    identity: Option<Extension<Identity>>,
+    Path(id): Path<String>,
+) -> Response {
+    lifecycle_command(&st, &identity, ClusterId(id), LifecycleCommand::Suspend).await
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/clusters/{id}/resume", tag = "clusters",
+    params(("id" = String, Path, description = "Cluster id")),
+    responses((status = 202, description = "Desired state set back to running; reconciler re-provisions (suspend=false)"),
+              (status = 401, description = "No/invalid token"),
+              (status = 403, description = "Missing Write on cluster (Operator/Admin only)"),
+              (status = 404, description = "No such cluster"),
+              (status = 409, description = "Illegal state transition, or the cluster's project is queue-assigned (Kueue owns suspend)")),
+    security(("bearer" = []))
+)]
+async fn resume_cluster(
+    State(st): State<ClusterApiState>,
+    identity: Option<Extension<Identity>>,
+    Path(id): Path<String>,
+) -> Response {
+    lifecycle_command(&st, &identity, ClusterId(id), LifecycleCommand::Resume).await
 }
 
 /// A job in the persistent, cross-cluster history (Phase 3, spec §5.5).
@@ -494,6 +741,8 @@ pub fn router(store: Arc<dyn Store>, policy: Arc<PolicyConfig>) -> Router {
             "/api/v1/clusters/{id}",
             get(get_cluster).delete(delete_cluster),
         )
+        .route("/api/v1/clusters/{id}/suspend", post(suspend_cluster))
+        .route("/api/v1/clusters/{id}/resume", post(resume_cluster))
         .route("/api/v1/jobs", get(list_jobs))
         .with_state(ClusterApiState {
             store,

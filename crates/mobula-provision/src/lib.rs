@@ -86,11 +86,38 @@ pub trait Provisioner: Send + Sync {
     /// Begin teardown. Idempotent; succeeds if already gone.
     async fn terminate(&self, id: &ClusterId) -> Result<(), ProvisionError>;
 
+    /// Suspend the cluster: release its compute while keeping spec and
+    /// state (#51). Idempotent; succeeds if already suspended. Like
+    /// [`Provisioner::terminate`] this is a level-triggered call, NOT
+    /// generation-keyed through the outbox — suspension changes no spec
+    /// field, so it must not ride the `{id}/{generation}` intent key (ADR-0007:
+    /// same key = same actuation parameters). Mobula owns `spec.suspend`
+    /// (SSA field manager), so this is a single-field actuation on an owned
+    /// field.
+    async fn suspend(&self, id: &ClusterId) -> Result<(), ProvisionError>;
+
+    /// Resume a suspended cluster (`spec.suspend: false`). Idempotent.
+    /// The reconcile engine normally resumes through the generation-keyed
+    /// `apply` path (the full manifest already writes `suspend: false`, which
+    /// also repairs drift); this method exists for callers that must resume
+    /// *without* re-asserting the rest of the spec.
+    async fn resume(&self, id: &ClusterId) -> Result<(), ProvisionError>;
+
     /// Observe current state without mutating anything.
     async fn observe(&self, id: &ClusterId) -> Result<ObservedCluster, ProvisionError>;
 
     /// List every cluster this backend manages (field-manager scoped).
     async fn list(&self) -> Result<Vec<ObservedCluster>, ProvisionError>;
+
+    /// The Ray head's Prometheus metrics endpoint for `id`, reachable from
+    /// the control plane (`GET /api/v1/clusters/{id}/metrics` proxies it,
+    /// #52). Synchronous and pure — it derives a name, it never I/Os.
+    /// `None` (the default) when the backend can't name one; the route then
+    /// answers a clean 404 `metrics unavailable`.
+    fn metrics_endpoint(&self, id: &ClusterId) -> Option<String> {
+        let _ = id;
+        None
+    }
 }
 
 /// Observed state of a Serve service.

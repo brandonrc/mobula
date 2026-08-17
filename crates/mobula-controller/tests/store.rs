@@ -66,6 +66,23 @@ async fn conformance(store: &dyn Store) {
         DesiredState::Terminated
     );
 
+    // #51: the Suspended desired state round-trips too (persisted as the
+    // string "suspended" by the sqlx stores; old "running"/"terminated"
+    // rows still parse).
+    store
+        .set_desired(&id, DesiredState::Suspended)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().desired,
+        DesiredState::Suspended
+    );
+    store.set_desired(&id, DesiredState::Running).await.unwrap();
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().desired,
+        DesiredState::Running
+    );
+
     // list.
     assert_eq!(store.list().await.unwrap().len(), 1);
 
@@ -845,6 +862,90 @@ async fn sqlite_store_pool_conforms() {
     pool_conformance(&store).await;
 }
 
+/// Scoped-role-assignment conformance (ADR-0009 addendum, #49), run against
+/// BOTH impls (and Postgres in CI): upsert/list/delete keyed by
+/// (principal, role, scope), per-principal filter, created_at stability.
+async fn assignment_conformance(store: &dyn Store) {
+    // Empty by default; per-principal filter.
+    assert!(store.list_role_assignments(None).await.unwrap().is_empty());
+    assert!(store
+        .list_role_assignments(Some("alice"))
+        .await
+        .unwrap()
+        .is_empty());
+
+    store
+        .upsert_role_assignment("alice", "operator", "project:ml-team")
+        .await
+        .unwrap();
+    store
+        .upsert_role_assignment("alice", "viewer", "*")
+        .await
+        .unwrap();
+    store
+        .upsert_role_assignment("bob", "developer", "project:data")
+        .await
+        .unwrap();
+
+    // Per-principal list is ordered by (principal, scope, role); "*" sorts
+    // before "project:…".
+    let alice = store.list_role_assignments(Some("alice")).await.unwrap();
+    assert_eq!(alice.len(), 2);
+    assert_eq!(alice[0].scope, "*");
+    assert_eq!(alice[0].role, "viewer");
+    assert_eq!(alice[1].scope, "project:ml-team");
+    assert!(alice.iter().all(|a| a.principal == "alice"));
+    assert!(alice.iter().all(|a| a.created_at > 0));
+
+    // Re-upsert of the same triple replaces in place (no duplicate) and
+    // preserves the original created_at.
+    let first = alice[1].created_at;
+    store
+        .upsert_role_assignment("alice", "operator", "project:ml-team")
+        .await
+        .unwrap();
+    let again = store.list_role_assignments(Some("alice")).await.unwrap();
+    assert_eq!(again.len(), 2);
+    assert_eq!(again[1].created_at, first);
+
+    // Unfiltered list covers all principals, ordered.
+    let all = store.list_role_assignments(None).await.unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].principal, "alice");
+    assert_eq!(all[2].principal, "bob");
+
+    // Delete round-trips; deleting a missing triple errors naming it.
+    store
+        .delete_role_assignment("alice", "viewer", "*")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_role_assignments(Some("alice"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let err = store
+        .delete_role_assignment("alice", "viewer", "*")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no such assignment alice/viewer/*"), "{err}");
+}
+
+#[tokio::test]
+async fn in_memory_store_assignment_conforms() {
+    assignment_conformance(&InMemoryStore::new()).await;
+}
+
+#[tokio::test]
+async fn sqlite_store_assignment_conforms() {
+    let store = SqliteStore::in_memory().await.unwrap();
+    assignment_conformance(&store).await;
+}
+
 /// Governance-policy conformance (api-v1.md §5.16): unset reads as `None`;
 /// set round-trips the full record (prices, quotas, provenance flag);
 /// overwrite replaces the row; `seed_policy` is insert-if-absent.
@@ -1039,6 +1140,7 @@ mod postgres {
     pg_conformance!(postgres_store_usage_conforms, usage_conformance);
     pg_conformance!(postgres_store_audit_conforms, audit_conformance);
     pg_conformance!(postgres_store_local_auth_conforms, local_auth_conformance);
+    pg_conformance!(postgres_store_assignment_conforms, assignment_conformance);
 
     #[tokio::test]
     async fn postgres_store_policy_conforms() {

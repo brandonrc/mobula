@@ -25,6 +25,12 @@ click through the UI and exercise the API end-to-end. No Kubernetes.
 client (vendored into `mobula-ui/vendor/`) before building, so the UI image
 needs no GitHub Packages token. Re-run it after changing the API surface.
 
+**Store backend:** `mobula serve --db` also accepts a `postgres://…` /
+`postgresql://…` URL — the store then runs on Postgres 16 (schema is
+auto-created on connect) instead of a SQLite file. The store conformance
+suite covers it when `MOBULA_TEST_POSTGRES_URL` is set (mobula-controller
+tests; skipped otherwise).
+
 ## Try it
 
 ```bash

@@ -1573,6 +1573,7 @@ dependencies = [
 name = "mobula-auth"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "axum",
  "bcrypt",
  "jsonwebtoken",
@@ -1664,6 +1665,19 @@ dependencies = [
 [[package]]
 name = "mobula-proxy"
 version = "0.0.1"
+dependencies = [
+ "axum",
+ "jsonwebtoken",
+ "mobula-auth",
+ "rand 0.8.7",
+ "reqwest",
+ "rsa",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+]
 
 [[package]]
 name = "nu-ansi-term"

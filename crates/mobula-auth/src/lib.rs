@@ -26,9 +26,9 @@ pub enum PermissionType {
 
 /// What a permission applies to — artifact-keeper's `target_type`. This is
 /// what lets `Operator` (cluster lifecycle) differ from `Developer` (job
-/// code) with the same verbs. Per-resource-instance scoping (which
-/// cluster/project) lands with the Phase 3 role_assignments table
-/// (ADR-0009); this is the target *type*.
+/// code) with the same verbs. Per-project scoping landed via the
+/// role_assignments table (ADR-0009 addendum, #49; see
+/// [`Identity::permits_scoped`]); this remains the target *type*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// The proxied Ray job surface — submitting/stopping jobs is "code".
@@ -80,6 +80,57 @@ impl Role {
             }
         }
     }
+
+    /// The snake_case wire/storage form (role_assignments.role column,
+    /// `PUT /api/v1/access/assignments` bodies).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Developer => "developer",
+            Role::Operator => "operator",
+            Role::Admin => "admin",
+        }
+    }
+
+    /// Inverse of [`Role::as_str`]; `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "viewer" => Some(Role::Viewer),
+            "developer" => Some(Role::Developer),
+            "operator" => Some(Role::Operator),
+            "admin" => Some(Role::Admin),
+            _ => None,
+        }
+    }
+}
+
+/// The global assignment scope (ADR-0009 addendum, #49): an assignment at
+/// this scope applies to every target, exactly like a group-derived role.
+pub const GLOBAL_SCOPE: &str = "*";
+
+/// The scope grammar for role assignments (#49): `"*"` (global) or
+/// `"project:<name>"`. Cluster-scoped bindings ("cluster:<id>") and group
+/// principals are deferred — group bindings are the OIDC-mapping layer's
+/// job (ADR-0009).
+pub fn valid_scope(scope: &str) -> bool {
+    if scope == GLOBAL_SCOPE {
+        return true;
+    }
+    let Some(name) = scope.strip_prefix("project:") else {
+        return false;
+    };
+    // Project names share the cluster-id grammar: a non-empty run of
+    // lowercase alphanumerics, '-', '_', '.', '/' (NIC project slugs).
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+}
+
+/// Whether an assignment `scope` covers `project` in a scoped check:
+/// `"*"` covers everything; `"project:<name>"` covers only that project.
+pub fn scope_covers(scope: &str, project: &str) -> bool {
+    scope == GLOBAL_SCOPE || scope == format!("project:{project}")
 }
 
 /// Authenticated caller, attached to requests after validation. A caller
@@ -97,6 +148,28 @@ impl Identity {
     /// an empty role set grants nothing).
     pub fn permits(&self, action: PermissionType, target: Target) -> bool {
         self.roles.iter().any(|r| r.grants(action, target))
+    }
+
+    /// Scoped check (ADR-0009 addendum, #49): the global fast path
+    /// ([`Identity::permits`]) OR any assignment in `assignments` whose
+    /// scope covers `project` (`"*"` or `"project:<project>"`) and whose
+    /// role grants `(action, target)`.
+    ///
+    /// Semantics are ADDITIVE ONLY: an assignment can grant, never subtract
+    /// — there are no deny rules. A principal with no assignments gets
+    /// exactly today's flat group→role mapping; one with assignments gets
+    /// the union of group-derived roles and scope-matching assigned roles.
+    pub fn permits_scoped(
+        &self,
+        action: PermissionType,
+        target: Target,
+        assignments: &[(Role, String)],
+        project: &str,
+    ) -> bool {
+        self.permits(action, target)
+            || assignments
+                .iter()
+                .any(|(role, scope)| scope_covers(scope, project) && role.grants(action, target))
     }
 
     pub fn is_authorized(&self) -> bool {
@@ -169,6 +242,20 @@ pub enum AuthError {
 
 pub mod flows;
 pub mod local;
+
+/// Where scoped role assignments come from at request time (ADR-0009
+/// addendum, #49). The trait lives here so the evaluation semantics
+/// ([`Identity::permits_scoped`]) stay next to the model; the
+/// implementation lives in mobula-api's auth_layer over the Store (one
+/// indexed `role_assignments` read per request — caching is a documented
+/// follow-up, not built).
+#[async_trait::async_trait]
+pub trait AssignmentSource: Send + Sync {
+    /// All assignments for `subject`, as (role, scope) rows. Implementations
+    /// must fail CLOSED on backend errors (return an empty vec — global
+    /// roles still apply, scoped extras are withheld).
+    async fn assignments_for(&self, subject: &str) -> Vec<(Role, String)>;
+}
 
 /// Subset of the OIDC provider metadata Mobula uses.
 #[derive(Debug, Clone, Deserialize)]
@@ -527,6 +614,93 @@ mod tests {
             ..RoleMappings::default()
         }
         .has_wildcard());
+    }
+
+    #[test]
+    fn role_wire_names_round_trip() {
+        for r in [Role::Viewer, Role::Developer, Role::Operator, Role::Admin] {
+            assert_eq!(Role::parse(r.as_str()), Some(r));
+        }
+        assert_eq!(Role::parse("superuser"), None);
+    }
+
+    #[test]
+    fn scope_grammar_is_star_or_project_name() {
+        assert!(valid_scope("*"));
+        assert!(valid_scope("project:ml-team"));
+        assert!(valid_scope("project:team/sub_ns.1"));
+        for bad in [
+            "",
+            "project:",
+            "cluster:c1",
+            "project:has space",
+            "project:semi;colon",
+            "**",
+            "*x",
+        ] {
+            assert!(!valid_scope(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn permits_scoped_matrix() {
+        use PermissionType::*;
+        use Target::*;
+        let dev = Identity {
+            subject: "u".into(),
+            email: None,
+            groups: vec![],
+            roles: vec![Role::Developer],
+        };
+        let op_ml = vec![(Role::Operator, "project:ml-team".to_string())];
+
+        // Global roles cover everything, assignments irrelevant (fast path).
+        let admin = Identity {
+            subject: "root".into(),
+            email: None,
+            groups: vec![],
+            roles: vec![Role::Admin],
+        };
+        assert!(admin.permits_scoped(Delete, Cluster, &[], "anywhere"));
+
+        // Developer (global) already reads clusters everywhere; scoped
+        // operator adds lifecycle ONLY for the matching project.
+        assert!(dev.permits_scoped(Read, Cluster, &op_ml, "ml-team"));
+        assert!(dev.permits_scoped(Write, Cluster, &op_ml, "ml-team"));
+        assert!(dev.permits_scoped(Delete, Cluster, &op_ml, "ml-team"));
+        assert!(!dev.permits_scoped(Write, Cluster, &op_ml, "other"));
+        // Scoped grants don't leak across targets: operator-on-ml-team
+        // doesn't grant job writes (operator is read-only on Job) — checked
+        // against a caller with no global roles so the assignment decides.
+        let nobody = Identity {
+            subject: "n".into(),
+            email: None,
+            groups: vec![],
+            roles: vec![],
+        };
+        assert!(!nobody.permits_scoped(Write, Job, &op_ml, "ml-team"));
+        // The non-scoped fast path is unchanged: no assignments consulted.
+        assert!(!dev.permits(Write, Cluster));
+
+        // A "*" assignment is a global grant — same coverage as a group role.
+        let op_star = vec![(Role::Operator, "*".to_string())];
+        assert!(dev.permits_scoped(Write, Cluster, &op_star, "other"));
+
+        // No assignments → exactly the flat mapping (the fallback rule).
+        assert!(!dev.permits_scoped(Write, Cluster, &[], "ml-team"));
+        assert!(!nobody.permits_scoped(Read, Cluster, &[], "ml-team"));
+        assert!(nobody.permits_scoped(Read, Cluster, &op_ml, "ml-team"));
+
+        // Assignments are additive only — no deny rules exist, so a scoped
+        // viewer assignment cannot strip a global operator's write.
+        let op = Identity {
+            subject: "o".into(),
+            email: None,
+            groups: vec![],
+            roles: vec![Role::Operator],
+        };
+        let scoped_viewer = vec![(Role::Viewer, "project:ml-team".to_string())];
+        assert!(op.permits_scoped(Write, Cluster, &scoped_viewer, "ml-team"));
     }
 
     #[test]

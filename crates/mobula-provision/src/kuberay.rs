@@ -289,6 +289,17 @@ fn pod_template(
 
 pub const SERVICE_KIND: &str = "RayService";
 
+/// The partial manifest a suspend/resume call actuates (#51): a JSON merge
+/// patch flipping only `spec.suspend`. Deliberately NOT a server-side apply:
+/// a partial SSA apply with Mobula's field manager is fully-specified intent
+/// and would drop every other Mobula-owned field from the applied set. Mobula
+/// already owns `spec.suspend` via the full apply ([`to_raycluster`] always
+/// writes it), so a merge patch flips the value while single-writer ownership
+/// (ADR-0007) stays with the `mobula` field manager.
+pub fn suspend_patch(suspend: bool) -> Value {
+    json!({ "spec": { "suspend": suspend } })
+}
+
 /// Build the RayService manifest for a Serve service. The `serveConfigV2`
 /// is passed through verbatim; `upgradeStrategy` selects canary
 /// (NewCluster — zero-downtime with safe rollback) vs in-place (None).
@@ -534,6 +545,21 @@ mod tests {
             None,
         );
         assert_eq!(m["spec"]["suspend"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn suspend_patch_flips_only_the_suspend_field() {
+        // #51: the suspend/resume actuation is a merge patch touching only
+        // spec.suspend — Mobula owns the field (to_raycluster always writes
+        // it), so ownership stays with the `mobula` field manager.
+        assert_eq!(suspend_patch(true), json!({ "spec": { "suspend": true } }));
+        assert_eq!(
+            suspend_patch(false),
+            json!({ "spec": { "suspend": false } })
+        );
+        // The patch must carry nothing else — a partial SSA apply would be
+        // fully-specified intent and drop Mobula's other owned fields.
+        assert_eq!(suspend_patch(true)["spec"].as_object().unwrap().len(), 1);
     }
 
     #[test]

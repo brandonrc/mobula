@@ -15,16 +15,18 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use mobula_auth::{Identity, PermissionType, RoleMappings, Target, Validator};
-use mobula_controller::Store;
-use serde::Serialize;
-use utoipa::ToSchema;
+use mobula_auth::{valid_scope, Identity, PermissionType, Role, RoleMappings, Target, Validator};
+use mobula_controller::{now_unix, RoleAssignment, Store};
+use mobula_core::{AuditDecision, AuditEvent};
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 
-use crate::audit::role_str;
+use crate::audit::{emit, role_str};
 use crate::auth_layer::authorize;
 
 #[derive(Clone)]
@@ -169,5 +171,263 @@ pub fn router(validator: Option<Arc<Validator>>, store: Option<Arc<dyn Store>>) 
     Router::new()
         .route("/api/v1/identity", get(identity))
         .route("/api/v1/access/roles", get(list_roles))
+        .route("/api/v1/access/assignments", get(list_assignments))
+        .route(
+            "/api/v1/access/assignments/{principal}",
+            axum::routing::put(upsert_assignment).delete(delete_assignment),
+        )
         .with_state(AccessApiState { validator, store })
+}
+
+// --- Scoped role bindings (ADR-0009 addendum, #49) ---
+//
+// Assignments grant `role` to `principal` at `scope` ("*" or
+// "project:<name>"), additively on top of the group-derived roles. All
+// three routes are Admin-only and store-backed (503 without a store), and
+// every mutation is audited.
+
+/// One assignment as the wire sees it.
+#[derive(Serialize, ToSchema)]
+pub struct AssignmentView {
+    /// The Identity `subject` the assignment applies to.
+    pub principal: String,
+    /// "viewer" | "developer" | "operator" | "admin".
+    pub role: String,
+    /// "*" (global) or "project:<name>".
+    pub scope: String,
+    /// Unix seconds when the assignment was first written.
+    pub created_at: u64,
+}
+
+impl From<RoleAssignment> for AssignmentView {
+    fn from(a: RoleAssignment) -> Self {
+        AssignmentView {
+            principal: a.principal,
+            role: a.role,
+            scope: a.scope,
+            created_at: a.created_at,
+        }
+    }
+}
+
+/// Body of `PUT /api/v1/access/assignments/{principal}`.
+#[derive(Deserialize, ToSchema)]
+pub struct UpsertAssignment {
+    /// "viewer" | "developer" | "operator" | "admin".
+    pub role: String,
+    /// "*" (global) or "project:<name>".
+    pub scope: String,
+}
+
+/// Query of `DELETE /api/v1/access/assignments/{principal}`.
+#[derive(Deserialize, IntoParams)]
+pub struct DeleteAssignmentQuery {
+    pub role: String,
+    pub scope: String,
+}
+
+fn store_err(e: mobula_controller::StoreError) -> Response {
+    tracing::warn!(error = %e, "access store error");
+    (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+}
+
+/// The store backing the assignments routes, or 503 in store-less
+/// (gateway-only) deployments. A macro, not a helper fn returning
+/// `Result<_, Response>` — `Response` is 128+ bytes and trips
+/// clippy::result_large_err.
+macro_rules! require_store {
+    ($st:expr) => {
+        match $st.store.as_ref() {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "role assignments require a configured store",
+                )
+                    .into_response()
+            }
+        }
+    };
+}
+
+/// Admin gate shared by the assignments routes: access-control surfaces are
+/// Admin-only (api-v1.md §2.2), classified with Target::Cluster.
+async fn require_admin(
+    st: &AccessApiState,
+    identity: &Option<Extension<Identity>>,
+) -> Option<Response> {
+    authorize(
+        st.store.as_ref(),
+        identity.as_ref().map(|e| &e.0),
+        PermissionType::Admin,
+        Target::Cluster,
+    )
+    .await
+}
+
+/// List every scoped role assignment, Admin-only.
+#[utoipa::path(
+    get, path = "/api/v1/access/assignments", tag = "access",
+    responses(
+        (status = 200, description = "All role assignments", body = [AssignmentView]),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Admin only — access-control surface (api-v1.md §2.2)"),
+        (status = 503, description = "No store configured (gateway-only deployment)"),
+    ),
+    security(("bearer" = []))
+)]
+async fn list_assignments(
+    State(st): State<AccessApiState>,
+    identity: Option<Extension<Identity>>,
+) -> Response {
+    if let Some(deny) = require_admin(&st, &identity).await {
+        return deny;
+    }
+    let store = require_store!(&st);
+    match store.list_role_assignments(None).await {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(AssignmentView::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => store_err(e),
+    }
+}
+
+/// Create or replace one assignment, Admin-only. The role and scope grammar
+/// are validated here — the store is dumb persistence.
+#[utoipa::path(
+    put, path = "/api/v1/access/assignments/{principal}", tag = "access",
+    params(("principal" = String, Path, description = "The Identity subject to bind")),
+    request_body = UpsertAssignment,
+    responses(
+        (status = 200, description = "Assignment stored", body = AssignmentView),
+        (status = 400, description = "Unknown role or invalid scope grammar"),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Admin only"),
+        (status = 503, description = "No store configured"),
+    ),
+    security(("bearer" = []))
+)]
+async fn upsert_assignment(
+    State(st): State<AccessApiState>,
+    identity: Option<Extension<Identity>>,
+    Path(principal): Path<String>,
+    Json(body): Json<UpsertAssignment>,
+) -> Response {
+    if let Some(deny) = require_admin(&st, &identity).await {
+        return deny;
+    }
+    if principal.is_empty() {
+        return (StatusCode::BAD_REQUEST, "principal must not be empty").into_response();
+    }
+    if Role::parse(&body.role).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown role {:?} (viewer|developer|operator|admin)",
+                body.role
+            ),
+        )
+            .into_response();
+    }
+    if !valid_scope(&body.scope) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid scope {:?} (\"*\" or \"project:<name>\")",
+                body.scope
+            ),
+        )
+            .into_response();
+    }
+    let store = require_store!(&st);
+    if let Err(e) = store
+        .upsert_role_assignment(&principal, &body.role, &body.scope)
+        .await
+    {
+        return store_err(e);
+    }
+    emit(
+        Some(store),
+        AuditEvent {
+            ts: now_unix(),
+            subject: identity.as_ref().map(|e| e.0.subject.clone()),
+            decision: AuditDecision::Allow,
+            action: Some("upsert_assignment".into()),
+            method: Some("PUT".into()),
+            path: Some(format!("/api/v1/access/assignments/{principal}")),
+            status: Some(StatusCode::OK.as_u16()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let view = match store.list_role_assignments(Some(&principal)).await {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|a| a.role == body.role && a.scope == body.scope)
+            .map(AssignmentView::from),
+        Err(e) => return store_err(e),
+    };
+    match view {
+        Some(v) => Json(v).into_response(),
+        None => store_err(mobula_controller::StoreError::Backend(
+            "assignment vanished after upsert".into(),
+        )),
+    }
+}
+
+/// Remove one assignment, Admin-only; 404 when the triple doesn't exist.
+#[utoipa::path(
+    delete, path = "/api/v1/access/assignments/{principal}", tag = "access",
+    params(
+        ("principal" = String, Path, description = "The Identity subject"),
+        DeleteAssignmentQuery,
+    ),
+    responses(
+        (status = 204, description = "Assignment removed"),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Admin only"),
+        (status = 404, description = "No such assignment"),
+        (status = 503, description = "No store configured"),
+    ),
+    security(("bearer" = []))
+)]
+async fn delete_assignment(
+    State(st): State<AccessApiState>,
+    identity: Option<Extension<Identity>>,
+    Path(principal): Path<String>,
+    Query(q): Query<DeleteAssignmentQuery>,
+) -> Response {
+    if let Some(deny) = require_admin(&st, &identity).await {
+        return deny;
+    }
+    let store = require_store!(&st);
+    match store
+        .delete_role_assignment(&principal, &q.role, &q.scope)
+        .await
+    {
+        Ok(()) => {
+            emit(
+                Some(store),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: identity.as_ref().map(|e| e.0.subject.clone()),
+                    decision: AuditDecision::Allow,
+                    action: Some("delete_assignment".into()),
+                    method: Some("DELETE".into()),
+                    path: Some(format!("/api/v1/access/assignments/{principal}")),
+                    status: Some(StatusCode::NO_CONTENT.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(mobula_controller::StoreError::Backend(m)) if m.contains("no such assignment") => {
+            (StatusCode::NOT_FOUND, "no such assignment").into_response()
+        }
+        Err(e) => store_err(e),
+    }
 }

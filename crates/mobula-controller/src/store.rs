@@ -32,9 +32,18 @@ pub(crate) fn json_err(e: serde_json::Error) -> StoreError {
 /// What the operator wants a cluster to be. The *observed* state is
 /// reconstructed from the provisioner every reconcile (ADR-0006) — it is
 /// never stored as authoritative truth.
+///
+/// Persisted as a string column (`desired`) by the sqlx stores, so adding a
+/// variant is back-compatible with old rows; an *old binary* reading a row
+/// written by a newer one errors rather than guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesiredState {
     Running,
+    /// #51: compute released, spec kept. The reconciler drives the backing
+    /// cluster to `spec.suspend: true` (Mobula owns that field, ADR-0007) —
+    /// except for queue-assigned clusters, where Kueue owns suspend and the
+    /// API rejects user suspend/resume with 409.
+    Suspended,
     Terminated,
 }
 
@@ -240,6 +249,28 @@ pub struct StoredPolicy {
     pub quotas: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
     /// True while the row is the untouched `--policy` boot seed.
     pub from_file_seed: bool,
+}
+
+/// A scoped role assignment (ADR-0009 addendum, #49): `principal` (the
+/// Identity `subject`) holds `role` at `scope`, where scope is `"*"`
+/// (global — today's flat behavior) or `"project:<name>"`. Assignments are
+/// additive grants on top of the group-derived roles; there are no deny
+/// rules. Group-principal bindings are deliberately out of scope — they
+/// belong to the OIDC-mapping layer.
+///
+/// Stored as plain TEXT columns (role/scope are not JSON — this table is
+/// query-facing, keyed by (principal, role, scope) so an upsert of the same
+/// triple replaces it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RoleAssignment {
+    pub principal: String,
+    /// Role name ("viewer" | "developer" | "operator" | "admin") — the
+    /// `mobula_auth::Role` wire form; the store stays free of the auth crate.
+    pub role: String,
+    /// `"*"` or `"project:<name>"`.
+    pub scope: String,
+    /// Unix seconds when the assignment was first written.
+    pub created_at: u64,
 }
 
 /// Lifecycle of an outbox intent (ADR-0007). A `Pending` row left behind by
@@ -557,6 +588,38 @@ pub trait Store: Send + Sync {
     /// Best-effort `last_used_at` stamp on a successful token
     /// authentication. Never fails the request being authenticated.
     async fn touch_api_token(&self, prefix: &str, now: u64) -> Result<(), StoreError>;
+
+    // --- Scoped role assignments (ADR-0009 addendum, #49) ---
+
+    /// Create or replace a scoped role assignment, keyed by
+    /// (principal, role, scope). `created_at` is stamped by the store on
+    /// insert and preserved on re-upsert. Validation of the role name and
+    /// scope grammar is the API layer's job (access.rs) — the store is dumb
+    /// persistence.
+    async fn upsert_role_assignment(
+        &self,
+        principal: &str,
+        role: &str,
+        scope: &str,
+    ) -> Result<(), StoreError>;
+
+    /// List assignments, ordered by (principal, scope, role). `principal`
+    /// filters to one subject — the per-request authz lookup path (one
+    /// indexed row read per request).
+    async fn list_role_assignments(
+        &self,
+        principal: Option<&str>,
+    ) -> Result<Vec<RoleAssignment>, StoreError>;
+
+    /// Remove one assignment. Errors naming the missing
+    /// (principal, role, scope) when it does not exist, mirroring
+    /// `delete_allocation`'s convention.
+    async fn delete_role_assignment(
+        &self,
+        principal: &str,
+        role: &str,
+        scope: &str,
+    ) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]
@@ -650,6 +713,8 @@ pub mod memory {
         audit_seq: std::sync::atomic::AtomicU64,
         local_users: Mutex<HashMap<String, LocalUserRecord>>,
         api_tokens: Mutex<HashMap<String, ApiTokenRecord>>,
+        /// Scoped role assignments (#49), keyed by (principal, role, scope).
+        assignments: Mutex<HashMap<(String, String, String), RoleAssignment>>,
     }
 
     impl InMemoryStore {
@@ -1130,6 +1195,64 @@ pub mod memory {
             }
             Ok(())
         }
+
+        async fn upsert_role_assignment(
+            &self,
+            principal: &str,
+            role: &str,
+            scope: &str,
+        ) -> Result<(), StoreError> {
+            let mut map = self.assignments.lock().unwrap();
+            let key = (principal.to_string(), role.to_string(), scope.to_string());
+            // Re-upsert preserves the original created_at.
+            let created_at = map.get(&key).map(|a| a.created_at).unwrap_or_else(now_unix);
+            map.insert(
+                key,
+                RoleAssignment {
+                    principal: principal.to_string(),
+                    role: role.to_string(),
+                    scope: scope.to_string(),
+                    created_at,
+                },
+            );
+            Ok(())
+        }
+
+        async fn list_role_assignments(
+            &self,
+            principal: Option<&str>,
+        ) -> Result<Vec<RoleAssignment>, StoreError> {
+            let mut out: Vec<RoleAssignment> = self
+                .assignments
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|a| principal.is_none_or(|p| a.principal == p))
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| {
+                a.principal
+                    .cmp(&b.principal)
+                    .then(a.scope.cmp(&b.scope))
+                    .then(a.role.cmp(&b.role))
+            });
+            Ok(out)
+        }
+
+        async fn delete_role_assignment(
+            &self,
+            principal: &str,
+            role: &str,
+            scope: &str,
+        ) -> Result<(), StoreError> {
+            let key = (principal.to_string(), role.to_string(), scope.to_string());
+            if self.assignments.lock().unwrap().remove(&key).is_none() {
+                return Err(StoreError::Backend(format!(
+                    "no such assignment {principal}/{role}/{scope}"
+                )));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1428,6 +1551,35 @@ pub(crate) mod testkit {
         async fn touch_api_token(&self, prefix: &str, now: u64) -> Result<(), StoreError> {
             self.check("touch_api_token")?;
             self.inner.touch_api_token(prefix, now).await
+        }
+        async fn upsert_role_assignment(
+            &self,
+            principal: &str,
+            role: &str,
+            scope: &str,
+        ) -> Result<(), StoreError> {
+            self.check("upsert_role_assignment")?;
+            self.inner
+                .upsert_role_assignment(principal, role, scope)
+                .await
+        }
+        async fn list_role_assignments(
+            &self,
+            principal: Option<&str>,
+        ) -> Result<Vec<RoleAssignment>, StoreError> {
+            self.check("list_role_assignments")?;
+            self.inner.list_role_assignments(principal).await
+        }
+        async fn delete_role_assignment(
+            &self,
+            principal: &str,
+            role: &str,
+            scope: &str,
+        ) -> Result<(), StoreError> {
+            self.check("delete_role_assignment")?;
+            self.inner
+                .delete_role_assignment(principal, role, scope)
+                .await
         }
     }
 }

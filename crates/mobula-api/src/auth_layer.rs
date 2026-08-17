@@ -16,7 +16,9 @@ use axum::extract::{Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use mobula_auth::{local::LocalAuthenticator, Identity, PermissionType, Target, Validator};
+use mobula_auth::{
+    local::LocalAuthenticator, AssignmentSource, Identity, PermissionType, Role, Target, Validator,
+};
 use mobula_controller::{now_unix, Store};
 use mobula_core::{AuditDecision, AuditEvent, AuditRequired, ClusterRegistry};
 
@@ -233,6 +235,80 @@ pub async fn require_auth(State(st): State<AuthState>, req: Request, next: Next)
     let mut req = req;
     req.extensions_mut().insert(identity);
     next.run(req).await
+}
+
+/// [`AssignmentSource`] over the store's `role_assignments` table (#49): one
+/// indexed row read per request. Caching (per-subject memoization with a
+/// short TTL or store-driven invalidation) is a documented follow-up — the
+/// table is tiny and the read is a PK-prefix lookup.
+pub struct StoreAssignments<'a>(pub &'a dyn Store);
+
+#[async_trait::async_trait]
+impl AssignmentSource for StoreAssignments<'_> {
+    async fn assignments_for(&self, subject: &str) -> Vec<(Role, String)> {
+        match self.0.list_role_assignments(Some(subject)).await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|a| Role::parse(&a.role).map(|r| (r, a.scope)))
+                .collect(),
+            Err(e) => {
+                // Fail closed: scoped extras are withheld, global roles
+                // (identity.roles) still apply via permits_scoped's fast path.
+                tracing::warn!(error = %e, subject = %subject, "assignment lookup failed");
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Scoped variant of [`authorize`] (#49): grants when the identity's global
+/// roles suffice (fast path, no store read) OR when a stored assignment
+/// covers `project` (`"*"` or `"project:<project>"`). Additive-only —
+/// assignments never subtract from global role-derived permissions, and a
+/// subject with no assignments gets exactly the flat mapping.
+pub async fn authorize_scoped(
+    store: Option<&Arc<dyn Store>>,
+    identity: Option<&Identity>,
+    action: PermissionType,
+    target: Target,
+    project: &str,
+) -> Option<Response> {
+    match identity {
+        None => None,
+        Some(id) if id.permits(action, target) => None,
+        Some(id) => {
+            let assignments = match store {
+                Some(store) => {
+                    StoreAssignments(store.as_ref())
+                        .assignments_for(&id.subject)
+                        .await
+                }
+                // No store: nowhere to look up assignments — flat mapping only.
+                None => Vec::new(),
+            };
+            if id.permits_scoped(action, target, &assignments, project) {
+                return None;
+            }
+            emit(
+                store,
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: Some(id.subject.clone()),
+                    decision: AuditDecision::Deny,
+                    reason: Some("insufficient_permission".into()),
+                    status: Some(StatusCode::FORBIDDEN.as_u16()),
+                    required: Some(AuditRequired {
+                        action: permission_str(action),
+                        target: target_str(target),
+                    }),
+                    granted_roles: id.roles.iter().map(role_str).collect(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            Some((StatusCode::FORBIDDEN, "insufficient permission").into_response())
+        }
+    }
 }
 
 /// Route-handler authorization helper. Returns `Some(denial_response)` when

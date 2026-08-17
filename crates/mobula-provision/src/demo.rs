@@ -75,6 +75,26 @@ impl Provisioner for DemoProvisioner {
         Ok(())
     }
 
+    async fn suspend(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        if let Some(c) = self.clusters.lock().unwrap().get_mut(&id.0) {
+            // Suspending a terminated cluster is meaningless; everything
+            // else drops to Suspended (idempotent).
+            if c.state != ClusterState::Terminated {
+                c.state = ClusterState::Suspended;
+            }
+        }
+        Ok(())
+    }
+
+    async fn resume(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        if let Some(c) = self.clusters.lock().unwrap().get_mut(&id.0) {
+            if c.state == ClusterState::Suspended {
+                c.state = ClusterState::Running;
+            }
+        }
+        Ok(())
+    }
+
     async fn observe(&self, id: &ClusterId) -> Result<ObservedCluster, ProvisionError> {
         match self.clusters.lock().unwrap().get(&id.0) {
             Some(c) => Ok(ObservedCluster {
@@ -102,6 +122,12 @@ impl Provisioner for DemoProvisioner {
                 api_base_url: Some(Self::base_url(id)),
             })
             .collect())
+    }
+
+    fn metrics_endpoint(&self, _id: &ClusterId) -> Option<String> {
+        // Nothing is actually provisioned — there is no head to scrape, so
+        // the metrics passthrough answers 404 `metrics unavailable` (#52).
+        None
     }
 }
 
@@ -231,6 +257,26 @@ mod tests {
         );
         // Terminating an unknown id is a no-op, not an error.
         p.terminate(&ClusterId("ghost".into())).await.unwrap();
+
+        // suspend/resume drive the state (#51): suspended keeps the record,
+        // resume returns to Running; both are idempotent no-ops for unknown
+        // ids and resume never revives a terminated cluster.
+        p.resume(&id).await.unwrap();
+        assert_eq!(
+            p.observe(&id).await.unwrap().state,
+            ClusterState::Terminated,
+            "resume must not revive a terminated cluster"
+        );
+        p.apply(&id, &cluster_spec("c1"), 3, "c1/3", None)
+            .await
+            .unwrap();
+        p.suspend(&id).await.unwrap();
+        assert_eq!(p.observe(&id).await.unwrap().state, ClusterState::Suspended);
+        p.suspend(&id).await.unwrap(); // idempotent
+        p.resume(&id).await.unwrap();
+        assert_eq!(p.observe(&id).await.unwrap().state, ClusterState::Running);
+        p.suspend(&ClusterId("ghost".into())).await.unwrap();
+        p.resume(&ClusterId("ghost".into())).await.unwrap();
 
         // list reflects what was applied.
         let all = Provisioner::list(&p).await.unwrap();
