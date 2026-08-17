@@ -64,8 +64,8 @@ pub enum AllocationSpecError {
 
 /// RFC 1123 subdomain: lowercase alphanumerics, `-` and `.`, starting and
 /// ending alphanumeric, ≤253 chars. Kueue object names (flavors, queues,
-/// cohorts) and namespaces all follow this.
-fn is_k8s_name(s: &str) -> bool {
+/// cohorts), namespaces, and local-auth usernames all follow this.
+pub fn is_k8s_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 253
         && s.bytes()

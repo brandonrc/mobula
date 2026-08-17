@@ -623,18 +623,21 @@ remains (durable log capture is REQUIREMENTS §3.9, later).
 #### `GET /api/v1/identity` — **Milestone A**
 
 "Who am I" for the shell's identity chip and role-gated rendering
-(ui-ux-spec §5.8, §5.10).
+(ui-ux-spec §5.8, §5.10). **Implemented** (2026-08-17, `access.rs`;
+mounted unconditionally).
 
 - **Auth:** any authenticated caller.
-- **Response 200:** `Identity` (§3.6).
+- **Response 200:** `Identity` (§3.6) — `{subject, email, groups, roles}`
+  with snake_case role names.
 - **Dev mode:** with no validator configured (`--dev-allow-unauthenticated`)
   returns `{ "subject": "dev", "email": null, "groups": [], "roles":
   ["admin"] }` so the unauthenticated dev loop renders the full console.
 
 #### `GET /api/v1/access/roles`
 
-Effective role mappings for the access page (ui-ux-spec §5.8). **New;
-Milestone B.** v1 is read-only from `auth.toml`; editing stays in the config
+Effective role mappings for the access page (ui-ux-spec §5.8).
+**Implemented** (2026-08-17, `access.rs`; mounted unconditionally,
+Admin-only). v1 is read-only from `auth.toml`; editing stays in the config
 file + restart.
 
 - **Auth:** Admin.
@@ -656,6 +659,14 @@ file + restart.
 Shape mirrors `RoleMappings` (`mobula-auth/src/lib.rs:98`). `editable`
 flips with the Phase-3 `role_assignments` work (ADR-0009); a `"*"` entry is
 the wildcard the validator already warns about.
+
+> **Local-mode deviation (additive):** when NO OIDC validator is configured
+> (pure local-auth mode, ADR-0011 — or dev mode), group→role mappings are
+> meaningless because local users carry their role as a column on the user
+> row. The endpoint then returns `{ "mappings": null, "source": "local",
+> "editable": false }` — `mappings` is `Option<RoleMappings>`, always
+> present but null. Role management in that mode is per-user via
+> `/api/v1/auth/users` (§5.15).
 
 ### 5.9 Audit — `GET /api/v1/audit`
 
@@ -931,6 +942,17 @@ to the token store.
   ownership probing). `POST /api/v1/auth/logout` revokes the caller's PAT.
 - Local users carry one of the four built-in roles as a column, resolved per
   request — role changes apply live, nothing is stamped into tokens.
+- **User management (Admin-only; implemented 2026-08-17):**
+  `GET /api/v1/auth/users` lists all users as `[LocalUserView]`
+  (`{username, email, role, disabled, created_at}` — hashes never
+  serialize). `POST /api/v1/auth/users` `{username, email?, password,
+  role}` → 201; the username must be RFC 1123 (k8s-name-safe) and untaken
+  (409), the password ≥ 8 chars, the role one of the four. `PUT
+  /api/v1/auth/users/{username}` `{role?, disabled?, password?}` → 200 with
+  the updated view; 404 for an unknown user. Every mutation emits an audit
+  event (`create_user` / `update_user`). Changing your OWN role/disabled is
+  allowed in v0 — no footgun guard — but is logged loudly
+  (`tracing::warn!`).
 - Bootstrap: first `--local-auth` boot with an empty user table creates
   `admin` with a random password written 0600 to
   `<db-dir>/local-admin-password` (or `MOBULA_LOCAL_ADMIN_PASSWORD` for
@@ -942,7 +964,7 @@ to the token store.
 
 | Endpoint | Milestone | Backs (ui-ux-spec) | Status in code |
 |---|---|---|---|
-| `GET /api/v1/identity` | **A** | shell, §5.8 | new, trivial |
+| `GET /api/v1/identity` | **A** | shell, §5.8 | **exists** (access.rs, incl. dev identity) |
 | `GET /api/v1/registry/clusters` | **A** | §5.6 (read-only, D5) | **exists** (registry.rs, Admin-only) |
 | `GET /api/v1/clusters` (registry-backed) | **A** | §5.2 | new fallback path; store-backed exists |
 | `GET /api/v1/clusters/{id}` | B | §5.4 | exists (+ ✱ fields) |
@@ -951,9 +973,9 @@ to the token store.
 | `POST …/suspend` `/resume` `/terminate` | B | §5.4 actions | new (DELETE exists) |
 | `GET /api/v1/overview` | B | §5.1 | new |
 | `GET /api/v1/audit` | B | §5.7 | **exists** (audit.rs, persisted + CSV) |
-| `GET /api/v1/access/roles` | B | §5.8 | new |
+| `GET /api/v1/access/roles` | B | §5.8 | **exists** (access.rs; `mappings: null`/`source: "local"` without OIDC) |
 | PKCE auth endpoints | B | §5.10 | UI does SPA-direct PKCE; backend endpoints still new |
-| Local auth (`/api/v1/auth/*`) | B | §5.10 | **exists** (local_auth.rs, ADR-0011) |
+| Local auth (`/api/v1/auth/*`) | B | §5.10 | **exists** (local_auth.rs, ADR-0011; incl. Admin-only user management) |
 | `GET /api/v1/clusters/{id}/nodes` | B/C | §5.4 nodes tab | new |
 | `/api/v1/clusters/{id}/jobs…` proxy + WS tail | C | §5.4 jobs/logs | new (southbound exists in gateway) |
 | `GET /api/v1/jobs[/{job_id}]` | C | §5.5 | new |

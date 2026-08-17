@@ -92,9 +92,10 @@ fn target_for_path(path: &str) -> Target {
         Target::Cluster
     } else {
         // /api/v1/auth/* falls through to the safe default (Job). Those
-        // routes are self-guarding — login is public by design and token
-        // management is owner-scoped — so the ext_authz verb check for
-        // them only needs a sane, non-privileged target.
+        // routes are self-guarding — login is public by design, token
+        // management is owner-scoped, and user management enforces Admin
+        // in-handler — so the ext_authz verb check for them only needs a
+        // sane, non-privileged target.
         Target::Job
     }
 }

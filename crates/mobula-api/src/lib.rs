@@ -4,6 +4,7 @@
 //! admin paths. The Ray Jobs gateway (Phase 1) mounts here as well, one base
 //! path per cluster.
 
+pub mod access;
 pub mod audit;
 pub mod auth_layer;
 pub mod clusters;
@@ -64,6 +65,11 @@ use utoipa_swagger_ui::SwaggerUi;
         local_auth::list_tokens,
         local_auth::revoke_token,
         local_auth::logout,
+        local_auth::list_users,
+        local_auth::create_user,
+        local_auth::update_user,
+        access::identity,
+        access::list_roles,
     ),
     components(
         schemas(
@@ -75,8 +81,14 @@ use utoipa_swagger_ui::SwaggerUi;
             local_auth::OidcProviderInfo,
             local_auth::CreateTokenRequest,
             local_auth::CreateTokenResponse,
+            local_auth::CreateUserRequest,
+            local_auth::UpdateUserRequest,
+            access::IdentityResponse,
+            access::RolesResponse,
+            access::RoleMappingsView,
             mobula_core::ApiTokenView,
             mobula_core::LocalRole,
+            mobula_core::LocalUserView,
             clusters::CreateCluster,
             clusters::ClusterView,
             clusters::JobView,
@@ -137,9 +149,15 @@ use utoipa_swagger_ui::SwaggerUi;
          Mounted only when a store is configured."),
         (name = "auth", description = "Local auth (ADR-0011): username/\
          password login issuing opaque (unsigned) bearer tokens, personal \
-         access token management, and provider metadata. `login` and \
-         `providers` are public; token routes are owner-scoped. Mounted \
-         only with `serve --local-auth` (except `providers`)."),
+         access token management, provider metadata, and Admin-only local \
+         user management. `login` and `providers` are public; token routes \
+         are owner-scoped; user routes are Admin-only. Mounted only with \
+         `serve --local-auth` (except `providers`)."),
+        (name = "access", description = "Identity & access (api-v1.md \
+         §5.8): `identity` is 'who am I' for any authenticated caller (the \
+         dev identity when auth is disabled); `access/roles` is the \
+         Admin-only read of the effective role mappings. Mounted \
+         unconditionally."),
     ),
     info(
         title = "Mobula",
@@ -355,6 +373,11 @@ fn build_app_full_svc_inner(
     if let Some(local) = local {
         app = app.merge(local_auth::router(local));
     }
+    // Identity/access routes (api-v1.md §5.8) mount unconditionally: every
+    // deployment has an identity (dev mode returns the specced dev
+    // identity), and the roles endpoint reports the local-mode variant
+    // when no OIDC validator is configured.
+    app = app.merge(access::router(validator.clone(), store.clone()));
     // Registry routes mount unconditionally (gateway-only deployments have a
     // routing table even without a store); merged once the app is
     // state-complete (Router<()>).
@@ -590,11 +613,23 @@ mod tests {
         assert!(doc["paths"]["/api/v1/auth/tokens"]["get"].is_object());
         assert!(doc["paths"]["/api/v1/auth/tokens/{prefix}"]["delete"].is_object());
         assert!(doc["paths"]["/api/v1/auth/logout"]["post"].is_object());
+        assert!(doc["paths"]["/api/v1/auth/users"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/auth/users"]["post"].is_object());
+        assert!(doc["paths"]["/api/v1/auth/users/{username}"]["put"].is_object());
         assert!(doc["components"]["schemas"]["LoginRequest"].is_object());
         assert!(doc["components"]["schemas"]["LoginResponse"].is_object());
         assert!(doc["components"]["schemas"]["ProvidersResponse"].is_object());
         assert!(doc["components"]["schemas"]["CreateTokenResponse"].is_object());
         assert!(doc["components"]["schemas"]["ApiTokenView"].is_object());
+        assert!(doc["components"]["schemas"]["LocalUserView"].is_object());
+        assert!(doc["components"]["schemas"]["CreateUserRequest"].is_object());
+        assert!(doc["components"]["schemas"]["UpdateUserRequest"].is_object());
+        // The identity & access contract (api-v1.md §5.8).
+        assert!(doc["paths"]["/api/v1/identity"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/access/roles"]["get"].is_object());
+        assert!(doc["components"]["schemas"]["IdentityResponse"].is_object());
+        assert!(doc["components"]["schemas"]["RolesResponse"].is_object());
+        assert!(doc["components"]["schemas"]["RoleMappingsView"].is_object());
         // Bearer security scheme is advertised for client codegen.
         assert_eq!(
             doc["components"]["securitySchemes"]["bearer"]["scheme"],

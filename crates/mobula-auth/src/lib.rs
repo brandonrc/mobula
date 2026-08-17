@@ -239,6 +239,11 @@ impl Validator {
         &self.config.issuer
     }
 
+    /// The configured group→role mappings (for `GET /api/v1/access/roles`).
+    pub fn role_mappings(&self) -> &RoleMappings {
+        &self.config.roles
+    }
+
     /// Run OIDC discovery and the initial JWKS fetch. Fails fast — a
     /// control plane that cannot validate tokens must not start serving.
     pub async fn discover(

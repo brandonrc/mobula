@@ -1,5 +1,5 @@
 //! Local-auth routes (ADR-0011): login, provider metadata, personal access
-//! tokens, logout.
+//! tokens, logout, and Admin-only local user management.
 //!
 //! Mounted only when local auth is enabled (`serve --local-auth`), except
 //! `GET /api/v1/auth/providers`, which is always mounted and public (it's
@@ -21,16 +21,17 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
-use mobula_auth::local::{token_prefix, LocalAuthError, LocalAuthenticator};
-use mobula_auth::Identity;
+use mobula_auth::local::{hash_password, token_prefix, LocalAuthError, LocalAuthenticator};
+use mobula_auth::{Identity, PermissionType, Target};
 use mobula_controller::{now_unix, Store};
-use mobula_core::{ApiTokenView, AuditDecision, AuditEvent};
+use mobula_core::{ApiTokenView, AuditDecision, AuditEvent, LocalRole, LocalUserView};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::audit::{emit, role_str};
+use crate::auth_layer::authorize;
 
 #[derive(Clone)]
 pub struct LocalAuthApiState {
@@ -389,6 +390,267 @@ async fn logout(
     StatusCode::NO_CONTENT.into_response()
 }
 
+// --- Local user management (Admin-only; api-v1.md §5.15) ---
+
+#[derive(Deserialize, ToSchema)]
+pub struct CreateUserRequest {
+    /// RFC 1123 subdomain (k8s-name-safe); unique.
+    pub username: String,
+    pub email: Option<String>,
+    /// Minimum 8 characters; bcrypt-hashed at rest, never stored or
+    /// returned in plaintext.
+    pub password: String,
+    pub role: LocalRole,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateUserRequest {
+    pub role: Option<LocalRole>,
+    pub disabled: Option<bool>,
+    /// New password (min 8 chars); replaces the bcrypt hash.
+    pub password: Option<String>,
+}
+
+/// Admin gate shared by the user-management routes: `Admin` on any target
+/// is granted only to Role::Admin (same pattern as the registry/audit
+/// routes; Target::Cluster per api-v1.md §2.2's access-control row).
+/// Denials are persisted — the local-auth router always has a store.
+async fn require_admin(
+    st: &LocalAuthApiState,
+    identity: &Option<Extension<Identity>>,
+) -> Option<Response> {
+    authorize(
+        Some(st.store()),
+        identity.as_ref().map(|e| &e.0),
+        PermissionType::Admin,
+        Target::Cluster,
+    )
+    .await
+}
+
+/// Password policy shared by create and update.
+fn password_ok(password: &str) -> bool {
+    password.len() >= 8
+}
+
+/// List all local users. Admin-only; hashes never serialize
+/// ([`LocalUserView`]).
+#[utoipa::path(
+    get, path = "/api/v1/auth/users", tag = "auth",
+    responses(
+        (status = 200, description = "All local users, ordered by username", body = Vec<LocalUserView>),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Admin only"),
+    ),
+    security(("bearer" = []))
+)]
+async fn list_users(
+    State(st): State<LocalAuthApiState>,
+    identity: Option<Extension<Identity>>,
+) -> Response {
+    if let Some(deny) = require_admin(&st, &identity).await {
+        return deny;
+    }
+    match st.store().list_local_users().await {
+        Ok(users) => Json(users.iter().map(|u| u.view()).collect::<Vec<_>>()).into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "user list failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+        }
+    }
+}
+
+/// Create a local user. Admin-only. 201 with the wire-safe view; 400 on a
+/// bad username/short password; 409 when the username is taken.
+#[utoipa::path(
+    post, path = "/api/v1/auth/users", tag = "auth",
+    request_body = CreateUserRequest,
+    responses(
+        (status = 201, description = "User created", body = LocalUserView),
+        (status = 400, description = "Invalid username (RFC 1123) or password under 8 chars"),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Admin only"),
+        (status = 409, description = "Username already taken"),
+    ),
+    security(("bearer" = []))
+)]
+async fn create_user(
+    State(st): State<LocalAuthApiState>,
+    identity: Option<Extension<Identity>>,
+    Json(body): Json<CreateUserRequest>,
+) -> Response {
+    if let Some(deny) = require_admin(&st, &identity).await {
+        return deny;
+    }
+    if !mobula_core::pool::is_k8s_name(&body.username) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "username must be a valid Kubernetes name (RFC 1123 subdomain)",
+        )
+            .into_response();
+    }
+    if !password_ok(&body.password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "password must be at least 8 characters",
+        )
+            .into_response();
+    }
+    let caller = ident(&identity).map(|i| i.subject.clone());
+    match st.store().get_local_user(&body.username).await {
+        Ok(Some(_)) => return (StatusCode::CONFLICT, "username already taken").into_response(),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "user lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+        }
+    }
+    let hash = match hash_password(&body.password).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "password hash failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "hash error").into_response();
+        }
+    };
+    if let Err(e) = st
+        .store()
+        .create_local_user(&body.username, body.email.as_deref(), &hash, body.role)
+        .await
+    {
+        tracing::warn!(error = %e, "user create failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+    }
+    emit(
+        Some(st.store()),
+        AuditEvent {
+            ts: now_unix(),
+            subject: caller,
+            decision: AuditDecision::Allow,
+            action: Some("create_user".into()),
+            method: Some("POST".into()),
+            path: Some("/api/v1/auth/users".into()),
+            status: Some(StatusCode::CREATED.as_u16()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let view = LocalUserView {
+        username: body.username,
+        email: body.email,
+        role: body.role,
+        disabled: false,
+        created_at: now_unix(),
+    };
+    (StatusCode::CREATED, Json(view)).into_response()
+}
+
+/// Update a local user: role, disabled flag, and/or password. Admin-only;
+/// 404 for an unknown user. Changing your OWN role/disabled is allowed in
+/// v0 (no footgun guard) but is audit-logged loudly.
+#[utoipa::path(
+    put, path = "/api/v1/auth/users/{username}", tag = "auth",
+    params(("username" = String, Path, description = "The local user's username")),
+    request_body = UpdateUserRequest,
+    responses(
+        (status = 200, description = "User updated", body = LocalUserView),
+        (status = 400, description = "Password under 8 chars"),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Admin only"),
+        (status = 404, description = "No such user"),
+    ),
+    security(("bearer" = []))
+)]
+async fn update_user(
+    State(st): State<LocalAuthApiState>,
+    identity: Option<Extension<Identity>>,
+    Path(username): Path<String>,
+    Json(body): Json<UpdateUserRequest>,
+) -> Response {
+    if let Some(deny) = require_admin(&st, &identity).await {
+        return deny;
+    }
+    if let Some(password) = &body.password {
+        if !password_ok(password) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "password must be at least 8 characters",
+            )
+                .into_response();
+        }
+    }
+    let caller = ident(&identity).map(|i| i.subject.clone());
+    let user = match st.store().get_local_user(&username).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such user").into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "user lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+        }
+    };
+    // Self-lockout footgun: allowed in v0, but shouted into the logs.
+    if caller.as_deref() == Some(user.username.as_str())
+        && (body.role.is_some() || body.disabled.is_some())
+    {
+        tracing::warn!(
+            user = %user.username,
+            role = ?body.role,
+            disabled = ?body.disabled,
+            "admin is changing their OWN role/disabled flag — no footgun guard in v0"
+        );
+    }
+    if let Some(role) = body.role {
+        if let Err(e) = st.store().set_local_user_role(&username, role).await {
+            tracing::warn!(error = %e, "role update failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+        }
+    }
+    if let Some(disabled) = body.disabled {
+        if let Err(e) = st
+            .store()
+            .set_local_user_disabled(&username, disabled)
+            .await
+        {
+            tracing::warn!(error = %e, "disabled update failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+        }
+    }
+    if let Some(password) = &body.password {
+        let hash = match hash_password(password).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "password hash failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "hash error").into_response();
+            }
+        };
+        if let Err(e) = st.store().set_local_user_password(&username, &hash).await {
+            tracing::warn!(error = %e, "password update failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+        }
+    }
+    emit(
+        Some(st.store()),
+        AuditEvent {
+            ts: now_unix(),
+            subject: caller,
+            decision: AuditDecision::Allow,
+            action: Some("update_user".into()),
+            method: Some("PUT".into()),
+            path: Some(format!("/api/v1/auth/users/{username}")),
+            status: Some(StatusCode::OK.as_u16()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let view = LocalUserView {
+        username: user.username,
+        email: user.email,
+        role: body.role.unwrap_or(user.role),
+        disabled: body.disabled.unwrap_or(user.disabled),
+        created_at: user.created_at,
+    };
+    Json(view).into_response()
+}
+
 /// The local-auth route bundle, mounted only when local auth is enabled.
 pub fn router(auth: Arc<LocalAuthenticator>) -> Router {
     Router::new()
@@ -396,6 +658,8 @@ pub fn router(auth: Arc<LocalAuthenticator>) -> Router {
         .route("/api/v1/auth/tokens", post(create_token).get(list_tokens))
         .route("/api/v1/auth/tokens/{prefix}", delete(revoke_token))
         .route("/api/v1/auth/logout", post(logout))
+        .route("/api/v1/auth/users", get(list_users).post(create_user))
+        .route("/api/v1/auth/users/{username}", put(update_user))
         .with_state(LocalAuthApiState { auth })
 }
 

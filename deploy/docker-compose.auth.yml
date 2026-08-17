@@ -55,11 +55,16 @@ services:
     # Same image as the base demo, but authenticated: real OIDC validation
     # against the local Keycloak. --allow-insecure-transport because the
     # issuer is cleartext http (local demo only — never in production).
+    # Local auth is ALSO enabled so this stack demonstrates both providers
+    # at once (SSO button + local form on /login; JWT-shaped bearers go to
+    # Keycloak validation, opaque mob_ tokens to the local store).
     network_mode: "service:keycloak"
     ports: !reset []
     depends_on:
       keycloak:
         condition: service_healthy
+      auth-init:
+        condition: service_completed_successfully
     command:
       - "serve"
       - "--bind"
@@ -67,13 +72,31 @@ services:
       - "--demo"
       - "--auth-config"
       - "/etc/mobula/auth.toml"
+      - "--local-auth"
+      - "--db"
+      - "/data/mobula.db"
       - "--allow-insecure-transport"
       - "--audit-log"
-      - "/tmp/mobula-audit.jsonl"
+      - "/data/mobula-audit.jsonl"
       - "--metering-interval-secs"
       - "5"
       - "--policy"
       - "/etc/mobula/policy.toml"
+    environment:
+      MOBULA_LOCAL_ADMIN_PASSWORD: "admin"
     volumes:
       - ./keycloak/auth.toml:/etc/mobula/auth.toml:ro
       - ./policy.toml:/etc/mobula/policy.toml:ro
+      - mobula-auth-data:/data
+
+  # Same root-owned-volume fix as the local variant (mobula runs as 1001).
+  auth-init:
+    profiles: ["auth"]
+    image: alpine:3
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /data && chown -R 1001:0 /data"]
+    volumes:
+      - mobula-auth-data:/data
+
+volumes:
+  mobula-auth-data:
