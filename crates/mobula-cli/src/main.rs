@@ -25,6 +25,8 @@ enum Command {
         bind: std::net::SocketAddr,
         /// TOML cluster registry for the job gateway (Phase 1 static
         /// registry; the lifecycle controller replaces this in Phase 3).
+        /// When the file contains auth_tokens, a warning is logged if its
+        /// permissions are more permissive than 0600 (#4).
         #[arg(long)]
         registry: Option<std::path::PathBuf>,
         /// TOML auth config (OIDC issuer, audience, role mappings).
@@ -536,8 +538,16 @@ async fn main() -> std::io::Result<()> {
             }
             _ => {
                 let creds = load_credentials()?;
-                println!("{}", creds.access_token);
-                Ok(())
+                match stored_token_action(&creds, unix_now()) {
+                    StoredTokenAction::Valid => {
+                        println!("{}", creds.access_token);
+                        Ok(())
+                    }
+                    StoredTokenAction::ExpiredNoRefresh => {
+                        Err(std::io::Error::other("token expired, run mobula login"))
+                    }
+                    StoredTokenAction::Refresh => refresh_stored_token(&creds).await,
+                }
             }
         },
     }
@@ -653,6 +663,7 @@ async fn login_local(server: &str, username: &str, password_stdin: bool) -> std:
         refresh_token: None,
         // For local logins this field carries the control-plane URL.
         issuer: server.to_string(),
+        client_id: None,
     })?;
     let subject = body["identity"]["subject"].as_str().unwrap_or(username);
     let roles = body["identity"]["roles"]
@@ -735,6 +746,7 @@ async fn login(issuer: &str, client_id: &str, scope: &str) -> std::io::Result<()
         access_token: token.access_token.clone(),
         refresh_token: token.refresh_token.clone(),
         issuer: issuer.to_string(),
+        client_id: Some(client_id.to_string()),
     })?;
     match token.expires_in {
         Some(secs) => println!("Logged in. Token expires in {secs}s."),
@@ -768,12 +780,134 @@ async fn service_token(
     Ok(())
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// What `mobula token` should do with the stored access token (#18).
+#[derive(Debug, PartialEq, Eq)]
+enum StoredTokenAction {
+    /// Print it as-is.
+    Valid,
+    /// Expired JWT with a refresh token — attempt a refresh grant.
+    Refresh,
+    /// Expired JWT and no way to refresh — the user must re-login.
+    ExpiredNoRefresh,
+}
+
+/// Client-side expiry decision for the stored token. Opaque local-auth
+/// tokens (`mob_…`) carry no exp — the server enforces their lifetime, so
+/// they pass through, as do undecodable tokens (the server validates for
+/// real; this is display-only hygiene).
+fn stored_token_action(creds: &Credentials, now: u64) -> StoredTokenAction {
+    let Some(exp) = jwt_exp(&creds.access_token) else {
+        return StoredTokenAction::Valid;
+    };
+    if exp > now {
+        return StoredTokenAction::Valid;
+    }
+    if creds.refresh_token.is_some() {
+        StoredTokenAction::Refresh
+    } else {
+        StoredTokenAction::ExpiredNoRefresh
+    }
+}
+
+/// Decode the `exp` claim from a JWT payload WITHOUT verifying the
+/// signature — client-side display only; the server is the validator.
+/// `None` for opaque tokens, non-JWT strings, and payloads without `exp`.
+fn jwt_exp(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64url_decode(payload)?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("exp")?.as_u64()
+}
+
+/// Minimal base64url (RFC 4648 §5) decoder — avoids a base64 dependency
+/// for this one JWT payload decode.
+fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Refresh grant against the stored issuer (RFC 6749 §6), persisting the
+/// new tokens (0600) and printing the fresh access token. Any failure —
+/// discovery, transport, grant rejected — means re-login (#18).
+async fn refresh_stored_token(creds: &Credentials) -> std::io::Result<()> {
+    let re_login = || std::io::Error::other("token expired, run mobula login");
+    let Some(refresh) = creds.refresh_token.as_deref() else {
+        return Err(re_login());
+    };
+    let client = mobula_auth::idp_client();
+    let meta = mobula_auth::discover_metadata(&client, &creds.issuer)
+        .await
+        .map_err(|_| re_login())?;
+    let token_ep = meta.token_endpoint.ok_or_else(re_login)?;
+    // Logins predating #18 did not persist the client id; fall back to the
+    // default public client.
+    let client_id = creds.client_id.as_deref().unwrap_or("mobula-cli");
+    let res = client
+        .post(&token_ep)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .map_err(|_| re_login())?;
+    if !res.status().is_success() {
+        return Err(re_login());
+    }
+    let token: flows::TokenResponse = res.json().await.map_err(|_| re_login())?;
+    save_credentials(&Credentials {
+        access_token: token.access_token.clone(),
+        // Providers may rotate refresh tokens; keep the old one when the
+        // response omits a replacement.
+        refresh_token: token.refresh_token.or_else(|| creds.refresh_token.clone()),
+        issuer: creds.issuer.clone(),
+        client_id: creds.client_id.clone(),
+    })?;
+    println!("{}", token.access_token);
+    Ok(())
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Credentials {
     access_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
     issuer: String,
+    /// OAuth client id used at login — needed for the refresh_token grant
+    /// (#18). Absent for local logins and pre-#18 credential files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
 }
 
 fn credentials_path() -> std::io::Result<std::path::PathBuf> {
@@ -825,12 +959,45 @@ fn load_credentials() -> std::io::Result<Credentials> {
 
 fn load_registry(path: &std::path::Path) -> std::io::Result<ClusterRegistry> {
     let raw = std::fs::read_to_string(path)?;
-    toml::from_str(&raw).map_err(|e| {
+    let registry: ClusterRegistry = toml::from_str(&raw).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid registry {}: {e}", path.display()),
         )
-    })
+    })?;
+    if let Some(warning) = registry_permission_warning(path, &registry) {
+        tracing::warn!("{warning}");
+    }
+    Ok(registry)
+}
+
+/// A registry file carrying `auth_token`s holds bearer-equivalent secrets,
+/// like credentials.json — warn (never fail) when group/other can read it
+/// (#4). `None` when no tokens are present or the mode is 0600 or tighter.
+fn registry_permission_warning(
+    path: &std::path::Path,
+    registry: &ClusterRegistry,
+) -> Option<String> {
+    if !registry.clusters.iter().any(|c| c.auth_token.is_some()) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Some(format!(
+                "registry {} contains auth_tokens but is mode {:04o} — group/other can \
+                 read cluster bearer tokens; run: chmod 600 {}",
+                path.display(),
+                mode,
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    None
 }
 
 /// Stdout logging always; when `audit_log` is set, `mobula::audit`
@@ -978,6 +1145,7 @@ dev = { cpu = 200, memory = 400, "nvidia.com/gpu" = 8 }
             access_token: "tok".into(),
             refresh_token: Some("ref".into()),
             issuer: "https://idp.example".into(),
+            client_id: Some("mobula-cli".into()),
         })
         .unwrap();
         let loaded = load_credentials().unwrap();
@@ -996,6 +1164,115 @@ dev = { cpu = 200, memory = 400, "nvidia.com/gpu" = 8 }
             );
         }
         std::env::remove_var("MOBULA_CONFIG_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// base64url-encode without padding — for fabricating unsigned JWTs in
+    /// tests (no real signatures needed; jwt_exp never verifies).
+    fn b64url(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut s = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = u32::from(chunk[0]);
+            let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+            let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            s.push(T[((n >> 18) & 63) as usize] as char);
+            s.push(T[((n >> 12) & 63) as usize] as char);
+            if chunk.len() > 1 {
+                s.push(T[((n >> 6) & 63) as usize] as char);
+            }
+            if chunk.len() > 2 {
+                s.push(T[(n & 63) as usize] as char);
+            }
+        }
+        s
+    }
+
+    fn jwt_with_exp(exp: u64) -> String {
+        format!(
+            "{}.{}.sig",
+            b64url(br#"{"alg":"RS256"}"#),
+            b64url(format!(r#"{{"exp":{exp}}}"#).as_bytes())
+        )
+    }
+
+    #[test]
+    fn jwt_exp_decodes_payload_without_verifying_signature() {
+        assert_eq!(jwt_exp(&jwt_with_exp(2_000_000_000)), Some(2_000_000_000));
+        // Payload without exp, non-JSON payload, opaque token, garbage.
+        let no_exp = format!("h.{}.s", b64url(br#"{"sub":"x"}"#));
+        assert_eq!(jwt_exp(&no_exp), None);
+        let bad_payload = format!("h.{}.s", b64url(b"not json"));
+        assert_eq!(jwt_exp(&bad_payload), None);
+        assert_eq!(
+            jwt_exp("mob_abcd1234_0123456789abcdef0123456789abcdef"),
+            None
+        );
+        assert_eq!(jwt_exp("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn stored_token_action_matrix() {
+        let now = 1_700_000_000;
+        let creds = |access: String, refresh: Option<&str>| Credentials {
+            access_token: access,
+            refresh_token: refresh.map(str::to_string),
+            issuer: "https://idp.example".into(),
+            client_id: Some("mobula-cli".into()),
+        };
+        // Valid JWT → print as-is.
+        assert_eq!(
+            stored_token_action(&creds(jwt_with_exp(now + 3600), None), now),
+            StoredTokenAction::Valid
+        );
+        // Expired + refresh token → attempt refresh.
+        assert_eq!(
+            stored_token_action(&creds(jwt_with_exp(now - 1), Some("ref")), now),
+            StoredTokenAction::Refresh
+        );
+        // Expired, no refresh → re-login.
+        assert_eq!(
+            stored_token_action(&creds(jwt_with_exp(now - 1), None), now),
+            StoredTokenAction::ExpiredNoRefresh
+        );
+        // Opaque local-auth token (no exp) → pass through; the server
+        // enforces its lifetime.
+        assert_eq!(
+            stored_token_action(
+                &creds("mob_abcd1234_0123456789abcdef0123456789abcdef".into(), None),
+                now
+            ),
+            StoredTokenAction::Valid
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_with_tokens_warns_on_permissive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mobula-cli-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clusters.toml");
+        let with_token = "[[clusters]]\nid = \"a\"\nhostname = \"a.test\"\n\
+             api_base_url = \"http://a:8265\"\nauth_token = \"secret\"\n";
+        std::fs::write(&path, with_token).unwrap();
+        let registry: ClusterRegistry = ::toml::from_str(with_token).unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let warning = registry_permission_warning(&path, &registry).expect("0644 + token warns");
+        assert!(warning.contains("chmod 600"), "{warning}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(registry_permission_warning(&path, &registry).is_none());
+
+        // No tokens → no warning, even at 0644.
+        let bare: ClusterRegistry = ::toml::from_str(
+            "[[clusters]]\nid = \"a\"\nhostname = \"a.test\"\napi_base_url = \"http://a:8265\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(registry_permission_warning(&path, &bare).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

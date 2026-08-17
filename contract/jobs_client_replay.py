@@ -9,6 +9,9 @@ real `ray start --head`.
 Environment:
   MOBULA_ADDRESS  gateway base URL as the stock client sees it
                   (default http://demo.ray.test:8484)
+  RAY_AUTH_MODE   "token" on the token-auth matrix legs: the stock client
+                  then attaches `Authorization: Bearer $RAY_AUTH_TOKEN`
+                  itself (Ray >=2.52). Unset = auth-off leg.
 """
 
 import asyncio
@@ -18,6 +21,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import ray
 from ray.job_submission import JobStatus, JobSubmissionClient
 
 MARKER = "mobula-contract-ok"
@@ -26,6 +30,8 @@ TERMINAL = {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.STOPPED}
 
 
 def main() -> int:
+    auth_mode = os.environ.get("RAY_AUTH_MODE", "disabled")
+    print(f"replay leg: ray {ray.__version__}, auth mode {auth_mode}")
     client = JobSubmissionClient(ADDRESS)  # negotiates via GET /api/version
     print(f"connected through gateway: {ADDRESS}")
 

@@ -267,6 +267,29 @@ pub fn build_app(registry: ClusterRegistry, validator: Option<Arc<Validator>>) -
     build_app_full(registry, validator, None, Default::default())
 }
 
+/// As [`build_app`], with explicit northbound [`ServeLimits`] so tests can
+/// shrink the DoS knobs (concurrency caps, websocket timeouts/sizes) and
+/// exercise them deterministically.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn build_app_with_serve_limits(
+    registry: ClusterRegistry,
+    validator: Option<Arc<Validator>>,
+    limits: ServeLimits,
+) -> Router {
+    build_app_full_svc_inner(
+        registry,
+        validator,
+        None,
+        Default::default(),
+        None,
+        None,
+        true,
+        limits,
+    )
+    .expect("test limits carry no unreadable CA bundle")
+}
+
 /// Build the full app. When a `store` is provided, the cluster lifecycle
 /// routes (`/api/v1/clusters`) are mounted (Phase 3). Layer order matters:
 /// 1. auth middleware (outermost) — attaches identity, enforces the Job
@@ -286,7 +309,6 @@ pub fn build_app_full(
 ) -> Router {
     build_app_full_svc(registry, validator, store, policy, None, None)
 }
-
 /// As [`build_app_full`], plus an optional Serve-service provisioner; when
 /// present, the `/api/v1/services` routes are mounted, and an optional
 /// [`mobula_auth::local::LocalAuthenticator`]; when present, the local-auth
@@ -308,7 +330,17 @@ pub fn build_app_full_svc(
     services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
     local: Option<Arc<mobula_auth::local::LocalAuthenticator>>,
 ) -> Router {
-    build_app_full_svc_inner(registry, validator, store, policy, services, local, true)
+    build_app_full_svc_inner(
+        registry,
+        validator,
+        store,
+        policy,
+        services,
+        local,
+        true,
+        ServeLimits::default(),
+    )
+    .expect("default limits carry no CA bundle")
 }
 
 /// Router-level fail-closed guard (#45, moving #36's invariant into the
@@ -353,9 +385,14 @@ fn build_app_full_svc_inner(
     services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
     local: Option<Arc<mobula_auth::local::LocalAuthenticator>>,
     allow_unauthenticated: bool,
-) -> Router {
+    limits: ServeLimits,
+) -> std::io::Result<Router> {
     let registry = Arc::new(registry);
-    let gw = gateway::GatewayState::new(registry.clone(), store.clone());
+    let gw = gateway::GatewayState::try_with_limits(
+        registry.clone(),
+        store.clone(),
+        limits.gateway.clone(),
+    )?;
     // Local auth IS authentication: it satisfies the fail-closed rule
     // (#36/#45) the same way an OIDC validator does.
     let fail_closed = validator.is_none() && local.is_none() && !allow_unauthenticated;
@@ -407,6 +444,14 @@ fn build_app_full_svc_inner(
         app = app.merge(services::router(services));
     }
     let app = app
+        // Total per-request timeout for CONTROL-PLANE routes only (#30):
+        // applied before the fallback/gateway layers so it does not cap
+        // proxied cluster traffic — long log streams and websocket tails
+        // legitimately outlive it (the gateway has its own timeouts).
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            limits.control_plane_timeout,
+        ))
         // Fallback is registered before the layers so gateway dispatch
         // also wraps unmatched paths — cluster traffic like /api/jobs/
         // has no control-plane route and must still hit the middleware.
@@ -418,12 +463,53 @@ fn build_app_full_svc_inner(
         .layer(axum::middleware::from_fn_with_state(
             auth,
             auth_layer::require_auth,
+        ))
+        // Global northbound concurrency cap (#30): backpressure across the
+        // whole surface (control plane + gateway), coarser than the
+        // gateway's own semaphore.
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            limits.max_concurrent_requests,
         ));
     // Outermost when installed: applied last so it wraps auth + gateway.
-    if fail_closed {
+    let app = if fail_closed {
         app.layer(axum::middleware::from_fn(refuse_non_loopback))
     } else {
         app
+    };
+    Ok(app)
+}
+
+/// Northbound hardening limits (issues #30/#31), applied as tower layers
+/// plus the gateway's internal knobs. Kept out of [`ServeOptions`] so
+/// existing struct literals keep compiling; configure via
+/// [`serve_with_shutdown_and_limits`]. `Default` is the production posture:
+#[derive(Debug, Clone)]
+pub struct ServeLimits {
+    /// Global cap on in-flight northbound HTTP requests across the whole
+    /// surface (control plane + gateway), applied as tower's
+    /// `ConcurrencyLimit`. Excess requests get backpressure (the server
+    /// stops accepting new work) rather than a queue or a 503; the
+    /// gateway's own finer semaphore refuses its excess with 503.
+    /// Default: 512.
+    pub max_concurrent_requests: usize,
+    /// Total per-request timeout for control-plane routes, applied as
+    /// tower-http's `TimeoutLayer` (408 on expiry). Proxied cluster traffic
+    /// is exempt — long log streams and websocket tails legitimately
+    /// outlive it; the gateway has its own southbound timeouts.
+    /// Default: 60s.
+    pub control_plane_timeout: std::time::Duration,
+    /// Gateway-specific knobs: body cap, inflight cap, websocket bridge
+    /// limits, southbound CA bundle. See [`gateway::GatewayLimits`].
+    pub gateway: gateway::GatewayLimits,
+}
+
+impl Default for ServeLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: 512,
+            control_plane_timeout: std::time::Duration::from_secs(60),
+            gateway: gateway::GatewayLimits::default(),
+        }
     }
 }
 
@@ -467,10 +553,23 @@ pub async fn serve(addr: std::net::SocketAddr, opts: ServeOptions) -> std::io::R
 
 /// Serve the API until `shutdown` resolves. Enforces the fail-closed
 /// invariants (#36) before binding: registry validation, and a refusal to
-/// expose an unauthenticated gateway on a non-loopback address.
+/// expose an unauthenticated gateway on a non-loopback address. Uses the
+/// default [`ServeLimits`].
 pub async fn serve_with_shutdown(
     addr: std::net::SocketAddr,
     opts: ServeOptions,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    serve_with_shutdown_and_limits(addr, opts, ServeLimits::default(), shutdown).await
+}
+
+/// As [`serve_with_shutdown`], with explicit northbound [`ServeLimits`]
+/// (DoS knobs, #30/#31; southbound CA bundle, #2). Fails before binding if
+/// `limits.gateway.southbound_ca_bundle` can't be read or parsed.
+pub async fn serve_with_shutdown_and_limits(
+    addr: std::net::SocketAddr,
+    opts: ServeOptions,
+    limits: ServeLimits,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     opts.registry
@@ -503,7 +602,8 @@ pub async fn serve_with_shutdown(
         opts.services,
         opts.local_auth,
         opts.allow_unauthenticated,
-    );
+        limits,
+    )?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -723,7 +823,9 @@ mod tests {
             None,
             None,
             false,
-        );
+            ServeLimits::default(),
+        )
+        .expect("default limits carry no CA bundle");
         let req = with_peer(
             Request::post("/api/v1/clusters")
                 .header("content-type", "application/json")
@@ -747,7 +849,9 @@ mod tests {
             None,
             None,
             false,
-        );
+            ServeLimits::default(),
+        )
+        .expect("default limits carry no CA bundle");
         let req = with_peer(
             Request::get("/healthz").body(Body::empty()).unwrap(),
             "203.0.113.9",
@@ -768,7 +872,9 @@ mod tests {
             None,
             None,
             false,
-        );
+            ServeLimits::default(),
+        )
+        .expect("default limits carry no CA bundle");
         let req = with_peer(
             Request::get("/healthz").body(Body::empty()).unwrap(),
             "127.0.0.1",

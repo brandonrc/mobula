@@ -19,19 +19,77 @@ use mobula_core::{AuditDecision, AuditEvent, ClusterEndpoint, ClusterRegistry};
 
 use crate::audit::emit;
 
-/// Request bodies are buffered before forwarding; job submissions are tiny
-/// and runtime-env package uploads are modest. Bounded (with the
-/// concurrency limit below) so N concurrent uploads can't OOM the gateway
-/// (#30). Streaming passthrough is a follow-up.
+/// Default request-body cap for proxied calls (see `GatewayLimits`).
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Max concurrent proxied requests. Caps peak buffered-body memory at
-/// roughly `MAX_INFLIGHT × MAX_BODY_BYTES` and bounds upstream fan-out
-/// (#30). Excess requests wait for a permit rather than piling up.
+/// Default cap on concurrent proxied requests (see `GatewayLimits`).
 const MAX_INFLIGHT: usize = 64;
 
-/// A black-holing cluster must not pin a websocket half-open forever (#31).
+/// Default southbound websocket connect timeout (see `GatewayLimits`).
 const WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Default websocket idle timeout: a bridge with no frames in either
+/// direction for this long is torn down (see `GatewayLimits`).
+const WS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Default max websocket frame size, both directions (see `GatewayLimits`).
+const WS_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default max websocket message size, both directions (see `GatewayLimits`).
+const WS_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Gateway hardening knobs (issues #30/#31), with production-safe defaults.
+/// `Default` is the production posture; tests shrink the values to exercise
+/// the limits deterministically. Plumb them in via
+/// `crate::serve_with_shutdown_and_limits`.
+#[derive(Debug, Clone)]
+pub struct GatewayLimits {
+    /// Request bodies are buffered before forwarding; job submissions are
+    /// tiny and runtime-env package uploads are modest. Bounded (with
+    /// `max_inflight`) so N concurrent uploads can't OOM the gateway (#30).
+    /// Streaming passthrough is a follow-up. Default: 64 MiB.
+    pub max_body_bytes: usize,
+    /// Max concurrent proxied requests (HTTP + websocket bridges share the
+    /// semaphore). Caps peak buffered-body memory at roughly
+    /// `max_inflight × max_body_bytes` and bounds upstream fan-out (#30).
+    /// Excess requests are refused with 503 rather than piling up. A
+    /// websocket bridge holds its permit for the bridge's whole lifetime
+    /// (#31). Default: 64.
+    pub max_inflight: usize,
+    /// Bound on the southbound websocket connect: a black-holing cluster
+    /// must not pin the client's half-open upgrade indefinitely (#31).
+    /// Default: 15s.
+    pub ws_connect_timeout: std::time::Duration,
+    /// A websocket bridge with no frames in either direction for this long
+    /// is closed — an idle tail must not hold a semaphore permit (and the
+    /// memory/sockets behind it) forever (#31). Generous by default so a
+    /// quiet-but-running job's log tail survives. Default: 300s.
+    pub ws_idle_timeout: std::time::Duration,
+    /// Max websocket frame size accepted on either hop; oversize frames
+    /// terminate the bridge (#31). Default: 4 MiB.
+    pub ws_max_frame_bytes: usize,
+    /// Max websocket message size accepted on either hop; oversize messages
+    /// terminate the bridge (#31). Default: 16 MiB.
+    pub ws_max_message_bytes: usize,
+    /// Extra CA bundle (PEM) trusted for southbound cluster endpoints, so
+    /// self-signed cluster TLS can be verified instead of disabled (#2).
+    /// `None` = system/webpki roots only.
+    pub southbound_ca_bundle: Option<std::path::PathBuf>,
+}
+
+impl Default for GatewayLimits {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: MAX_BODY_BYTES,
+            max_inflight: MAX_INFLIGHT,
+            ws_connect_timeout: WS_CONNECT_TIMEOUT,
+            ws_idle_timeout: WS_IDLE_TIMEOUT,
+            ws_max_frame_bytes: WS_MAX_FRAME_BYTES,
+            ws_max_message_bytes: WS_MAX_MESSAGE_BYTES,
+            southbound_ca_bundle: None,
+        }
+    }
+}
 
 /// Header carrying the cluster's static Ray token (Ray >= 2.52 token
 /// auth). Pinned by the contract-test suite against each supported Ray
@@ -43,8 +101,9 @@ pub struct GatewayState {
     registry: Arc<ClusterRegistry>,
     client: reqwest::Client,
     /// Bounds concurrent proxied requests so buffered bodies can't OOM the
-    /// gateway (#30). Shared across HTTP and websocket paths.
+    /// gateway (#30). Shared across HTTP and websocket paths (#31).
     inflight: Arc<tokio::sync::Semaphore>,
+    limits: GatewayLimits,
     /// Audit persistence for the per-request trail (api-v1.md §5.9);
     /// `None` in gateway-only mode — events stay trace-only there.
     store: Option<Arc<dyn Store>>,
@@ -52,22 +111,48 @@ pub struct GatewayState {
 
 impl GatewayState {
     pub fn new(registry: Arc<ClusterRegistry>, store: Option<Arc<dyn Store>>) -> Self {
-        Self {
+        // Default limits carry no CA bundle, so this is infallible.
+        Self::try_with_limits(registry, store, GatewayLimits::default())
+            .expect("default gateway limits contain no CA bundle")
+    }
+
+    /// As [`GatewayState::new`] with explicit [`GatewayLimits`]. Fails when
+    /// `limits.southbound_ca_bundle` can't be read or parsed (#2).
+    pub fn try_with_limits(
+        registry: Arc<ClusterRegistry>,
+        store: Option<Arc<dyn Store>>,
+        limits: GatewayLimits,
+    ) -> std::io::Result<Self> {
+        // Reverse-proxy client posture (security issues #3/#5):
+        // never follow redirects southbound (SSRF amplifier — 3xx
+        // passes through to the caller untouched), and bound how long
+        // a hung head can pin a connection. read_timeout is per read,
+        // so long log streams stay alive as long as bytes flow.
+        let mut client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(120));
+        if let Some(bundle) = &limits.southbound_ca_bundle {
+            // Trust self-signed cluster endpoints by pinning their CA —
+            // verification stays ON; nothing here weakens TLS (#2).
+            let pem = std::fs::read(bundle)?;
+            let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("southbound CA bundle {}: {e}", bundle.display()),
+                )
+            })?;
+            for cert in certs {
+                client = client.add_root_certificate(cert);
+            }
+        }
+        Ok(Self {
             registry,
             store,
-            inflight: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT)),
-            // Reverse-proxy client posture (security issues #3/#5):
-            // never follow redirects southbound (SSRF amplifier — 3xx
-            // passes through to the caller untouched), and bound how long
-            // a hung head can pin a connection. read_timeout is per read,
-            // so long log streams stay alive as long as bytes flow.
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("static client config"),
-        }
+            inflight: Arc::new(tokio::sync::Semaphore::new(limits.max_inflight)),
+            client: client.build().expect("static client config"),
+            limits,
+        })
     }
 }
 
@@ -84,13 +169,21 @@ pub async fn host_gateway(State(gw): State<GatewayState>, req: Request, next: Ne
         return next.run(req).await;
     };
     // One permit per proxied request bounds peak buffered-body memory and
-    // upstream fan-out (#30); held across HTTP and websocket paths.
-    let _permit = match gw.inflight.clone().acquire_owned().await {
+    // upstream fan-out (#30); shared with websocket bridges (#31). Excess
+    // requests are refused with 503 rather than queueing unboundedly — a
+    // queue behind the semaphore is itself a DoS surface.
+    let permit = match gw.inflight.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "gateway closing").into_response(),
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway busy: too many inflight proxied requests",
+            )
+                .into_response()
+        }
     };
     if is_websocket_upgrade(req.headers()) {
-        ws::proxy_upgrade(gw.store.as_ref(), &cluster, req).await
+        ws::proxy_upgrade(gw.store.as_ref(), &cluster, &gw.limits, permit, req).await
     } else {
         proxy(&gw, &cluster, req).await.into_response()
     }
@@ -130,7 +223,7 @@ async fn proxy(
     let method = parts.method.clone();
     let path = parts.uri.path().to_string();
 
-    let body = axum::body::to_bytes(body, MAX_BODY_BYTES)
+    let body = axum::body::to_bytes(body, gw.limits.max_body_bytes)
         .await
         .map_err(|_| GatewayError::BodyTooLarge)?;
 
@@ -280,6 +373,8 @@ mod ws {
     pub async fn proxy_upgrade(
         store: Option<&Arc<dyn Store>>,
         cluster: &ClusterEndpoint,
+        limits: &super::GatewayLimits,
+        permit: tokio::sync::OwnedSemaphorePermit,
         req: Request,
     ) -> Response {
         // `None` only in dev-unauthenticated mode (see proxy()).
@@ -326,9 +421,15 @@ mod ws {
         // Connect southbound BEFORE accepting the client upgrade so an
         // unreachable cluster surfaces as 502, not a dead socket — and
         // bound the connect so a black-holing head can't pin the client's
-        // half-open upgrade indefinitely (#31).
-        let connect = tokio_tungstenite::connect_async(southbound);
-        let upstream = match tokio::time::timeout(super::WS_CONNECT_TIMEOUT, connect).await {
+        // half-open upgrade indefinitely (#31). Frame/message caps apply
+        // on the southbound hop too, so a hostile cluster can't OOM the
+        // gateway any more than a hostile client can.
+        let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        ws_config.max_frame_size = Some(limits.ws_max_frame_bytes);
+        ws_config.max_message_size = Some(limits.ws_max_message_bytes);
+        let connect =
+            tokio_tungstenite::connect_async_with_config(southbound, Some(ws_config), false);
+        let upstream = match tokio::time::timeout(limits.ws_connect_timeout, connect).await {
             Ok(Ok((stream, _resp))) => stream,
             Ok(Err(e)) => {
                 tracing::warn!(cluster = %cluster.id, error = %e, "upstream ws connect failed");
@@ -359,38 +460,69 @@ mod ws {
             },
         )
         .await;
+        let idle_timeout = limits.ws_idle_timeout;
         upgrade
-            .on_upgrade(move |client| bridge(client, upstream))
+            .max_frame_size(limits.ws_max_frame_bytes)
+            .max_message_size(limits.ws_max_message_bytes)
+            .on_upgrade(move |client| bridge(client, upstream, idle_timeout, permit))
             .into_response()
     }
 
-    async fn bridge<S>(client: axws::WebSocket, upstream: tokio_tungstenite::WebSocketStream<S>)
-    where
+    /// Relay frames both ways until either side closes/errors (including
+    /// the configured frame/message caps) or the bridge goes idle for
+    /// `idle_timeout` (#31). The semaphore `permit` is held for the whole
+    /// bridge lifetime so open bridges count against `max_inflight`.
+    async fn bridge<S>(
+        client: axws::WebSocket,
+        upstream: tokio_tungstenite::WebSocketStream<S>,
+        idle_timeout: std::time::Duration,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         let (mut client_tx, mut client_rx) = client.split();
         let (mut upstream_tx, mut upstream_rx) = upstream.split();
 
-        let northbound = async {
-            while let Some(Ok(msg)) = upstream_rx.next().await {
-                let Some(msg) = ts_to_axum(msg) else { continue };
-                if client_tx.send(msg).await.is_err() {
+        let idle = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle);
+        loop {
+            tokio::select! {
+                msg = upstream_rx.next() => {
+                    match msg {
+                        Some(Ok(msg)) => {
+                            if let Some(msg) = ts_to_axum(msg) {
+                                if client_tx.send(msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        // Protocol error (e.g. oversize frame) or EOF.
+                        Some(Err(_)) | None => break,
+                    }
+                }
+                msg = client_rx.next() => {
+                    match msg {
+                        Some(Ok(msg)) => {
+                            if let Some(msg) = axum_to_ts(msg) {
+                                if upstream_tx.send(msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(_)) | None => break,
+                    }
+                }
+                _ = &mut idle => {
+                    tracing::debug!("ws bridge closed: idle timeout");
                     break;
                 }
             }
-            let _ = client_tx.close().await;
-        };
-        let southbound = async {
-            while let Some(Ok(msg)) = client_rx.next().await {
-                let Some(msg) = axum_to_ts(msg) else { continue };
-                if upstream_tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-            let _ = upstream_tx.close().await;
-        };
-        // Either side closing tears down the bridge.
-        futures::future::select(Box::pin(northbound), Box::pin(southbound)).await;
+            // Any frame in either direction resets the idle clock.
+            idle.as_mut()
+                .reset(tokio::time::Instant::now() + idle_timeout);
+        }
+        let _ = client_tx.close().await;
+        let _ = upstream_tx.close().await;
     }
 
     fn ts_to_axum(msg: TsMessage) -> Option<axws::Message> {

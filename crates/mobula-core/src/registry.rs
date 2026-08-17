@@ -85,8 +85,14 @@ impl ClusterRegistry {
 
     /// Validate the registry as security-sensitive input (issues #2/#8):
     /// duplicate hostnames/ids fail fast (first-match-wins misrouting),
-    /// URLs are scheme-restricted with no userinfo/fragment, and a static
-    /// token over cleartext http is rejected unless explicitly overridden.
+    /// URLs are scheme-restricted with no userinfo/fragment, literal-IP
+    /// hosts in link-local/CGNAT ranges are refused (SSRF: cloud metadata
+    /// endpoints, overlay meshes), and a static token over cleartext http
+    /// is rejected unless explicitly overridden.
+    ///
+    /// Residual risk: DNS-named `api_base_url`s pass unchecked — resolving
+    /// them at validation can't defeat DNS rebinding, so name-based SSRF
+    /// screening is accepted as out of scope. Only literal IPs are denied.
     pub fn validate(&self, allow_insecure_transport: bool) -> Result<(), RegistryError> {
         let mut hostnames = std::collections::HashSet::new();
         let mut ids = std::collections::HashSet::new();
@@ -133,6 +139,18 @@ impl ClusterRegistry {
             if c.api_base_url.contains('#') {
                 return Err(invalid("fragment not allowed"));
             }
+            // SSRF posture (#2): literal IPs in link-local/CGNAT ranges
+            // never name a Ray head — they name cloud metadata endpoints
+            // (169.254.169.254) or overlay meshes. DNS names pass through
+            // (see validate's doc comment for the residual risk).
+            if let Ok(ip) = authority_host(authority).parse::<std::net::IpAddr>() {
+                if is_denied_southbound_ip(ip) {
+                    return Err(invalid(
+                        "literal IP in a link-local/CGNAT range (169.254.0.0/16, \
+                         100.64.0.0/10, fe80::/10) is not a cluster endpoint",
+                    ));
+                }
+            }
             if c.auth_token.is_some() && is_http && !allow_insecure_transport {
                 return Err(RegistryError::CleartextToken(c.id.0.clone()));
             }
@@ -156,6 +174,35 @@ fn strip_port(host: &str) -> &str {
         }
     }
     host
+}
+
+/// Extract the host portion of a URL authority: `[fe80::1]:8265` yields
+/// `fe80::1`, `host:8265` yields `host`, `host` yields `host`. Userinfo is
+/// already rejected by validation before this runs.
+fn authority_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    authority.split(':').next().unwrap_or(authority)
+}
+
+/// Literal-IP denylist for southbound `api_base_url`s (issue #2 remainder):
+/// link-local and CGNAT ranges never name a Ray head — they name cloud
+/// metadata endpoints (169.254.169.254) or overlay meshes (Tailscale etc.).
+/// Computed from octets rather than the std `is_*` helpers so the ranges
+/// are explicit and stable across toolchains.
+fn is_denied_southbound_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // 169.254.0.0/16 link-local (includes cloud metadata 169.254.169.254)
+            (o[0] == 169 && o[1] == 254)
+                // 100.64.0.0/10 CGNAT / overlay meshes
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+        }
+        // fe80::/10 link-local
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +319,42 @@ mod tests {
             bad_host.validate(true),
             Err(RegistryError::InvalidHostname { .. })
         ));
+    }
+
+    #[test]
+    fn validate_rejects_link_local_and_cgnat_literal_ips() {
+        // #2: cloud metadata endpoints and overlay meshes must never be
+        // registered as cluster heads.
+        for url in [
+            "http://169.254.169.254:8265",
+            "https://169.254.0.1",
+            "http://100.64.0.1:8265",
+            "http://100.127.255.254",
+            "http://[fe80::1]:8265",
+            "http://[febf::ffff]:8265",
+        ] {
+            let mut bad = registry();
+            bad.clusters[0].api_base_url = url.into();
+            bad.clusters[0].auth_token = None;
+            assert!(
+                matches!(bad.validate(true), Err(RegistryError::InvalidUrl { .. })),
+                "{url} should be rejected"
+            );
+        }
+        // Ordinary private/loopback IPs (in-cluster heads, dev setups) and
+        // DNS names (residual risk, documented on validate) still pass.
+        for url in [
+            "http://10.0.0.5:8265",
+            "http://127.0.0.1:8265",
+            "http://100.63.255.255:8265",
+            "https://[fd00::1]:8265",
+            "http://demo-head-svc:8265",
+        ] {
+            let mut ok = registry();
+            ok.clusters[0].api_base_url = url.into();
+            ok.clusters[0].auth_token = None;
+            assert!(ok.validate(false).is_ok(), "{url} should pass");
+        }
     }
 
     #[test]

@@ -11,6 +11,22 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      # PostgresStore conformance (#48): tests/store.rs runs its scenarios
+      # against Postgres when MOBULA_TEST_POSTGRES_URL is set.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mobula
+          POSTGRES_PASSWORD: mobula
+          POSTGRES_DB: mobula
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mobula -d mobula"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -22,6 +38,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
+        env:
+          MOBULA_TEST_POSTGRES_URL: postgres://mobula:mobula@localhost:5432/mobula
         run: cargo test --workspace
 
   coverage:

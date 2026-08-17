@@ -9,6 +9,8 @@ pub mod metering;
 pub mod pool_reconcile;
 pub mod reconcile;
 pub mod store;
+#[cfg(feature = "postgres")]
+pub mod store_postgres;
 pub mod store_sqlite;
 
 pub use metering::Metering;
@@ -19,4 +21,6 @@ pub use store::{
     IntentRecord, IntentStatus, Store, StoreError, StoredCluster, StoredPolicy, StoredPool,
     UsageSample, UsageSource, LOCKOUT_SECS, LOGIN_LOCKOUT_THRESHOLD,
 };
+#[cfg(feature = "postgres")]
+pub use store_postgres::PostgresStore;
 pub use store_sqlite::SqliteStore;

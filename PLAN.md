@@ -39,7 +39,12 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 - CI (fmt, clippy, test, cargo-deny), Apache-2.0 LICENSE (in place; matches
   the nebari-dev org convention for a future org transfer), DCO, ADR
   directory.
-- Postgres schema v0 (SQLite dev mode); config loading; structured logging.
+- Persistent store schema; config loading; structured logging. (Amended
+  2026-08-16: landed SQLite-first rather than "Postgres schema v0, SQLite dev
+  mode" — the `Store` trait has a SQLite impl with embedded schema and
+  spec/enums as JSON text so the SQL ports to Postgres unchanged, plus a
+  conformance suite over both impls; the Postgres backend itself is still
+  pending.)
 
 ### Phase 1 — Multi-cluster job gateway (first drop-in artifact)
 
@@ -56,9 +61,12 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
   each cluster's native job API** — never a reimplementation of the dashboard
   head (its endpoints write GCS KV and spawn JobSupervisor actors internally;
   replacing it would mean speaking unstable internal protocols, violating D2).
-- Gateway owns: client-compatible surface, routing by cluster, queueing,
-  durable log capture to object store, job records in Postgres. Package
-  upload and supervisor mechanics pass through to the real head.
+- Gateway owns: client-compatible surface, routing by cluster, job records.
+  Package upload and supervisor mechanics pass through to the real head.
+  (Amended 2026-08-16: **queueing was deliberately delegated to Kueue** —
+  ADR-0010, a plan change from the original "gateway owns queueing"; **job
+  records landed** in the persistent Store, cross-cluster and keyed by job id;
+  **durable log capture to object store is still outstanding**.)
 - Routing model: **one base URL per cluster** (the stock client's fixed root
   paths leave no cluster-id slot; per-cluster NebariApp hostnames provide
   this naturally). The gateway holds and forwards each cluster's static Ray
@@ -93,9 +101,11 @@ maintain a standalone mode (any OIDC IdP, any K8s) in the same binary.
 > in every gateway audit event (HTTP + websocket), and `serve --audit-log`
 > writing `mobula::audit` as append-only JSONL. (Amended 2026-08-16: local
 > auth mode issues *opaque, unsigned* tokens — Mobula stores credentials,
-> never signs them; see ADR-0011.) Explicitly deferred:
-> Postgres-backed audit records (lands with the Phase 3 storage layer —
-> the JSONL file satisfies append-only/exportable until then) and the
+> never signs them; see ADR-0011.) (Amended 2026-08-16 #2: audit records
+> are no longer deferred — `Store::record_audit`/`list_audit` persist them
+> with caller identity, append-only with sequence cursors; SQLite-backed,
+> Postgres-portable SQL. The JSONL file remains as an additional sink.)
+> Still deferred: the
 > FIPS crypto provider (aws-lc-rs; grouped with the release-engineering
 > item, required before any DISA accreditation claim, ADR-0008).
 - Mobula owns JWT validation, device-code flow for CLI, and service-account
@@ -410,6 +420,19 @@ These are the honest gap between "works in the tested happy path" and
 multi-tenant deployment.
 
 ## v0 cut line (one quarter, 1–3 people)
+
+> Status 2026-08-16 (against the list below): **done** — KubeRay backend
+> (live, e2e-proven), single binary, SQLite store, cluster CRUD + TTL
+> reaping, OIDC login + fixed roles + deny-by-default, audit log (JSONL
+> plus persisted Store records with caller identity), the identity-aware
+> job gateway holding per-cluster Ray tokens. **Still pending** — Postgres
+> backend (store SQL is Postgres-portable but no Postgres impl yet),
+> durable job logs to object store, Nebari pack (lives in the separate
+> `mobula-pack` repo), plain Helm chart. Two items listed under
+> **Deferred** have since landed in Phase 4: Serve management
+> (authenticated CRUD over RayService) and the cost model (price-sheet
+> estimation); fair share arrives via Kueue (ADR-0010), not a home-grown
+> engine.
 
 **In:** KubeRay backend only; single binary; SQLite/Postgres, no HA. Cluster
 CRUD + TTL reaping via RayCluster CRs. OIDC login + three fixed roles

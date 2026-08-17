@@ -4,6 +4,13 @@ name: Contract
 # JobSubmissionClient replayed through the gateway against a live Ray head.
 # Runs on gateway changes, weekly (to catch new Ray releases moving the
 # surface underneath us), and on demand.
+#
+# Matrix policy (gate S4): the latest TWO Ray minor releases, each pinned
+# to a concrete patch, crossed with Ray token auth off/on (Ray >=2.52
+# native token auth: head started with RAY_AUTH_MODE=token, stock client
+# presenting RAY_AUTH_TOKEN). When a new Ray minor ships, bump the matrix
+# below to the two newest minors (one pinned patch each) — no other change
+# should be needed.
 on:
   push:
     branches: [main]
@@ -22,14 +29,23 @@ env:
 jobs:
   jobs-api:
     runs-on: ubuntu-latest
+    name: "ray ${{ matrix.ray }} / token auth ${{ matrix.token_auth }}"
     strategy:
       fail-fast: false
       matrix:
-        # Supported-version matrix (two Ray minors policy). "ray[default]"
-        # unpinned = latest release, our early-warning canary.
-        ray: ["ray[default]"]
+        # Supported-version matrix: latest two Ray minors, pinned to a
+        # patch each (verified against ray-project/ray releases).
+        ray: ["ray[default]==2.57.0", "ray[default]==2.56.1"]
+        token_auth: ["off", "on"]
     steps:
       - uses: actions/checkout@v7
+
+      - name: Generate the token-auth leg's shared token
+        # A fresh random token per run (secrets.token_hex(32) shape — same
+        # as `ray get-auth-token --generate`). CI-only: the cluster and
+        # gateway live and die inside one ephemeral runner. Never a
+        # committed literal — gitleaks correctly flags those.
+        run: echo "RAY_CONTRACT_TOKEN=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v7
@@ -43,10 +59,18 @@ jobs:
 
       - name: Start Ray head
         run: |
+          AUTH_CURL=()
+          if [ "${{ matrix.token_auth }}" = "on" ]; then
+            # Ray >=2.52 native token auth: the head enforces a Bearer
+            # token on every dashboard/job-API request.
+            export RAY_AUTH_MODE=token
+            export RAY_AUTH_TOKEN="$RAY_CONTRACT_TOKEN"
+            AUTH_CURL=(-H "Authorization: Bearer $RAY_AUTH_TOKEN")
+          fi
           ray start --head --dashboard-host=127.0.0.1 --dashboard-port=8265
           # Wait for the dashboard job API to come up.
           for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:8265/api/version && break || sleep 2
+            curl -sf "${AUTH_CURL[@]}" http://127.0.0.1:8265/api/version && break || sleep 2
           done
 
       - name: Start Mobula gateway in front of it
@@ -58,15 +82,33 @@ jobs:
           hostname = "demo.ray.test"
           api_base_url = "http://127.0.0.1:8265"
           EOF
+          EXTRA_FLAGS=""
+          if [ "${{ matrix.token_auth }}" = "on" ]; then
+            # The gateway holds the cluster token and presents it
+            # southbound (crates/mobula-api/src/gateway.rs). The registry
+            # refuses a token over cleartext http without the explicit
+            # insecure-transport override — fine for loopback CI.
+            echo "auth_token = \"$RAY_CONTRACT_TOKEN\"" >> clusters.toml
+            EXTRA_FLAGS="--allow-insecure-transport"
+          fi
           cargo build -p mobula-cli
-          nohup ./target/debug/mobula serve --bind 0.0.0.0:8484 --registry clusters.toml --dev-allow-unauthenticated \
+          nohup ./target/debug/mobula serve --bind 0.0.0.0:8484 --registry clusters.toml --dev-allow-unauthenticated $EXTRA_FLAGS \
             > mobula.log 2>&1 &
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8484/healthz && break || sleep 1
           done
 
       - name: Replay JobSubmissionClient through the gateway
-        run: python contract/jobs_client_replay.py
+        run: |
+          if [ "${{ matrix.token_auth }}" = "on" ]; then
+            # Stock client picks these up itself: with RAY_AUTH_MODE=token
+            # it attaches `Authorization: Bearer $RAY_AUTH_TOKEN` to every
+            # request (ray._private.authentication.http_token_authentication).
+            export RAY_AUTH_MODE=token
+            export RAY_AUTH_TOKEN="$RAY_CONTRACT_TOKEN"
+          fi
+          echo "replay leg: ${{ matrix.ray }} token_auth=${{ matrix.token_auth }}"
+          python contract/jobs_client_replay.py
 
       - name: Gateway logs
         if: always()

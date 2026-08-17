@@ -16,6 +16,19 @@ pub enum StoreError {
     Backend(String),
 }
 
+// Shared by the sqlx-backed stores (SQLite, Postgres).
+impl From<sqlx::Error> for StoreError {
+    fn from(e: sqlx::Error) -> Self {
+        StoreError::Backend(e.to_string())
+    }
+}
+
+/// Shared by the sqlx-backed stores (SQLite, Postgres): spec/enum columns are
+/// JSON text, so a serialization failure surfaces as a store error.
+pub(crate) fn json_err(e: serde_json::Error) -> StoreError {
+    StoreError::Backend(format!("serialization: {e}"))
+}
+
 /// What the operator wants a cluster to be. The *observed* state is
 /// reconstructed from the provisioner every reconcile (ADR-0006) — it is
 /// never stored as authoritative truth.

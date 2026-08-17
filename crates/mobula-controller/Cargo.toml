@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Postgres store backend (ADR-0004: Postgres is truth in prod). Default-on,
+# mirroring mobula-provision's `kuberay`, so CI's plain
+# `cargo clippy --workspace --all-targets` / `cargo test --workspace` compile it.
+default = ["postgres"]
+postgres = ["sqlx/postgres"]
+
 [dependencies]
 mobula-core.workspace = true
 mobula-provision.workspace = true
@@ -18,3 +25,7 @@ async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
+
+[dev-dependencies]
+# The Postgres conformance tests create a per-test schema over sqlx directly.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }

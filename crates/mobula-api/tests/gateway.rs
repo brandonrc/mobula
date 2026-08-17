@@ -76,6 +76,23 @@ fn app_with_cluster(addr: SocketAddr, token: Option<&str>) -> Router {
     )
 }
 
+/// As `app_with_cluster`, with explicit northbound limits so the DoS knobs
+/// (#30/#31) can be shrunk to deterministic test values.
+fn app_with_cluster_limits(addr: SocketAddr, limits: mobula_api::ServeLimits) -> Router {
+    mobula_api::build_app_with_serve_limits(
+        ClusterRegistry {
+            clusters: vec![ClusterEndpoint {
+                id: ClusterId("demo".into()),
+                hostname: "demo.ray.test".into(),
+                api_base_url: format!("http://{addr}"),
+                auth_token: None,
+            }],
+        },
+        None,
+        limits,
+    )
+}
+
 #[tokio::test]
 async fn cluster_host_proxies_to_ray_head_with_token_injected() {
     let (addr, log) = spawn_mock_ray_head().await;
@@ -340,6 +357,111 @@ mod websocket {
             "expected 502 handshake rejection, got: {msg}"
         );
     }
+
+    /// As `spawn_gateway`, with explicit northbound limits so the ws
+    /// knobs (#31) can be shrunk to deterministic test values.
+    async fn spawn_gateway_with_limits(
+        head: SocketAddr,
+        limits: mobula_api::ServeLimits,
+    ) -> SocketAddr {
+        let app = mobula_api::build_app_with_serve_limits(
+            ClusterRegistry {
+                clusters: vec![ClusterEndpoint {
+                    id: ClusterId("demo".into()),
+                    hostname: "127.0.0.1".into(),
+                    api_base_url: format!("http://{head}"),
+                    auth_token: None,
+                }],
+            },
+            None,
+            limits,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    /// Read until the bridge closes; fails if it hasn't within `secs`.
+    async fn expect_bridge_close(
+        ws: &mut (impl StreamExt<Item = Result<TsMessage, tokio_tungstenite::tungstenite::Error>>
+                  + Unpin),
+        secs: u64,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            match tokio::time::timeout_at(deadline, ws.next()).await {
+                Ok(Some(Ok(TsMessage::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return,
+                Ok(Some(Ok(_))) => continue,
+                Err(_) => panic!("bridge did not close within {secs}s"),
+            }
+        }
+    }
+
+    /// #31: a bridge with no frames in either direction for the configured
+    /// idle timeout is torn down (and its semaphore permit released).
+    #[tokio::test]
+    async fn ws_bridge_closes_after_idle_timeout() {
+        // Mock head that upgrades and then says nothing, forever.
+        async fn ws_silent(upgrade: WebSocketUpgrade) -> impl IntoResponse {
+            upgrade.on_upgrade(|socket| async move {
+                let _hold = socket;
+                std::future::pending::<()>().await;
+            })
+        }
+        let app = Router::new().route("/api/jobs/x/logs/tail", axum::routing::any(ws_silent));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let head = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let limits = mobula_api::ServeLimits {
+            gateway: mobula_api::gateway::GatewayLimits {
+                ws_idle_timeout: std::time::Duration::from_millis(200),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let gw = spawn_gateway_with_limits(head, limits).await;
+
+        let req = format!("ws://{gw}/api/jobs/x/logs/tail")
+            .into_client_request()
+            .unwrap();
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        expect_bridge_close(&mut ws, 5).await;
+    }
+
+    /// #31: a message over the configured max size terminates the bridge
+    /// instead of being buffered.
+    #[tokio::test]
+    async fn ws_bridge_closes_on_oversize_message() {
+        let (head, _log) = spawn_mock_ws_head().await;
+        let limits = mobula_api::ServeLimits {
+            gateway: mobula_api::gateway::GatewayLimits {
+                ws_max_message_bytes: 64,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let gw = spawn_gateway_with_limits(head, limits).await;
+
+        let req = format!("ws://{gw}/api/jobs/x/logs/tail")
+            .into_client_request()
+            .unwrap();
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        // Drain the mock's three log lines (each well under the cap).
+        for _ in 0..3 {
+            ws.next().await.unwrap().unwrap();
+        }
+        // 256 bytes against a 64-byte cap: the bridge must die, not buffer.
+        ws.send(TsMessage::Text("x".repeat(256).into()))
+            .await
+            .unwrap();
+        expect_bridge_close(&mut ws, 5).await;
+    }
 }
 
 #[tokio::test]
@@ -469,4 +591,111 @@ async fn cookie_and_forwarded_headers_are_stripped_southbound() {
     // the request count and rely on the src-level unit tests of
     // southbound_headers for exact header assertions.
     assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+/// #30: with the inflight semaphore saturated (capacity 1, one request
+/// parked on a hanging head), the next proxied request is refused with 503
+/// instead of queueing — a queue behind the semaphore is itself a DoS
+/// surface.
+#[tokio::test]
+async fn saturated_gateway_returns_503_not_a_queue() {
+    use std::time::Duration;
+
+    // Mock head that signals when /hang is hit, then never responds.
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let arrived_in_handler = arrived.clone();
+    let app = Router::new().route(
+        "/hang",
+        axum::routing::get(move || {
+            let arrived = arrived_in_handler.clone();
+            async move {
+                arrived.notify_one();
+                std::future::pending::<()>().await;
+                ""
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let limits = mobula_api::ServeLimits {
+        gateway: mobula_api::gateway::GatewayLimits {
+            max_inflight: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let app = app_with_cluster_limits(addr, limits);
+
+    // First request takes the only permit and parks on the hanging head.
+    let app2 = app.clone();
+    let first = tokio::spawn(async move {
+        app2.oneshot(
+            Request::get("/hang")
+                .header(header::HOST, "demo.ray.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+        .await
+        .expect("first request never reached the mock head");
+
+    let res = app
+        .oneshot(
+            Request::get("/api/jobs/")
+                .header(header::HOST, "demo.ray.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "saturated gateway must refuse, not queue"
+    );
+    first.abort();
+}
+
+/// #2: link-local / CGNAT literal IPs must be refused at registry
+/// validation — they name cloud metadata endpoints or overlay meshes,
+/// never a Ray head.
+#[test]
+fn link_local_api_base_urls_are_rejected_at_validation() {
+    for url in [
+        "http://169.254.169.254:8265",
+        "http://100.64.0.1:8265",
+        "http://[fe80::1]:8265",
+    ] {
+        let registry = ClusterRegistry {
+            clusters: vec![ClusterEndpoint {
+                id: ClusterId("evil".into()),
+                hostname: "evil.ray.test".into(),
+                api_base_url: url.into(),
+                auth_token: None,
+            }],
+        };
+        assert!(
+            registry.validate(true).is_err(),
+            "{url} must be rejected at validation"
+        );
+    }
+    // Ordinary in-cluster IPs and DNS names still pass (DNS resolution-time
+    // SSRF is the documented accepted residual risk).
+    for url in ["http://10.0.0.5:8265", "http://demo-head-svc:8265"] {
+        let registry = ClusterRegistry {
+            clusters: vec![ClusterEndpoint {
+                id: ClusterId("ok".into()),
+                hostname: "ok.ray.test".into(),
+                api_base_url: url.into(),
+                auth_token: None,
+            }],
+        };
+        assert!(registry.validate(false).is_ok(), "{url} must pass");
+    }
 }

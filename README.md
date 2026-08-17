@@ -12,7 +12,9 @@ full Nebari Infrastructure Core (NIC) deployment — Keycloak SSO, Envoy Gateway
 ingress, and `NebariApp`-driven OIDC client provisioning come from the platform.
 A standalone mode (any OIDC IdP, any Kubernetes) keeps it useful outside Nebari.
 
-Status: **Phase 1 — federating job gateway**. Start with
+Status: **Phases 0–3 complete** (gateway, identity/RBAC, cluster lifecycle
+controller over a persistent Store); **Phase 4 in flight** (governance,
+services, Kueue-backed resource pools). Start with
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (diagrams: system context,
 crate map, lifecycle state machine, gateway request flow), then
 [REQUIREMENTS.md](REQUIREMENTS.md), [PLAN.md](PLAN.md), and
@@ -102,9 +104,12 @@ server. Every route takes a Bearer JWT; the Ray Jobs API is hostname-routed
 through the gateway and intentionally out of this spec.
 
 Workspace layout: `mobula-core` (domain model, no cloud/K8s deps) ·
-`mobula-provision` (Provisioner trait; KubeRay backend first) · `mobula-api`
-(HTTP surface + future Jobs gateway) · `mobula-proxy` (standalone-mode
-identity proxy) · `mobula-cli` (the `mobula` binary).
+`mobula-provision` (Provisioner trait; live KubeRay + Kueue backends) ·
+`mobula-api` (HTTP surface + the Ray Jobs gateway) · `mobula-auth` (OIDC
+validation, device-code/service-account login) · `mobula-controller`
+(reconcile engine + persistent Store — SQLite, Postgres-portable SQL) ·
+`mobula-policy` (quota + cost governance) · `mobula-proxy` (standalone-mode
+identity proxy; still a stub) · `mobula-cli` (the `mobula` binary).
 
 License: [Apache-2.0](LICENSE) — matching the nebari-dev org convention.
 

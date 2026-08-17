@@ -970,3 +970,109 @@ async fn sqlite_persists_across_reopen() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// --- Postgres conformance (#48): the SAME scenarios run against
+// PostgresStore when MOBULA_TEST_POSTGRES_URL points at a Postgres (e.g.
+// `docker run -p 5432:5432 -e POSTGRES_PASSWORD=mobula postgres:16-alpine`);
+// otherwise they skip with a clear message. CI's test job runs a postgres
+// service and sets the env var, so this is exercised on every PR.
+#[cfg(feature = "postgres")]
+mod postgres {
+    use super::*;
+    use mobula_controller::PostgresStore;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+    /// Connect in a fresh per-test schema (set as every connection's
+    /// search_path) so parallel scenarios never share rows. `None` — with a
+    /// clear message — when MOBULA_TEST_POSTGRES_URL is unset.
+    async fn postgres_store() -> Option<PostgresStore> {
+        let url = match std::env::var("MOBULA_TEST_POSTGRES_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!(
+                    "skipping PostgresStore conformance: MOBULA_TEST_POSTGRES_URL is not set \
+                     (e.g. postgres://mobula:mobula@localhost:5432/mobula)"
+                );
+                return None;
+            }
+        };
+        let schema = format!(
+            "conf_{}_{}",
+            std::process::id(),
+            NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
+        );
+        let pool = PgPoolOptions::new()
+            .after_connect(move |conn, _meta| {
+                let schema = schema.clone();
+                Box::pin(async move {
+                    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query(&format!("SET search_path TO {schema}"))
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect to MOBULA_TEST_POSTGRES_URL");
+        Some(PostgresStore::from_pool(pool).await.expect("apply schema"))
+    }
+
+    macro_rules! pg_conformance {
+        ($name:ident, $scenario:ident) => {
+            #[tokio::test]
+            async fn $name() {
+                if let Some(store) = postgres_store().await {
+                    $scenario(&store).await;
+                }
+            }
+        };
+    }
+
+    pg_conformance!(postgres_store_conforms, conformance);
+    pg_conformance!(postgres_store_pool_conforms, pool_conformance);
+    pg_conformance!(postgres_store_usage_conforms, usage_conformance);
+    pg_conformance!(postgres_store_audit_conforms, audit_conformance);
+    pg_conformance!(postgres_store_local_auth_conforms, local_auth_conformance);
+
+    #[tokio::test]
+    async fn postgres_store_policy_conforms() {
+        if let Some(store) = postgres_store().await {
+            policy_conformance(&store).await;
+        }
+        // seed_policy on an EMPTY store (a second, fresh schema).
+        if let Some(fresh) = postgres_store().await {
+            policy_seed_conformance(&fresh).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_concurrent_distinct_upserts_do_not_collapse_generation() {
+        // #42, Postgres side: the advisory-lock transaction must serialize
+        // two concurrent spec changes so each sees the other's bump.
+        let Some(store) = postgres_store().await else {
+            return;
+        };
+        let store = std::sync::Arc::new(store);
+        let id = ClusterId("demo".into());
+        store.upsert_desired(&id, spec("demo", 1)).await.unwrap(); // gen 1
+
+        let (s1, s2) = (store.clone(), store.clone());
+        let (i1, i2) = (id.clone(), id.clone());
+        let a = tokio::spawn(async move { s1.upsert_desired(&i1, spec("demo", 2)).await });
+        let b = tokio::spawn(async move { s2.upsert_desired(&i2, spec("demo", 5)).await });
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+
+        assert_eq!(
+            store.get(&id).await.unwrap().unwrap().generation,
+            3,
+            "two distinct concurrent spec changes must yield two generation bumps"
+        );
+    }
+}
