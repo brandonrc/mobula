@@ -74,6 +74,22 @@ Expected matrix: no token → 401 everywhere; viewer → reads 200, mutations
 cluster lifecycle; admin → pools/registry/audit. Every decision lands in
 `GET /api/v1/audit` (Admin) with the caller's Keycloak subject.
 
+**Realm hardening:** the imported realm is production-shaped, not a toy —
+brute-force detection is on (5 failed logins temporarily lock the account),
+a password policy applies to any newly set password (min length 8, at least
+one digit, not equal to the username, last 2 passwords not reusable), access
+tokens live 15 minutes (refresh tokens rotate; SSO session idle/max 8h/10h),
+and login + admin events are logged via `jboss-logging` (see
+`docker logs mobula-demo-keycloak-1`), complementing Mobula's own audit log.
+The demo passwords stay weak on purpose — they're imported pre-hashed
+(PBKDF2-SHA256, 600k iterations) so import doesn't trip the password policy —
+and remain the documented password = username credentials.
+
+The single deliberate deviation from a production posture is
+`sslRequired: "none"` in `deploy/keycloak/mobula-realm.json` — this compose
+stack has no TLS terminator. For a real deployment, flip it to
+`"sslRequired": "all"` (or `"external"` behind a TLS-terminating proxy).
+
 How it works: Keycloak's hostname is pinned to `http://localhost:8090` and
 the `mobula` container shares Keycloak's network namespace, so the OIDC
 issuer string is identical from your shell, the container, and the token's

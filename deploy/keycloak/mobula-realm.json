@@ -3,6 +3,29 @@
   "enabled": true,
   "displayName": "Mobula local auth demo",
   "sslRequired": "none",
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "minimumQuickLoginWaitSeconds": 60,
+  "waitIncrementSeconds": 60,
+  "quickLoginCheckMilliSeconds": 1000,
+  "maxDeltaTimeSeconds": 43200,
+  "failureFactor": 5,
+  "passwordPolicy": "length(8) and digits(1) and notUsername(undefined) and passwordHistory(2)",
+  "accessTokenLifespan": 900,
+  "ssoSessionIdleTimeout": 28800,
+  "ssoSessionMaxLifespan": 36000,
+  "ssoSessionIdleTimeoutRememberMe": 0,
+  "ssoSessionMaxLifespanRememberMe": 0,
+  "offlineSessionIdleTimeout": 2592000,
+  "revokeRefreshToken": true,
+  "refreshTokenMaxReuse": 0,
+  "eventsEnabled": true,
+  "eventsListeners": [
+    "jboss-logging"
+  ],
+  "adminEventsEnabled": true,
+  "adminEventsDetailsEnabled": true,
   "groups": [
     {
       "name": "platform-admins"
@@ -28,8 +51,8 @@
       "credentials": [
         {
           "type": "password",
-          "value": "admin",
-          "temporary": false
+          "secretData": "{\"value\": \"olbkwJWR2N4f5xh8LiFWc5QQ6CD/1CHkyXINWe0WNiI=\", \"salt\": \"+Kcxvom2lHtLKL8IxY00Ig==\", \"additionalParameters\": {}}",
+          "credentialData": "{\"hashIterations\": 600000, \"algorithm\": \"pbkdf2-sha256\", \"additionalParameters\": {}}"
         }
       ],
       "groups": [
@@ -44,8 +67,8 @@
       "credentials": [
         {
           "type": "password",
-          "value": "operator",
-          "temporary": false
+          "secretData": "{\"value\": \"hU36WD4ZyS/4z0DW1wKzpSBIju9dY498NlUHQkHGIe0=\", \"salt\": \"gQOErnoe1HMa9ZIZYNqiIw==\", \"additionalParameters\": {}}",
+          "credentialData": "{\"hashIterations\": 600000, \"algorithm\": \"pbkdf2-sha256\", \"additionalParameters\": {}}"
         }
       ],
       "groups": [
@@ -62,8 +85,8 @@
       "credentials": [
         {
           "type": "password",
-          "value": "developer",
-          "temporary": false
+          "secretData": "{\"value\": \"Ok7T7ralWICsVyIjf1Nx2tlkp0dxxUXd5QjJWiOko5w=\", \"salt\": \"riwuJfADyrPYCsPM36L74A==\", \"additionalParameters\": {}}",
+          "credentialData": "{\"hashIterations\": 600000, \"algorithm\": \"pbkdf2-sha256\", \"additionalParameters\": {}}"
         }
       ],
       "groups": [
@@ -80,8 +103,8 @@
       "credentials": [
         {
           "type": "password",
-          "value": "viewer",
-          "temporary": false
+          "secretData": "{\"value\": \"HXSpasOQrqJ0udyHBDZnuq9QhoGjy0ImuoHxcvg8eQs=\", \"salt\": \"40Zzs50wNCi/Pk3QdNljsw==\", \"additionalParameters\": {}}",
+          "credentialData": "{\"hashIterations\": 600000, \"algorithm\": \"pbkdf2-sha256\", \"additionalParameters\": {}}"
         }
       ],
       "groups": [
