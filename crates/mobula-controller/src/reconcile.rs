@@ -539,6 +539,8 @@ mod tests {
                 head_memory: "2Gi".into(),
                 worker_groups: vec![],
                 ttl_seconds: ttl,
+                pod: None,
+                pod_resolved: None,
             },
             generation: 1,
             desired: DesiredState::Running,

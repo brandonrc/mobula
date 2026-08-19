@@ -1387,6 +1387,8 @@ mod tests {
                 replicas: 1,
             }],
             ttl_seconds: None,
+            pod: None,
+            pod_resolved: None,
         }
     }
 

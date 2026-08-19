@@ -27,6 +27,7 @@ use axum::{Extension, Json, Router};
 use mobula_auth::{Identity, PermissionType, Target};
 use mobula_controller::{now_unix, Store, StoredPolicy};
 use mobula_core::{AuditDecision, AuditEvent};
+use mobula_policy::podshape::PodShapeCatalog;
 use mobula_policy::{PriceSheet, ResourceMap};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -56,7 +57,10 @@ fn store_err(e: mobula_controller::StoreError) -> Response {
 /// `None` when the seed is empty (no `--policy` given) — an empty seed
 /// never materializes a row, so `source` stays `"none"`.
 fn seed_from_config(cfg: &PolicyConfig) -> Option<StoredPolicy> {
-    if cfg.prices.is_none() && cfg.quotas.is_empty() {
+    // A `[pod_shaping]`-only policy file is a real configuration: it must
+    // materialize a row, or the catalog would never reach the store and
+    // could not be edited.
+    if cfg.prices.is_none() && cfg.quotas.is_empty() && cfg.pod_shaping.is_empty() {
         return None;
     }
     Some(StoredPolicy {
@@ -66,6 +70,7 @@ fn seed_from_config(cfg: &PolicyConfig) -> Option<StoredPolicy> {
             .iter()
             .map(|(k, v)| (k.clone(), v.0.clone()))
             .collect(),
+        pod_shaping: cfg.pod_shaping.clone(),
         from_file_seed: true,
     })
 }
@@ -83,6 +88,12 @@ pub(crate) fn config_from_stored(p: &StoredPolicy) -> PolicyConfig {
             .map(|(k, v)| (k.clone(), ResourceMap(v.clone())))
             .collect(),
         gpu_default_sharing: Default::default(),
+        // The pod-shaping catalog (#66) IS part of the stored row, so
+        // adding a mount is an API call rather than a restart — same
+        // treatment as prices and quotas, and the same reasoning that made
+        // pools API-managed (ADR-0010). `gpu_default_sharing` stays
+        // boot-time-only: it is a safety default, not a catalog.
+        pod_shaping: p.pod_shaping.clone(),
     }
 }
 
@@ -125,6 +136,9 @@ pub struct PolicyView {
     pub prices: Option<BTreeMap<String, f64>>,
     /// project → (resource → limit). Empty when no quotas are configured.
     pub quotas: BTreeMap<String, BTreeMap<String, f64>>,
+    /// The pod-shaping catalog (#66): what callers may select. Empty when
+    /// pod shaping is not configured.
+    pub pod_shaping: PodShapeCatalog,
     /// "file" (the untouched `--policy` boot seed) | "store" (edited via
     /// PUT) | "none" (no policy configured at all).
     #[schema(example = "file")]
@@ -138,6 +152,7 @@ impl PolicyView {
         PolicyView {
             prices: p.prices,
             quotas: p.quotas,
+            pod_shaping: p.pod_shaping,
             source,
             editable: true,
         }
@@ -155,6 +170,15 @@ pub struct UpdatePolicy {
     pub prices: Option<Option<BTreeMap<String, f64>>>,
     /// Present replaces the whole quota map (`{}` clears all quotas).
     pub quotas: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// Present replaces the whole pod-shaping catalog (`{}` switches pod
+    /// shaping off). Validated as a unit before it is stored — a catalog
+    /// whose defaults do not resolve would 403 every cluster create, so it
+    /// is rejected here rather than discovered there.
+    ///
+    /// Editing this does NOT re-shape running clusters: each cluster's grant
+    /// is frozen onto its spec at admission. A cluster moves onto the new
+    /// catalog only when it is re-submitted.
+    pub pod_shaping: Option<PodShapeCatalog>,
 }
 
 /// Distinguish an absent field from an explicit JSON `null`: serde's plain
@@ -263,6 +287,16 @@ async fn update_policy(
         }
     }
 
+    if let Some(catalog) = &body.pod_shaping {
+        if let Err(e) = catalog.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid pod_shaping catalog: {e}"),
+            )
+                .into_response();
+        }
+    }
+
     let mut next = match effective_policy(&st.store, &st.policy_seed).await {
         Ok(p) => p.unwrap_or_default(),
         Err(e) => return store_err(e),
@@ -272,6 +306,9 @@ async fn update_policy(
     }
     if let Some(quotas) = body.quotas {
         next.quotas = quotas;
+    }
+    if let Some(catalog) = body.pod_shaping {
+        next.pod_shaping = catalog;
     }
     next.from_file_seed = false;
     if let Err(e) = st.store.set_policy(&next).await {
@@ -342,6 +379,7 @@ mod tests {
             prices: Some(PriceSheet(BTreeMap::from([("cpu".into(), 0.04)]))),
             quotas: Default::default(),
             gpu_default_sharing: Default::default(),
+            pod_shaping: Default::default(),
         })
         .unwrap();
         assert!(seeded.from_file_seed);
@@ -359,6 +397,7 @@ mod tests {
                 ResourceMap(BTreeMap::from([("cpu".to_string(), 5.0)])),
             )]),
             gpu_default_sharing: Default::default(),
+            pod_shaping: Default::default(),
         };
         // First read seeds from the file seed.
         let p = effective_policy(&store, &seed).await.unwrap().unwrap();

@@ -101,6 +101,14 @@ pub(crate) fn spec_changed(a: &ClusterSpec, b: &ClusterSpec) -> bool {
         || a.head_cpu != b.head_cpu
         || a.head_memory != b.head_memory
         || a.ttl_seconds != b.ttl_seconds
+        // Pod shaping (#66) drives actuation: a changed mount, env var,
+        // service account or placement must roll the pods, so it has to
+        // bump the generation like any other owned field. Both sides are
+        // compared — the selections because they are what the caller
+        // asked for, the resolution because a catalog change that alters
+        // an existing cluster's grant must be re-applied, not ignored.
+        || a.pod != b.pod
+        || a.pod_resolved != b.pod_resolved
         || a.worker_groups.len() != b.worker_groups.len()
         || a.worker_groups.iter().zip(&b.worker_groups).any(|(x, y)| {
             x.name != y.name
@@ -247,6 +255,21 @@ pub struct StoredPolicy {
     /// project → resource → limit. Empty = no quotas enforced.
     #[serde(default)]
     pub quotas: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
+    /// Pod-shaping catalog (#66): the mounts, placements and service
+    /// accounts callers may select. Store-backed and Admin-editable for the
+    /// same reason pools are (ADR-0010): adding a mount must not require a
+    /// restart.
+    ///
+    /// Editing the catalog does NOT re-shape running clusters — a cluster's
+    /// grant is frozen onto its spec as `pod_resolved` at admission, and the
+    /// KubeRay translation reads only the spec. A cluster moves onto a new
+    /// catalog when, and only when, someone re-submits it: the re-resolution
+    /// changes `pod_resolved`, `spec_changed` bumps the generation, and
+    /// KubeRay rolls the pods. Migration is deliberate, never ambient.
+    ///
+    /// `#[serde(default)]` keeps rows written before #66 readable.
+    #[serde(default)]
+    pub pod_shaping: mobula_policy::podshape::PodShapeCatalog,
     /// True while the row is the untouched `--policy` boot seed.
     pub from_file_seed: bool,
 }

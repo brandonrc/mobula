@@ -78,6 +78,103 @@ desired → observed; `observed_state` is `null` until the first observation,
 then walks `provisioning → running`. The dashboard's state badge derives from
 `observed_state`, falling back to `desired`.
 
+## Trying pod shaping (#66)
+
+Pod shaping is what lets a cluster mount a home directory, set env vars, run
+as a service account or land on a GPU pool — with the deployment declaring
+what exists and the caller picking by name. It is off until a catalog is
+configured. Either seed one from a file:
+
+```bash
+cargo run -p mobula-cli -- serve --policy deploy/policy.toml   # …plus your usual flags
+```
+
+…or add one at runtime, with no restart (the catalog is a store row, Admin-only):
+
+```bash
+curl -s -X PUT $BASE/api/v1/settings/policy -H 'content-type: application/json' -d '{
+  "pod_shaping": {
+    "mounts": [{"name":"home","claim_name":"nebari-home",
+                "mount_path":"/home/ray","read_only":false,
+                "sub_path":"home/{project}"}],
+    "service_accounts": ["ray-workload"],
+    "default_mounts": ["home"]
+  }
+}' | jq .pod_shaping
+```
+
+An incoherent catalog is rejected here rather than later — try
+`{"pod_shaping":{"default_mounts":["home"]}}` with no `home` mount defined and
+you get a 400 explaining that every create would fail.
+
+`deploy/policy.toml` ships the same thing as a seed: a `home` mount, a
+read-only `shared` mount and a `gpu` placement. The claims it names do not
+exist in a bare kind cluster, so create one to try the mount end to end:
+
+```bash
+kubectl -n mobula-dev apply -f - <<'YAML'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nebari-home
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+YAML
+```
+
+Then create a cluster. `home` is in `default_mounts`, so it is applied
+without being asked for:
+
+```bash
+curl -s -X POST $BASE/api/v1/clusters -H 'content-type: application/json' -d '{
+  "id":"shaped",
+  "spec":{"name":"shaped","project":"dev","ray_version":"2.57.0",
+    "image":"rayproject/ray:2.57.0","head_cpu":"1","head_memory":"2560Mi",
+    "worker_groups":[],"ttl_seconds":null,
+    "pod":{"env":[{"name":"AWS_ENDPOINT_URL","value":"https://s3.example.com"}]}}
+}'
+
+# what the platform granted (note sub_path scopes the shared claim per project):
+curl -s $BASE/api/v1/clusters/shaped | jq .
+
+# what actually reached the pod:
+kubectl -n mobula-dev get raycluster shaped -o jsonpath=\
+'{.spec.headGroupSpec.template.spec.volumes[0]}{"\n"}'
+kubectl -n mobula-dev get pods -l ray.io/cluster=shaped \
+  -o jsonpath='{.items[0].spec.containers[0].volumeMounts}{"\n"}'
+```
+
+Editing the catalog does not disturb `shaped` — its grant is frozen on its
+spec. Clear the catalog and check:
+
+```bash
+curl -s -X PUT $BASE/api/v1/settings/policy -H 'content-type: application/json' \
+  -d '{"pod_shaping": {}}' >/dev/null
+curl -s $BASE/api/v1/clusters/shaped | jq .        # unchanged
+kubectl -n mobula-dev get raycluster shaped \
+  -o jsonpath='{.spec.headGroupSpec.template.spec.volumes}{"\n"}'   # still mounted
+```
+
+Re-POSTing the same cluster is the deliberate migration: it re-resolves
+against the current catalog, bumps the generation, and KubeRay rolls the pods.
+
+Asking for something the catalog does not offer is a 403, and nothing is
+stored:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/api/v1/clusters \
+  -H 'content-type: application/json' -d '{
+  "id":"nope",
+  "spec":{"name":"nope","project":"dev","ray_version":"2.57.0",
+    "image":"rayproject/ray:2.57.0","head_cpu":"1","head_memory":"2560Mi",
+    "worker_groups":[],"ttl_seconds":null,
+    "pod":{"mounts":["secrets"]}}
+}'   # → 403
+```
+
 ## Configuration
 
 Everything is env-overridable (defaults shown):

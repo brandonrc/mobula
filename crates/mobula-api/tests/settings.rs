@@ -56,6 +56,7 @@ fn seeded_policy() -> PolicyConfig {
             ])),
         )]),
         gpu_default_sharing: Default::default(),
+        pod_shaping: Default::default(),
     }
 }
 
@@ -377,4 +378,306 @@ async fn update_policy_is_audited() {
         actions.contains(&"update_policy"),
         "expected an update_policy audit row, got {actions:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Pod-shaping catalog (#66): live-editable, Admin-only, and never retroactive.
+// ---------------------------------------------------------------------------
+
+fn catalog_json(mount_path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "mounts": [{
+            "name": "home",
+            "claim_name": "nebari-home",
+            "mount_path": mount_path,
+            "read_only": false,
+            "sub_path": "home/{project}"
+        }],
+        "service_accounts": ["ray-workload"],
+        "default_mounts": ["home"]
+    })
+}
+
+fn plain_create(id: &str, project: &str) -> serde_json::Value {
+    create_body_sized(id, project, "1", 0)
+}
+
+async fn stored_shape(
+    store: &Arc<InMemoryStore>,
+    id: &str,
+) -> Option<mobula_core::ResolvedPodShape> {
+    use mobula_controller::Store;
+    store
+        .get(&mobula_core::ClusterId(id.to_string()))
+        .await
+        .unwrap()
+        .expect("cluster stored")
+        .spec
+        .pod_resolved
+}
+
+#[tokio::test]
+async fn a_catalog_added_at_runtime_governs_the_next_create() {
+    // The point of making this store-backed: adding a mount must not need a
+    // restart. The server here boots with NO pod shaping at all.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), Default::default()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            HOST,
+            &admin,
+            plain_create("before", "demo"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(
+        stored_shape(&store, "before").await,
+        None,
+        "no catalog yet, so nothing is granted"
+    );
+
+    let res = app
+        .clone()
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({ "pod_shaping": catalog_json("/home/ray") }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let view = body_json(res).await;
+    assert_eq!(
+        view["pod_shaping"]["mounts"][0]["claim_name"],
+        "nebari-home"
+    );
+    assert_eq!(view["source"], "store");
+
+    // No restart between these two lines.
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            HOST,
+            &admin,
+            plain_create("after", "demo"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let shape = stored_shape(&store, "after").await.expect("granted");
+    assert_eq!(shape.volumes[0].claim_name, "nebari-home");
+    assert_eq!(shape.volumes[0].mount_path, "/home/ray");
+}
+
+#[tokio::test]
+async fn editing_the_catalog_does_not_re_shape_an_existing_cluster() {
+    // The safety property that makes a live catalog acceptable: a cluster's
+    // grant is frozen onto its spec at admission. An edit cannot silently
+    // change what an already-admitted cluster mounts.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), Default::default()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    app.clone()
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({ "pod_shaping": catalog_json("/home/ray") }),
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            HOST,
+            &admin,
+            plain_create("c", "demo"),
+        ))
+        .await
+        .unwrap();
+    let before = stored_shape(&store, "c").await.expect("granted");
+    assert_eq!(before.volumes[0].mount_path, "/home/ray");
+
+    // Move the mount, then clear the catalog entirely.
+    app.clone()
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({ "pod_shaping": catalog_json("/mnt/elsewhere") }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_shape(&store, "c").await.as_ref(),
+        Some(&before),
+        "a catalog edit must not touch an admitted cluster's grant"
+    );
+
+    app.clone()
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({ "pod_shaping": {} }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_shape(&store, "c").await.as_ref(),
+        Some(&before),
+        "clearing the catalog must not strip a running cluster's mounts"
+    );
+
+    // Re-submitting is the deliberate migration: now it picks up the new
+    // catalog (here: emptied), which bumps the generation and rolls the pods.
+    app.oneshot(post_json(
+        "/api/v1/clusters",
+        HOST,
+        &admin,
+        plain_create("c", "demo"),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        stored_shape(&store, "c").await,
+        None,
+        "re-submitting migrates the cluster onto the current catalog"
+    );
+}
+
+#[tokio::test]
+async fn an_incoherent_catalog_is_rejected_at_the_edit() {
+    // `default_mounts` naming a mount that does not exist would 403 EVERY
+    // cluster create. Catch it where the mistake was made.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), Default::default()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .clone()
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({ "pod_shaping": { "default_mounts": ["home"] } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // And the bad catalog was not stored, so creates still work.
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            HOST,
+            &admin,
+            plain_create("c", "demo"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_traversing_sub_path_is_rejected_at_the_edit() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store, Default::default()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let mut catalog = catalog_json("/home/ray");
+    catalog["mounts"][0]["sub_path"] = serde_json::json!("home/{project}/../../root");
+    let res = app
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({ "pod_shaping": catalog }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn editing_the_catalog_is_admin_only() {
+    // A live catalog is a grant of data access, so a developer must not be
+    // able to add themselves a mount.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store, Default::default()).await;
+    let dev = idp_token(&idp, &["/ml-eng"]);
+
+    let res = app
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &dev,
+            serde_json::json!({ "pod_shaping": catalog_json("/home/ray") }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_pod_shaping_only_policy_file_still_seeds_a_row() {
+    // A deployment may configure ONLY pod shaping (no prices, no quotas).
+    // That has to materialize a store row, or the catalog could never be
+    // edited afterwards.
+    use mobula_policy::podshape::{MountEntry, PodShapeCatalog};
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let seed = PolicyConfig {
+        prices: None,
+        quotas: Default::default(),
+        gpu_default_sharing: Default::default(),
+        pod_shaping: PodShapeCatalog {
+            mounts: vec![MountEntry {
+                name: "home".into(),
+                claim_name: "nebari-home".into(),
+                mount_path: "/home/ray".into(),
+                read_only: false,
+                sub_path: None,
+            }],
+            default_mounts: vec!["home".into()],
+            ..Default::default()
+        },
+    };
+    let app = authed_app_with_policy(&idp, store, seed).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .clone()
+        .oneshot(get("/api/v1/settings/policy", HOST, Some(&admin)))
+        .await
+        .unwrap();
+    let view = body_json(res).await;
+    assert_eq!(view["source"], "file", "the file seed materialized a row");
+    assert_eq!(view["pod_shaping"]["mounts"][0]["name"], "home");
+
+    // Editing another section must not drop the seeded catalog.
+    let res = app
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({ "prices": { "cpu": 0.05 } }),
+        ))
+        .await
+        .unwrap();
+    let view = body_json(res).await;
+    assert_eq!(view["pod_shaping"]["mounts"][0]["name"], "home");
+    assert_eq!(view["source"], "store");
 }
