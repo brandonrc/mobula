@@ -111,6 +111,15 @@ pub struct ClusterView {
     pub est_min_hourly: Option<f64>,
     /// Estimated $/hr at max (fully scaled) size.
     pub est_max_hourly: Option<f64>,
+    /// The caller's pod-shaping selections (#66), as canonicalized at
+    /// admission. Absent when nothing was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod: Option<mobula_core::podspec::PodOverrides>,
+    /// The grant frozen at admission: what this cluster actually mounts,
+    /// runs as, and lands on. This is the answer to "what is this cluster
+    /// actually mounting" — it must be readable here, not only in the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_resolved: Option<mobula_core::podspec::ResolvedPodShape>,
 }
 
 impl ClusterView {
@@ -138,6 +147,8 @@ impl ClusterView {
             ray_version: c.spec.ray_version.clone(),
             est_min_hourly: cost.map(|c| c.min_hourly),
             est_max_hourly: cost.map(|c| c.max_hourly),
+            pod: c.spec.pod.clone(),
+            pod_resolved: c.spec.pod_resolved.clone(),
         }
     }
 }
@@ -359,7 +370,19 @@ async fn create_cluster(
         body.spec.pod.as_ref(),
         &body.spec.project,
     ) {
-        Ok(shape) => body.spec.pod_resolved = shape,
+        Ok(shape) => {
+            body.spec.pod_resolved = shape;
+            // Canonicalize the selections that were just authorized, so two
+            // requests that resolve identically also compare identically in
+            // `spec_changed`. Without this, a re-submit with an explicitly
+            // empty `pod`, a duplicated mount, or a default-implied mount
+            // bumps the generation — and a bump rolls head and every
+            // worker, killing in-flight Ray jobs for a no-op.
+            body.spec.pod = mobula_policy::podshape::canonical_overrides(
+                body.spec.pod.take(),
+                &policy.pod_shaping,
+            );
+        }
         Err(e) => {
             emit(
                 Some(&st.store),

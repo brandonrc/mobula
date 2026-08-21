@@ -632,6 +632,90 @@ async fn editing_the_catalog_is_admin_only() {
 }
 
 #[tokio::test]
+async fn a_changed_file_seed_refreshes_an_unedited_row_on_restart() {
+    // A `from_file_seed` row was never admin-edited, so the file stays
+    // authoritative: restarting with `[pod_shaping]` added to the same file
+    // must refresh the row. Without this, the operator's addition silently
+    // never applies while the boot log and GET (source:"file") both claim
+    // the file is in effect.
+    use mobula_policy::podshape::{MountEntry, PodShapeCatalog};
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+
+    // First boot: prices/quotas only. GET materializes the seed row.
+    let app = authed_app_with_policy(&idp, store.clone(), seeded_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+    let res = app
+        .oneshot(get("/api/v1/settings/policy", HOST, Some(&admin)))
+        .await
+        .unwrap();
+    let view = body_json(res).await;
+    assert_eq!(view["source"], "file");
+    assert!(view["pod_shaping"]["mounts"]
+        .as_array()
+        .is_none_or(|m| m.is_empty()));
+
+    // "Restart" with [pod_shaping] added to the same policy file.
+    let mut seed2 = seeded_policy();
+    seed2.pod_shaping = PodShapeCatalog {
+        mounts: vec![MountEntry {
+            name: "home".into(),
+            claim_name: "nebari-home".into(),
+            mount_path: "/home/ray".into(),
+            read_only: false,
+            sub_path: None,
+        }],
+        default_mounts: vec!["home".into()],
+        ..Default::default()
+    };
+    let app2 = authed_app_with_policy(&idp, store, seed2).await;
+    let res = app2
+        .oneshot(get("/api/v1/settings/policy", HOST, Some(&admin)))
+        .await
+        .unwrap();
+    let view = body_json(res).await;
+    assert_eq!(
+        view["pod_shaping"]["mounts"][0]["name"], "home",
+        "the changed file seed must refresh the unedited row"
+    );
+    assert_eq!(
+        view["source"], "file",
+        "an unedited row keeps file provenance"
+    );
+}
+
+#[tokio::test]
+async fn an_edited_row_is_never_clobbered_by_the_file_seed() {
+    // Once an Admin has PUT the policy, the store is truth and the file is
+    // history — a restart with any seed must not undo the edit.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+
+    let app = authed_app_with_policy(&idp, store.clone(), seeded_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+    let res = app
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({ "prices": { "cpu": 0.99 } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // "Restart" with the original (different) file seed.
+    let app2 = authed_app_with_policy(&idp, store, seeded_policy()).await;
+    let res = app2
+        .oneshot(get("/api/v1/settings/policy", HOST, Some(&admin)))
+        .await
+        .unwrap();
+    let view = body_json(res).await;
+    assert_eq!(view["source"], "store", "the edit survives the restart");
+    assert_eq!(view["prices"]["cpu"], 0.99);
+}
+
+#[tokio::test]
 async fn a_pod_shaping_only_policy_file_still_seeds_a_row() {
     // A deployment may configure ONLY pod shaping (no prices, no quotas).
     // That has to materialize a store row, or the catalog could never be

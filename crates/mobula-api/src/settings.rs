@@ -110,6 +110,23 @@ pub(crate) async fn effective_policy(
     seed: &PolicyConfig,
 ) -> Result<Option<StoredPolicy>, mobula_controller::StoreError> {
     if let Some(p) = store.get_policy().await? {
+        // A `from_file_seed` row was never admin-edited, so the file stays
+        // authoritative until the first PUT: a restart with a changed
+        // `--policy` file must refresh the row, or an operator's addition
+        // (say, `[pod_shaping]`) silently never applies while the boot log
+        // and GET (source:"file") both claim the file is in effect. An
+        // edited row (`from_file_seed: false`) is truth and is never
+        // touched. The read-compare-write here is not atomic; the window is
+        // a PUT racing the first requests after a restart with a changed
+        // file, and the PUT wins every request thereafter.
+        if p.from_file_seed {
+            if let Some(fresh) = seed_from_config(seed) {
+                if fresh != p {
+                    store.set_policy(&fresh).await?;
+                    return Ok(Some(fresh));
+                }
+            }
+        }
         return Ok(Some(p));
     }
     match seed_from_config(seed) {

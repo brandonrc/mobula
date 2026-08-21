@@ -5,6 +5,13 @@
 mod common;
 use common::{authed_app_with_policy, authed_app_with_store, get, idp_token, post_json, spawn_idp};
 
+async fn body_json(res: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use std::sync::Arc;
@@ -1562,4 +1569,136 @@ async fn no_catalog_means_no_shaping_and_no_refusals() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
     assert_eq!(stored_spec(&store, "a").await.pod_resolved, None);
+}
+
+#[tokio::test]
+async fn no_catalog_means_env_is_refused_too() {
+    // "Pod shaping switched off" must mean off for every field. Env is the
+    // one with no catalog names to trip on, so without an explicit refusal
+    // any Writer could inject LD_PRELOAD onto every container while the
+    // deployment believes shaping is disabled.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), Default::default()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let mut body = create_body("a");
+    body["spec"]["pod"] = serde_json::json!({
+        "env": [{ "name": "LD_PRELOAD", "value": "/tmp/x.so" }]
+    });
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(store.get(&ClusterId("a".into())).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_grant_is_readable_through_the_api() {
+    // "What is this cluster actually mounting" must be answerable from GET,
+    // not from direct store access (docs/api-v1.md §3.1.1, dev-stack.md).
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), shaping_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body("a"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/a",
+            "mobula.example.com",
+            Some(&admin),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let view = body_json(res).await;
+    assert_eq!(
+        view["pod_resolved"]["volumes"][0]["claim_name"],
+        "nebari-home"
+    );
+    assert_eq!(view["pod_resolved"]["volumes"][0]["sub_path"], "home/demo");
+}
+
+#[tokio::test]
+async fn a_noop_pod_resubmit_does_not_roll_the_cluster() {
+    // A re-submit whose resolution is byte-identical must not bump the
+    // generation: a bump changes the pod-template annotation and KubeRay
+    // rolls head and every worker, killing in-flight jobs for nothing.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), shaping_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body("a"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let g1 = store
+        .get(&ClusterId("a".into()))
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    // Explicitly-empty pod object: same resolution as absent.
+    let mut body = create_body("a");
+    body["spec"]["pod"] = serde_json::json!({});
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    // Redundantly requesting the default mount, twice: same resolution.
+    let mut body = create_body("a");
+    body["spec"]["pod"] = serde_json::json!({ "mounts": ["home", "home"] });
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    let g2 = store
+        .get(&ClusterId("a".into()))
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+    assert_eq!(g1, g2, "no-op re-submits must not bump the generation");
 }

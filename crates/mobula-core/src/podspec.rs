@@ -165,6 +165,29 @@ pub fn is_safe_path_segment(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// Whether `name` is a DNS-1123 label: lowercase alphanumerics and `-`,
+/// starting and ending alphanumeric, at most 63 characters.
+///
+/// Kubernetes requires this of pod-spec volume names, so a catalog mount
+/// name that fails it applies cleanly as a CR and then bricks every pod —
+/// the catalog edit is where it has to be caught.
+pub fn is_dns1123_label(name: &str) -> bool {
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    !name.is_empty()
+        && name.len() <= 63
+        && name.chars().all(|c| alnum(c) || c == '-')
+        && name.starts_with(alnum)
+        && name.ends_with(alnum)
+}
+
+/// Whether a mount sub-path is safe to hand the kubelet: relative, and
+/// never traversing upward. One definition, shared by catalog validation
+/// (with `{project}` unexpanded) and admission-time expansion — hardening
+/// this predicate must harden both sites at once.
+pub fn sub_path_is_safe(sub_path: &str) -> bool {
+    !sub_path.starts_with('/') && !sub_path.split('/').any(|seg| seg == "..")
+}
+
 /// Whether `name` is a legal environment-variable name. Kubernetes accepts
 /// a broader set, but C-identifier rules are what every shell and Python
 /// runtime can actually read back.
@@ -250,6 +273,21 @@ mod tests {
         assert!(!is_safe_path_segment("naïve"));
         assert!(!is_safe_path_segment(&"x".repeat(64)));
         assert!(is_safe_path_segment(&"x".repeat(63)));
+    }
+
+    #[test]
+    fn dns1123_label_accepts_only_what_kubernetes_will() {
+        assert!(is_dns1123_label("home"));
+        assert!(is_dns1123_label("gpu-a100"));
+        assert!(is_dns1123_label("x0"));
+        assert!(is_dns1123_label(&"x".repeat(63)));
+        assert!(!is_dns1123_label(""));
+        assert!(!is_dns1123_label("Home"));
+        assert!(!is_dns1123_label("home_dir"));
+        assert!(!is_dns1123_label("home dir"));
+        assert!(!is_dns1123_label("-home"));
+        assert!(!is_dns1123_label("home-"));
+        assert!(!is_dns1123_label(&"x".repeat(64)));
     }
 
     #[test]

@@ -26,8 +26,8 @@
 //! mistake was made rather than as a 403 on every subsequent create.
 
 use mobula_core::podspec::{
-    is_safe_path_segment, is_valid_env_name, EnvVar, PodOverrides, ResolvedPodShape, Toleration,
-    VolumeMount, RESERVED_ENV,
+    is_dns1123_label, is_safe_path_segment, is_valid_env_name, sub_path_is_safe, EnvVar,
+    PodOverrides, ResolvedPodShape, Toleration, VolumeMount, RESERVED_ENV,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -42,7 +42,14 @@ use utoipa::ToSchema;
 /// own subtree. Per-*user* home directories fall out of the same mechanism
 /// once each user has a default project (tracked separately, in the
 /// self-service work).
+// `deny_unknown_fields` on every catalog struct is deliberate, and an
+// exception to the workspace's tolerant-deserialization default: these
+// structs encode a data-access grant. An Admin typo like the Kubernetes
+// spelling `subPath` silently dropped would store a catalog that mounts the
+// shared home claim unscoped for every project — a typo must be a refusal,
+// never a wider grant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MountEntry {
     pub name: String,
     pub claim_name: String,
@@ -55,6 +62,7 @@ pub struct MountEntry {
 
 /// A named placement: where pods land, and what taints they tolerate.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlacementEntry {
     pub name: String,
     #[serde(default)]
@@ -67,6 +75,7 @@ pub struct PlacementEntry {
 /// defaults to `Equal` and `effect` to `NoSchedule`, which is what a taint
 /// on a GPU pool almost always is.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TolerationEntry {
     pub key: String,
     #[serde(default = "default_operator")]
@@ -100,6 +109,7 @@ impl From<&TolerationEntry> for Toleration {
 /// pod shaping is switched off: any request for it is refused, and clusters
 /// render exactly as they did before #66.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PodShapeCatalog {
     #[serde(default)]
     pub mounts: Vec<MountEntry>,
@@ -156,6 +166,16 @@ impl PodShapeCatalog {
             if m.name.is_empty() {
                 return Err(CatalogError::EmptyName("mount"));
             }
+            // The catalog name is reused as the pod-spec volume name, which
+            // Kubernetes requires to be a DNS-1123 label. Anything else
+            // applies cleanly as a CR and then fails every pod, with the
+            // cluster stuck in provisioning — so the edit is where it fails.
+            if !is_dns1123_label(&m.name) {
+                return Err(CatalogError::BadName {
+                    kind: "mount",
+                    name: m.name.clone(),
+                });
+            }
             if m.claim_name.is_empty() {
                 return Err(CatalogError::MissingField {
                     entry: m.name.clone(),
@@ -172,7 +192,7 @@ impl PodShapeCatalog {
             // admission: `{project}` is still unexpanded, so this catches the
             // authoring mistake independent of any project name.
             if let Some(sp) = &m.sub_path {
-                if sp.starts_with('/') || sp.split('/').any(|seg| seg == "..") {
+                if !sub_path_is_safe(sp) {
                     return Err(CatalogError::BadSubPath {
                         mount: m.name.clone(),
                         sub_path: sp.clone(),
@@ -185,6 +205,10 @@ impl PodShapeCatalog {
                 kind: "mount",
                 name: n,
             });
+        }
+        // Two mounts at one path render a pod spec Kubernetes refuses.
+        if let Some(p) = dup(self.mounts.iter().map(|m| m.mount_path.clone())) {
+            return Err(CatalogError::DuplicateMountPath { path: p });
         }
 
         for pl in &self.placements {
@@ -233,6 +257,14 @@ impl PodShapeCatalog {
             });
         }
 
+        // A repeated default renders duplicate volumes, which Kubernetes
+        // refuses — every create would 201 and then hang in provisioning.
+        if let Some(n) = dup(self.default_mounts.iter().cloned()) {
+            return Err(CatalogError::DuplicateName {
+                kind: "default mount",
+                name: n,
+            });
+        }
         // The defaults must resolve, or every create fails.
         for d in &self.default_mounts {
             if !self.mounts.iter().any(|m| &m.name == d) {
@@ -267,6 +299,13 @@ impl PodShapeCatalog {
 pub enum CatalogError {
     #[error("a {0} entry has an empty name")]
     EmptyName(&'static str),
+    #[error(
+        "{kind} name {name:?} is not a DNS-1123 label (lowercase alphanumerics and '-', \
+         at most 63 chars) — Kubernetes would reject the pod it renders into"
+    )]
+    BadName { kind: &'static str, name: String },
+    #[error("two mounts share mount_path {path:?} — Kubernetes would reject the pod")]
+    DuplicateMountPath { path: String },
     #[error("{kind} {name:?} is defined more than once")]
     DuplicateName { kind: &'static str, name: String },
     #[error("mount {entry:?} is missing {field}")]
@@ -303,6 +342,8 @@ pub enum PodShapeError {
     UnsafeProject(String),
     #[error("mount {mount:?} is misconfigured: {reason}")]
     BadCatalogEntry { mount: String, reason: String },
+    #[error("pod shaping is not enabled on this deployment")]
+    ShapingDisabled,
 }
 
 /// The default mounts plus whatever the caller named, de-duplicated,
@@ -340,8 +381,9 @@ fn expand_sub_path(entry: &MountEntry, project: &str) -> Result<Option<String>, 
     let expanded = raw.replace("{project}", project);
     // A sub-path is joined onto the volume root by the kubelet; anything
     // that climbs out of it is a catalog authoring bug, and it must not
-    // reach the cluster regardless of how it got there.
-    if expanded.starts_with('/') || expanded.split('/').any(|seg| seg == "..") {
+    // reach the cluster regardless of how it got there. Same predicate as
+    // `validate()` — one definition, so hardening one site hardens both.
+    if !sub_path_is_safe(&expanded) {
         return Err(PodShapeError::BadCatalogEntry {
             mount: entry.name.clone(),
             reason: format!("sub_path {expanded:?} must be relative and must not traverse upward"),
@@ -382,6 +424,16 @@ pub fn resolve(
     project: &str,
 ) -> Result<Option<ResolvedPodShape>, PodShapeError> {
     let requested = overrides.cloned().unwrap_or_default();
+
+    // An empty catalog means pod shaping is switched off — for EVERY field.
+    // Mounts, placements and service accounts already fail on their unknown
+    // names, but env has no catalog name to trip on: without this guard a
+    // caller could inject env vars (LD_PRELOAD, proxy settings, …) onto
+    // every container while the deployment believes shaping is disabled and
+    // its manifests are byte-identical to the pre-#66 form.
+    if catalog.is_empty() && !requested.is_empty() {
+        return Err(PodShapeError::ShapingDisabled);
+    }
 
     let mounts = selected_mounts(catalog, &requested.mounts)?;
     let mut volumes = Vec::with_capacity(mounts.len());
@@ -432,6 +484,35 @@ pub fn resolve(
             .unwrap_or_default(),
     };
     Ok((!shape.is_empty()).then_some(shape))
+}
+
+/// Canonicalize the caller's selections before they are persisted, so two
+/// requests that resolve identically also *compare* identically.
+///
+/// `spec_changed` compares the stored selections; without canonicalization a
+/// re-submit with an explicitly-empty `pod`, a duplicated mount name, or a
+/// mount the defaults already imply would bump the generation — and a
+/// generation bump rolls head and every worker, killing in-flight Ray jobs
+/// for a change with zero effect on the manifest.
+///
+/// Env is deliberately left untouched: Kubernetes expands `$(VAR)`
+/// references in declaration order, so env order is caller-meaningful.
+///
+/// Call this only after [`resolve`] has succeeded — it assumes the names
+/// have already been authorized.
+pub fn canonical_overrides(
+    overrides: Option<PodOverrides>,
+    catalog: &PodShapeCatalog,
+) -> Option<PodOverrides> {
+    let mut p = overrides?;
+    // Default mounts apply whether or not they are named, so naming one
+    // adds nothing to the resolution.
+    p.mounts.retain(|m| !catalog.default_mounts.contains(m));
+    // Mount order is not meaningful: defaults resolve first regardless, and
+    // the catalog forbids two mounts at one path.
+    p.mounts.sort();
+    p.mounts.dedup();
+    (!p.is_empty()).then_some(p)
 }
 
 #[cfg(test)]
@@ -838,6 +919,142 @@ mod tests {
             }),
             Err(CatalogError::BadToleration { .. })
         ));
+    }
+
+    #[test]
+    fn duplicate_default_mounts_are_rejected() {
+        // A repeated default renders duplicate volumes, the API server
+        // rejects every pod, and every create hangs in provisioning — a
+        // catalog bug, so the edit is where it must fail.
+        let c = PodShapeCatalog {
+            default_mounts: vec!["home".into(), "home".into()],
+            ..catalog()
+        };
+        assert_eq!(
+            c.validate(),
+            Err(CatalogError::DuplicateName {
+                kind: "default mount",
+                name: "home".into()
+            })
+        );
+    }
+
+    #[test]
+    fn mount_names_must_be_dns1123_labels() {
+        // The catalog name becomes the pod-spec volume name, which
+        // Kubernetes requires to be a DNS-1123 label; anything else applies
+        // cleanly as a CR and then bricks every pod.
+        let long = "x".repeat(64);
+        for bad in ["Home_Dir", "home dir", "HOME", "-x", "x-", long.as_str()] {
+            let c = PodShapeCatalog {
+                mounts: vec![MountEntry {
+                    name: bad.into(),
+                    ..home()
+                }],
+                ..Default::default()
+            };
+            assert!(
+                matches!(c.validate(), Err(CatalogError::BadName { .. })),
+                "mount name {bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn colliding_mount_paths_are_rejected() {
+        // Two mounts at the same path render a pod spec Kubernetes refuses.
+        let c = PodShapeCatalog {
+            mounts: vec![
+                home(),
+                MountEntry {
+                    name: "data".into(),
+                    mount_path: "/home/ray".into(),
+                    ..shared()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            c.validate(),
+            Err(CatalogError::DuplicateMountPath {
+                path: "/home/ray".into()
+            })
+        );
+    }
+
+    #[test]
+    fn empty_catalog_refuses_env() {
+        // "Pod shaping switched off" must mean off for env too, or a caller
+        // can inject LD_PRELOAD onto every container of every cluster while
+        // the deployment believes shaping is disabled.
+        let c = PodShapeCatalog::default();
+        let o = PodOverrides {
+            env: vec![EnvVar {
+                name: "LD_PRELOAD".into(),
+                value: "/tmp/x.so".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(&c, Some(&o), "p"),
+            Err(PodShapeError::ShapingDisabled)
+        );
+    }
+
+    #[test]
+    fn catalog_rejects_unknown_fields() {
+        // "subPath" instead of sub_path would silently unscope the shared
+        // home claim for every project. This struct encodes a data-access
+        // grant: a typo must be a refusal, never a wider grant.
+        let j = serde_json::json!({
+            "mounts": [{
+                "name": "home",
+                "claim_name": "nebari-home",
+                "mount_path": "/home/ray",
+                "subPath": "home/{project}"
+            }]
+        });
+        assert!(serde_json::from_value::<PodShapeCatalog>(j).is_err());
+        // Same for the top level and placements.
+        assert!(serde_json::from_value::<PodShapeCatalog>(
+            serde_json::json!({ "defaultMounts": ["home"] })
+        )
+        .is_err());
+        assert!(serde_json::from_value::<PodShapeCatalog>(serde_json::json!({
+            "placements": [{ "name": "gpu", "tolerations": [{ "key": "k", "Operator": "Exists" }] }]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn canonical_overrides_collapses_noop_selections() {
+        // Two requests that resolve identically must compare identically,
+        // or a no-op re-submit bumps the generation and rolls every pod.
+        let c = catalog();
+        // Explicitly-empty is the same as absent.
+        assert_eq!(canonical_overrides(Some(PodOverrides::default()), &c), None);
+        // Duplicates and default-implied names collapse; order is canonical.
+        let o = PodOverrides {
+            mounts: vec!["shared".into(), "home".into(), "shared".into()],
+            ..Default::default()
+        };
+        let canon = canonical_overrides(Some(o), &c).unwrap();
+        assert_eq!(canon.mounts, vec!["shared".to_string()]);
+        // A request that is nothing but default-implied mounts is absent.
+        let o = PodOverrides {
+            mounts: vec!["home".into(), "home".into()],
+            ..Default::default()
+        };
+        assert_eq!(canonical_overrides(Some(o), &c), None);
+        // Env and other fields survive untouched.
+        let o = PodOverrides {
+            env: vec![EnvVar {
+                name: "A".into(),
+                value: "1".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(canonical_overrides(Some(o.clone()), &c), Some(o));
     }
 
     #[test]
