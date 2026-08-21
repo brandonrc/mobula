@@ -1,3 +1,4 @@
+use crate::podspec::{PodOverrides, ResolvedPodShape};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -31,6 +32,21 @@ pub struct ClusterSpec {
     pub worker_groups: Vec<WorkerGroup>,
     /// Idle TTL in seconds; `None` disables reaping.
     pub ttl_seconds: Option<u64>,
+    /// What the caller asked for in pod shaping: literal env vars, plus
+    /// names selected from the platform catalog (#66). Inert on its own —
+    /// [`Self::pod_resolved`] is what actually reaches a pod template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod: Option<PodOverrides>,
+    /// The platform's resolution of [`Self::pod`]: concrete claims, mount
+    /// paths, service account, selectors and tolerations.
+    ///
+    /// **Server-computed.** The API overwrites this on every create and
+    /// update from the catalog; a value supplied by a client is discarded.
+    /// It lives on the spec so the KubeRay translation stays a pure
+    /// function of the spec, and so a later catalog edit cannot re-shape a
+    /// cluster that was already admitted under different rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_resolved: Option<ResolvedPodShape>,
 }
 
 /// A homogeneous group of Ray worker nodes.

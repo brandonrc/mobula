@@ -320,6 +320,8 @@ fn cluster_spec(project: &str) -> ClusterSpec {
         head_memory: "2Gi".into(),
         worker_groups: vec![],
         ttl_seconds: None,
+        pod: None,
+        pod_resolved: None,
     }
 }
 

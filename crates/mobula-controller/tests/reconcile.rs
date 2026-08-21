@@ -170,6 +170,8 @@ fn spec(name: &str, replicas: u32) -> ClusterSpec {
             replicas,
         }],
         ttl_seconds: None,
+        pod: None,
+        pod_resolved: None,
     }
 }
 

@@ -22,3 +22,46 @@ research = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
 # only: not editable via PUT /api/v1/settings/policy.
 [gpu]
 default_sharing = "whole-gpu"
+
+# Pod shaping (#66): what callers may select when creating a cluster. The
+# platform declares what exists here; a caller picks by name and anything
+# unlisted is refused with 403.
+#
+# This section is the SEED, not the final word: it is written into the store
+# on first boot and is Admin-editable from there via
+# PUT /api/v1/settings/policy, so adding a mount does not need a restart.
+# Once the store row exists this file is ignored — edit through the API (or
+# clear the row) rather than expecting a file change to take effect.
+#
+# Editing the catalog never re-shapes a running cluster: each cluster's grant
+# is frozen onto its spec at admission and only changes if it is re-submitted.
+# Note the flip side: whoever holds the Mobula Admin role can grant any PVC in
+# the namespace to any project's pods. Every edit is audited.
+[pod_shaping]
+# Applied to every cluster whether or not it asks: this is how "Ray workers
+# always see the user's environment" is configured.
+default_mounts = ["home"]
+service_accounts = ["ray-workload"]
+
+# The home directory, scoped per project. `{project}` expands to the
+# cluster's project, so one shared home volume does not hand every cluster
+# every project's files. Point `claim_name` at whatever claim the platform
+# uses for home directories.
+[[pod_shaping.mounts]]
+name = "home"
+claim_name = "nebari-home"
+mount_path = "/home/ray"
+sub_path = "home/{project}"
+
+# A read-only shared dataset volume, opt-in per cluster.
+[[pod_shaping.mounts]]
+name = "shared"
+claim_name = "nebari-shared"
+mount_path = "/shared"
+read_only = true
+
+# Named placements: where pods land, and what taints they tolerate.
+[[pod_shaping.placements]]
+name = "gpu"
+node_selector = { "nvidia.com/gpu.present" = "true" }
+tolerations = [{ key = "nvidia.com/gpu", operator = "Exists" }]

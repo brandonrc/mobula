@@ -28,6 +28,8 @@ fn spec(name: &str, replicas: u32) -> ClusterSpec {
             replicas,
         }],
         ttl_seconds: None,
+        pod: None,
+        pod_resolved: None,
     }
 }
 
@@ -1060,6 +1062,7 @@ async fn policy_conformance(store: &dyn Store) {
             "ml-team".to_string(),
             BTreeMap::from([("cpu".to_string(), 500.0)]),
         )]),
+        pod_shaping: Default::default(),
         from_file_seed: seed,
     };
 
@@ -1091,6 +1094,7 @@ async fn policy_seed_conformance(store: &dyn Store) {
             "demo".to_string(),
             BTreeMap::from([("cpu".to_string(), 5.0)]),
         )]),
+        pod_shaping: Default::default(),
         from_file_seed: true,
     };
     assert!(store.seed_policy(&seed).await.unwrap());

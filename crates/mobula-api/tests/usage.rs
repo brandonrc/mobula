@@ -46,6 +46,7 @@ fn priced_policy() -> mobula_api::clusters::PolicyConfig {
         ]))),
         quotas: HashMap::new(),
         gpu_default_sharing: Default::default(),
+        pod_shaping: Default::default(),
     }
 }
 

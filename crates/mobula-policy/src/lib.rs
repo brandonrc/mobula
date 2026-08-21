@@ -12,6 +12,7 @@
 //! `nvidia.com/gpu` (devices).
 
 pub mod gpu;
+pub mod podshape;
 pub mod quantity;
 pub mod usage;
 
@@ -241,6 +242,8 @@ mod tests {
                 replicas: min,
             }],
             ttl_seconds: None,
+            pod: None,
+            pod_resolved: None,
         }
     }
 

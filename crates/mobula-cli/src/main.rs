@@ -194,9 +194,23 @@ async fn main() -> std::io::Result<()> {
                             format!("invalid policy file {}: {e}", path.display()),
                         )
                     })?;
+                    // An incoherent pod-shaping catalog (#66) would 403 every
+                    // cluster create — e.g. a `default_mounts` entry with no
+                    // matching mount. Fail at boot rather than at first use.
+                    cfg.pod_shaping.validate().map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid [pod_shaping] in policy file {}: {e}",
+                                path.display()
+                            ),
+                        )
+                    })?;
                     tracing::info!(
                         prices = cfg.prices.as_ref().map(|p| p.0.len()).unwrap_or(0),
                         quotas = cfg.quotas.len(),
+                        mounts = cfg.pod_shaping.mounts.len(),
+                        placements = cfg.pod_shaping.placements.len(),
                         "governance policy loaded"
                     );
                     cfg
@@ -668,7 +682,10 @@ async fn start_demo<S: mobula_controller::Store + 'static>(
 /// `[quotas] project = { resource = amount }` (Phase 4 governance), and
 /// `[gpu] default_sharing = "whole-gpu" | "mig" | "time-slice"` (#58 — the
 /// platform fallback for pool specs that leave `gpu_sharing` unset;
-/// boot-time only, never seeded into the store).
+/// boot-time only, never seeded into the store), and `[pod_shaping]` (#66 —
+/// the mounts, placements and service accounts callers may select; this one
+/// IS seeded into the store and is Admin-editable from there, so the file is
+/// its default rather than its final word).
 fn parse_policy(raw: &str) -> Result<mobula_api::clusters::PolicyConfig, toml::de::Error> {
     #[derive(serde::Deserialize)]
     struct GpuSection {
@@ -680,12 +697,14 @@ fn parse_policy(raw: &str) -> Result<mobula_api::clusters::PolicyConfig, toml::d
         prices: Option<mobula_policy::PriceSheet>,
         quotas: Option<std::collections::HashMap<String, mobula_policy::ResourceMap>>,
         gpu: Option<GpuSection>,
+        pod_shaping: Option<mobula_policy::podshape::PodShapeCatalog>,
     }
     let parsed: PolicyFile = toml::from_str(raw)?;
     Ok(mobula_api::clusters::PolicyConfig {
         prices: parsed.prices,
         quotas: parsed.quotas.unwrap_or_default(),
         gpu_default_sharing: parsed.gpu.map(|g| g.default_sharing).unwrap_or_default(),
+        pod_shaping: parsed.pod_shaping.unwrap_or_default(),
     })
 }
 
@@ -1262,6 +1281,45 @@ dev = { cpu = 200, memory = 400, "nvidia.com/gpu" = 8 }
         assert_eq!(cfg.gpu_default_sharing, mobula_core::GpuSharing::WholeGpu);
         assert!(parse_policy("prices = 'nope'").is_err());
         assert!(parse_policy("").is_ok(), "empty file = no governance");
+    }
+
+    #[test]
+    fn parse_policy_reads_pod_shaping() {
+        let cfg = parse_policy(
+            r#"
+            [pod_shaping]
+            default_mounts = ["home"]
+            service_accounts = ["ray-workload"]
+
+            [[pod_shaping.mounts]]
+            name = "home"
+            claim_name = "nebari-home"
+            mount_path = "/home/ray"
+            sub_path = "home/{project}"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.pod_shaping.mounts.len(), 1);
+        assert_eq!(cfg.pod_shaping.default_mounts, vec!["home".to_string()]);
+        // No section at all = pod shaping switched off.
+        assert!(parse_policy("").unwrap().pod_shaping.is_empty());
+    }
+
+    #[test]
+    /// The config we ship must actually load — a policy file that fails to
+    /// parse takes the whole server down at boot.
+    fn shipped_demo_policy_parses() {
+        let raw = include_str!("../../../deploy/policy.toml");
+        let cfg = parse_policy(raw).expect("deploy/policy.toml must parse");
+        // Boot rejects an incoherent catalog, so the config we ship must pass
+        // the same check.
+        cfg.pod_shaping
+            .validate()
+            .expect("deploy/policy.toml pod_shaping must validate");
+        assert!(
+            cfg.pod_shaping.mounts.iter().any(|m| m.name == "home"),
+            "the demo policy should ship the home mount the Ray discussion settled on"
+        );
     }
 
     #[test]

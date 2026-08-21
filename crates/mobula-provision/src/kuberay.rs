@@ -10,7 +10,8 @@
 //! top of these functions.
 
 use mobula_core::{
-    ClusterId, ClusterSpec, ClusterState, ServiceSpec, UpgradeStrategy, WorkerGroup,
+    ClusterId, ClusterSpec, ClusterState, ResolvedPodShape, ServiceSpec, UpgradeStrategy,
+    WorkerGroup,
 };
 use serde_json::{json, Value};
 
@@ -68,7 +69,15 @@ pub fn to_raycluster(
     let worker_specs: Vec<Value> = spec
         .worker_groups
         .iter()
-        .map(|g| worker_group_spec(g, &spec.image, autoscaling, Some(generation)))
+        .map(|g| {
+            worker_group_spec(
+                g,
+                &spec.image,
+                autoscaling,
+                Some(generation),
+                spec.pod_resolved.as_ref(),
+            )
+        })
         .collect();
 
     let mut labels = json!({
@@ -118,6 +127,13 @@ pub fn to_raycluster(
 /// drift. `name`/`project`/`ttl` are control-plane metadata, not on the CR.
 /// Both [`to_raycluster`] (implicitly) and [`fingerprint_from_cr`] project the
 /// same shape, so an out-of-band edit of an owned field changes the result.
+///
+/// Pod shaping (#66) is included per group — head *and* every worker — and
+/// both sides derive it through [`shape_from_pod_template`]: here by
+/// projecting the templates this module would render, there by projecting
+/// the live ones. Going through the same projection is what keeps the two
+/// symmetric: an out-of-band edit that strips a mount or swaps the service
+/// account reads as drift, and a round-trip of our own manifest never does.
 pub fn owned_spec_fingerprint(spec: &ClusterSpec) -> String {
     let workers: Vec<Value> = spec
         .worker_groups
@@ -126,6 +142,18 @@ pub fn owned_spec_fingerprint(spec: &ClusterSpec) -> String {
             json!({
                 "name": g.name, "cpu": g.cpu, "memory": g.memory, "gpu": g.gpu,
                 "min": g.min_replicas, "max": g.max_replicas,
+                // Per-group, not just head: the same shape is applied to
+                // every group, so an edit that strips a mount from ONE
+                // worker group would otherwise be invisible.
+                // `autoscaling: true` only suppresses `replicas`, which
+                // the projection never reads.
+                "pod": shape_from_pod_template(&worker_group_spec(
+                    g,
+                    &spec.image,
+                    true,
+                    None,
+                    spec.pod_resolved.as_ref(),
+                )),
             })
         })
         .collect();
@@ -135,6 +163,7 @@ pub fn owned_spec_fingerprint(spec: &ClusterSpec) -> String {
         "head_cpu": spec.head_cpu,
         "head_memory": spec.head_memory,
         "workers": workers,
+        "pod": shape_from_pod_template(&head_group_spec(spec, None)),
     })
     .to_string()
 }
@@ -160,6 +189,7 @@ pub fn fingerprint_from_cr(cr_spec: &Value) -> Option<String> {
                         "cpu": cpu,
                         "memory": memory,
                         "gpu": container_gpu(g),
+                        "pod": shape_from_pod_template(g),
                         "min": g.get("minReplicas").and_then(|v| v.as_u64()).unwrap_or(0),
                         "max": g.get("maxReplicas").and_then(|v| v.as_u64()).unwrap_or(0),
                     }))
@@ -174,6 +204,7 @@ pub fn fingerprint_from_cr(cr_spec: &Value) -> Option<String> {
             "head_cpu": head_cpu,
             "head_memory": head_memory,
             "workers": workers,
+            "pod": shape_from_pod_template(head),
         })
         .to_string(),
     )
@@ -223,6 +254,7 @@ fn head_group_spec(spec: &ClusterSpec, generation: Option<u64>) -> Value {
             &spec.head_memory,
             None,
             generation,
+            spec.pod_resolved.as_ref(),
         ),
     })
 }
@@ -232,6 +264,7 @@ fn worker_group_spec(
     image: &str,
     autoscaling: bool,
     generation: Option<u64>,
+    shape: Option<&ResolvedPodShape>,
 ) -> Value {
     // Workers run the cluster image (Kubernetes requires an image on every
     // container; KubeRay does NOT copy the head image onto worker groups,
@@ -241,7 +274,15 @@ fn worker_group_spec(
         "minReplicas": g.min_replicas,
         "maxReplicas": g.max_replicas,
         "rayStartParams": {},
-        "template": pod_template("ray-worker", image, &g.cpu, &g.memory, g.gpu.as_deref(), generation),
+        "template": pod_template(
+            "ray-worker",
+            image,
+            &g.cpu,
+            &g.memory,
+            g.gpu.as_deref(),
+            generation,
+            shape,
+        ),
     });
     // ADR-0007: only set `replicas` when we own it (autoscaling off). With
     // the in-tree autoscaler on, the sidecar owns replicas + scaleStrategy;
@@ -259,6 +300,7 @@ fn pod_template(
     memory: &str,
     gpu: Option<&str>,
     generation: Option<u64>,
+    shape: Option<&ResolvedPodShape>,
 ) -> Value {
     let mut limits = json!({ "cpu": cpu, "memory": memory });
     let mut requests = json!({ "cpu": cpu, "memory": memory });
@@ -275,7 +317,13 @@ fn pod_template(
     if !image.is_empty() {
         container["image"] = json!(image);
     }
-    let mut template = json!({ "spec": { "containers": [container] } });
+    let mut pod_spec = json!({ "containers": [container] });
+    // Pod shaping (#66). Absent or empty leaves the manifest byte-identical
+    // to the pre-#66 form, so an unconfigured deployment sees no change.
+    if let Some(s) = shape.filter(|s| !s.is_empty()) {
+        apply_pod_shape(&mut pod_spec, s);
+    }
+    let mut template = json!({ "spec": pod_spec });
     // Stamp the generation into the pod template so a spec bump changes the
     // template hash and KubeRay rolls the pods (#40). Services pass None —
     // KubeRay's RayService controller owns their rollout, not Mobula.
@@ -285,6 +333,109 @@ fn pod_template(
         });
     }
     template
+}
+
+/// Render an already-authorized [`ResolvedPodShape`] into a pod spec: env
+/// and volume mounts onto every container, volumes/serviceAccountName/
+/// nodeSelector/tolerations onto the pod.
+///
+/// Nothing here validates: by the time a shape reaches this function the
+/// policy layer has already decided the caller may have it
+/// (`mobula_policy::podshape::resolve`). Keeping the check upstream is what
+/// lets this stay a pure rendering step.
+fn apply_pod_shape(pod_spec: &mut Value, shape: &ResolvedPodShape) {
+    if !shape.env.is_empty() || !shape.volumes.is_empty() {
+        let env: Vec<Value> = shape
+            .env
+            .iter()
+            .map(|e| json!({ "name": e.name, "value": e.value }))
+            .collect();
+        let mounts: Vec<Value> = shape
+            .volumes
+            .iter()
+            .map(|v| {
+                let mut m = json!({
+                    "name": v.name,
+                    "mountPath": v.mount_path,
+                    "readOnly": v.read_only,
+                });
+                if let Some(sp) = &v.sub_path {
+                    m["subPath"] = json!(sp);
+                }
+                m
+            })
+            .collect();
+        if let Some(containers) = pod_spec
+            .get_mut("containers")
+            .and_then(|c| c.as_array_mut())
+        {
+            for c in containers {
+                if !env.is_empty() {
+                    c["env"] = json!(env);
+                }
+                if !mounts.is_empty() {
+                    c["volumeMounts"] = json!(mounts);
+                }
+            }
+        }
+    }
+    if !shape.volumes.is_empty() {
+        pod_spec["volumes"] = json!(shape
+            .volumes
+            .iter()
+            .map(|v| json!({
+                "name": v.name,
+                "persistentVolumeClaim": {
+                    "claimName": v.claim_name,
+                    "readOnly": v.read_only,
+                },
+            }))
+            .collect::<Vec<_>>());
+    }
+    if let Some(sa) = &shape.service_account {
+        pod_spec["serviceAccountName"] = json!(sa);
+    }
+    if !shape.node_selector.is_empty() {
+        pod_spec["nodeSelector"] = json!(shape.node_selector);
+    }
+    if !shape.tolerations.is_empty() {
+        pod_spec["tolerations"] = json!(shape
+            .tolerations
+            .iter()
+            .map(|t| {
+                let mut v = json!({
+                    "key": t.key,
+                    "operator": t.operator,
+                    "effect": t.effect,
+                });
+                if let Some(val) = &t.value {
+                    v["value"] = json!(val);
+                }
+                v
+            })
+            .collect::<Vec<_>>());
+    }
+}
+
+/// Project the pod shaping back out of a live pod template, so
+/// [`fingerprint_from_cr`] compares the same shape [`owned_spec_fingerprint`]
+/// projects. Reads the first container (matching [`pod_template`]) plus the
+/// pod-level fields.
+fn shape_from_pod_template(group: &Value) -> Value {
+    let spec = group.get("template").and_then(|t| t.get("spec"));
+    let container = first_container(group);
+    let list = |v: Option<&Value>| v.and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    json!({
+        "env": list(container.and_then(|c| c.get("env"))),
+        "volumeMounts": list(container.and_then(|c| c.get("volumeMounts"))),
+        "volumes": list(spec.and_then(|s| s.get("volumes"))),
+        "serviceAccountName": spec
+            .and_then(|s| s.get("serviceAccountName"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        "nodeSelector": spec.and_then(|s| s.get("nodeSelector")).cloned().unwrap_or(json!({})),
+        "tolerations": list(spec.and_then(|s| s.get("tolerations"))),
+    })
 }
 
 pub const SERVICE_KIND: &str = "RayService";
@@ -484,11 +635,19 @@ pub fn to_rayservice(name: &str, spec: &ServiceSpec) -> Value {
                 "rayVersion": spec.ray_version,
                 "headGroupSpec": {
                     "rayStartParams": { "dashboard-host": "0.0.0.0" },
-                    "template": pod_template("ray-head", &spec.image, &spec.head_cpu, &spec.head_memory, None, None),
+                    "template": pod_template(
+                        "ray-head",
+                        &spec.image,
+                        &spec.head_cpu,
+                        &spec.head_memory,
+                        None,
+                        None,
+                        None,
+                    ),
                 },
                 // Serve worker replicas are fixed here; Serve autoscaling is
                 // Ray Serve's own concern (deployment num_replicas).
-                "workerGroupSpecs": [worker_group_spec(&worker, &spec.image, false, None)],
+                "workerGroupSpecs": [worker_group_spec(&worker, &spec.image, false, None, None)],
             },
         },
     })
@@ -580,6 +739,155 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Pod shaping (#66)
+    // -----------------------------------------------------------------
+
+    fn shape() -> ResolvedPodShape {
+        use mobula_core::podspec::{EnvVar, Toleration, VolumeMount};
+        ResolvedPodShape {
+            env: vec![EnvVar {
+                name: "AWS_ENDPOINT_URL".into(),
+                value: "https://s3.example.com".into(),
+            }],
+            volumes: vec![VolumeMount {
+                name: "home".into(),
+                claim_name: "nebari-home".into(),
+                mount_path: "/home/ray".into(),
+                read_only: false,
+                sub_path: Some("home/ml-team".into()),
+            }],
+            service_account: Some("ray-workload".into()),
+            node_selector: std::collections::BTreeMap::from([(
+                "accelerator".to_string(),
+                "a100".to_string(),
+            )]),
+            tolerations: vec![Toleration {
+                key: "nvidia.com/gpu".into(),
+                operator: "Exists".into(),
+                value: None,
+                effect: "NoSchedule".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn no_shape_leaves_the_manifest_untouched() {
+        // A deployment that configures no pod shaping must produce exactly
+        // the manifest it produced before #66.
+        let mut s = spec(&[("w", 1, 1, 1)]);
+        let without = to_raycluster(&ClusterId("c".into()), &s, false, 1, None);
+        s.pod_resolved = Some(ResolvedPodShape::default());
+        let empty_shape = to_raycluster(&ClusterId("c".into()), &s, false, 1, None);
+        assert_eq!(without, empty_shape, "an empty shape must add nothing");
+    }
+
+    #[test]
+    fn shape_reaches_head_and_every_worker() {
+        // The whole point of the meeting's decision is that WORKERS see the
+        // environment; a mount that only lands on the head is useless.
+        let mut s = spec(&[("w1", 1, 1, 1), ("w2", 0, 2, 0)]);
+        s.pod_resolved = Some(shape());
+        let cr = to_raycluster(&ClusterId("c".into()), &s, false, 7, None);
+
+        let head = &cr["spec"]["headGroupSpec"]["template"]["spec"];
+        let workers = cr["spec"]["workerGroupSpecs"].as_array().unwrap();
+        assert_eq!(workers.len(), 2);
+
+        for pod in std::iter::once(head).chain(workers.iter().map(|w| &w["template"]["spec"])) {
+            let c = &pod["containers"][0];
+            assert_eq!(c["env"][0]["name"], "AWS_ENDPOINT_URL");
+            assert_eq!(c["volumeMounts"][0]["mountPath"], "/home/ray");
+            assert_eq!(c["volumeMounts"][0]["subPath"], "home/ml-team");
+            assert_eq!(c["volumeMounts"][0]["readOnly"], false);
+            assert_eq!(
+                pod["volumes"][0]["persistentVolumeClaim"]["claimName"],
+                "nebari-home"
+            );
+            assert_eq!(pod["serviceAccountName"], "ray-workload");
+            assert_eq!(pod["nodeSelector"]["accelerator"], "a100");
+            assert_eq!(pod["tolerations"][0]["key"], "nvidia.com/gpu");
+            assert_eq!(pod["tolerations"][0]["operator"], "Exists");
+            assert!(
+                pod["tolerations"][0].get("value").is_none(),
+                "an Exists toleration must not carry a value"
+            );
+        }
+    }
+
+    #[test]
+    fn sub_path_omitted_when_unscoped() {
+        let mut s = spec(&[("w", 1, 1, 1)]);
+        let mut sh = shape();
+        sh.volumes[0].sub_path = None;
+        s.pod_resolved = Some(sh);
+        let cr = to_raycluster(&ClusterId("c".into()), &s, false, 1, None);
+        let mount =
+            &cr["spec"]["headGroupSpec"]["template"]["spec"]["containers"][0]["volumeMounts"][0];
+        assert!(mount.get("subPath").is_none());
+    }
+
+    #[test]
+    fn shape_round_trips_through_the_fingerprint() {
+        // owned_spec_fingerprint and fingerprint_from_cr must agree on a
+        // manifest we produced ourselves, or every shaped cluster would
+        // report permanent spec drift.
+        let mut s = spec(&[("w", 1, 2, 1)]);
+        s.pod_resolved = Some(shape());
+        let cr = to_raycluster(&ClusterId("c".into()), &s, false, 3, None);
+        assert_eq!(
+            owned_spec_fingerprint(&s),
+            fingerprint_from_cr(&cr["spec"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn stripping_a_mount_out_of_band_reads_as_drift() {
+        // The failure this guards against: someone edits the RayCluster to
+        // drop the home mount and Mobula never notices the cluster no longer
+        // matches what was admitted.
+        let mut s = spec(&[("w", 1, 2, 1)]);
+        s.pod_resolved = Some(shape());
+        let mut cr = to_raycluster(&ClusterId("c".into()), &s, false, 3, None);
+        let before = fingerprint_from_cr(&cr["spec"]).unwrap();
+
+        cr["spec"]["headGroupSpec"]["template"]["spec"]["containers"][0]["volumeMounts"] =
+            json!([]);
+        assert_ne!(before, fingerprint_from_cr(&cr["spec"]).unwrap());
+
+        // Same for the service account — swapping it is a privilege change.
+        let mut cr2 = to_raycluster(&ClusterId("c".into()), &s, false, 3, None);
+        cr2["spec"]["headGroupSpec"]["template"]["spec"]["serviceAccountName"] = json!("default");
+        assert_ne!(before, fingerprint_from_cr(&cr2["spec"]).unwrap());
+    }
+
+    #[test]
+    fn stripping_a_mount_from_one_worker_group_reads_as_drift() {
+        // The shape lands on every group, so drift detection has to look at
+        // every group: an edit to a single worker group's mounts leaves the
+        // head untouched and would otherwise pass unnoticed.
+        let mut s = spec(&[("w1", 1, 2, 1), ("w2", 1, 2, 1)]);
+        s.pod_resolved = Some(shape());
+        let mut cr = to_raycluster(&ClusterId("c".into()), &s, false, 3, None);
+        let before = fingerprint_from_cr(&cr["spec"]).unwrap();
+
+        cr["spec"]["workerGroupSpecs"][1]["template"]["spec"]["containers"][0]["volumeMounts"] =
+            json!([]);
+        assert_ne!(before, fingerprint_from_cr(&cr["spec"]).unwrap());
+    }
+
+    #[test]
+    fn unshaped_fingerprint_is_unaffected_by_missing_pod_fields() {
+        // A CR with no shaping at all still round-trips: the projection
+        // reads absent fields as empty, not as a mismatch.
+        let s = spec(&[("w", 1, 2, 1)]);
+        let cr = to_raycluster(&ClusterId("c".into()), &s, false, 3, None);
+        assert_eq!(
+            owned_spec_fingerprint(&s),
+            fingerprint_from_cr(&cr["spec"]).unwrap()
+        );
+    }
+
     fn spec(autoscale_groups: &[(&str, u32, u32, u32)]) -> ClusterSpec {
         ClusterSpec {
             name: "demo".into(),
@@ -601,6 +909,8 @@ mod tests {
                 })
                 .collect(),
             ttl_seconds: None,
+            pod: None,
+            pod_resolved: None,
         }
     }
 

@@ -5,6 +5,13 @@
 mod common;
 use common::{authed_app_with_policy, authed_app_with_store, get, idp_token, post_json, spawn_idp};
 
+async fn body_json(res: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use std::sync::Arc;
@@ -338,6 +345,7 @@ async fn quota_admission_rejects_over_limit_with_409() {
         prices: None,
         quotas,
         gpu_default_sharing: Default::default(),
+        pod_shaping: Default::default(),
     };
     let app = authed_app_with_policy(&idp, store, policy).await;
     let admin = idp_token(&idp, &["/platform-admins"]);
@@ -393,6 +401,7 @@ async fn concurrent_creates_cannot_over_admit_quota() {
         prices: None,
         quotas,
         gpu_default_sharing: Default::default(),
+        pod_shaping: Default::default(),
     };
     let app = authed_app_with_policy(&idp, store, policy).await;
     let admin = idp_token(&idp, &["/platform-admins"]);
@@ -1384,4 +1393,312 @@ async fn noncompliant_multi_tenant_pool_admits_nothing() {
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("tenant isolation"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Pod shaping (#66): the platform declares what exists, the caller picks by
+// name. These tests pin the privilege boundary, not the happy path.
+// ---------------------------------------------------------------------------
+
+fn shaping_policy() -> mobula_api::clusters::PolicyConfig {
+    use mobula_policy::podshape::{MountEntry, PodShapeCatalog};
+    mobula_api::clusters::PolicyConfig {
+        prices: None,
+        quotas: Default::default(),
+        gpu_default_sharing: Default::default(),
+        pod_shaping: PodShapeCatalog {
+            mounts: vec![MountEntry {
+                name: "home".into(),
+                claim_name: "nebari-home".into(),
+                mount_path: "/home/ray".into(),
+                read_only: false,
+                sub_path: Some("home/{project}".into()),
+            }],
+            service_accounts: vec!["ray-workload".into()],
+            default_mounts: vec!["home".into()],
+            ..Default::default()
+        },
+    }
+}
+
+async fn stored_spec(store: &Arc<InMemoryStore>, id: &str) -> ClusterSpec {
+    store
+        .get(&ClusterId(id.to_string()))
+        .await
+        .unwrap()
+        .expect("cluster stored")
+        .spec
+}
+
+#[tokio::test]
+async fn default_mount_is_applied_and_scoped_to_the_project() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), shaping_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body("a"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let shape = stored_spec(&store, "a")
+        .await
+        .pod_resolved
+        .expect("resolved");
+    assert_eq!(shape.volumes.len(), 1);
+    assert_eq!(shape.volumes[0].claim_name, "nebari-home");
+    // The project sub-path is what stops one project reading another's
+    // directory out of a shared home volume.
+    assert_eq!(shape.volumes[0].sub_path.as_deref(), Some("home/demo"));
+}
+
+#[tokio::test]
+async fn selecting_an_unlisted_mount_is_refused_with_403() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), shaping_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let mut body = create_body("a");
+    body["spec"]["pod"] = serde_json::json!({ "mounts": ["secrets"] });
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "a mount the deployment does not offer must be refused"
+    );
+    assert!(
+        store.get(&ClusterId("a".into())).await.unwrap().is_none(),
+        "a refused create must not be stored"
+    );
+}
+
+#[tokio::test]
+async fn an_unlisted_service_account_is_refused_with_403() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store, shaping_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let mut body = create_body("a");
+    body["spec"]["pod"] = serde_json::json!({ "service_account": "default" });
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_client_supplied_resolution_is_discarded() {
+    // The escalation this closes: `pod_resolved` is the field that actually
+    // reaches the pod spec, so a caller who can set it directly can mount any
+    // claim in the namespace. The server must overwrite it from the catalog,
+    // never trust it.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), shaping_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let mut body = create_body("a");
+    body["spec"]["pod_resolved"] = serde_json::json!({
+        "volumes": [{
+            "name": "steal",
+            "claim_name": "someone-elses-data",
+            "mount_path": "/mnt/steal",
+            "read_only": false
+        }],
+        "service_account": "cluster-admin"
+    });
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let shape = stored_spec(&store, "a")
+        .await
+        .pod_resolved
+        .expect("resolved");
+    let names: Vec<_> = shape.volumes.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, vec!["home"], "smuggled volume must not survive");
+    assert_eq!(shape.service_account, None, "smuggled SA must not survive");
+}
+
+#[tokio::test]
+async fn no_catalog_means_no_shaping_and_no_refusals() {
+    // Deployments that configure nothing behave exactly as they did before.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), Default::default()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body("a"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(stored_spec(&store, "a").await.pod_resolved, None);
+}
+
+#[tokio::test]
+async fn no_catalog_means_env_is_refused_too() {
+    // "Pod shaping switched off" must mean off for every field. Env is the
+    // one with no catalog names to trip on, so without an explicit refusal
+    // any Writer could inject LD_PRELOAD onto every container while the
+    // deployment believes shaping is disabled.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), Default::default()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let mut body = create_body("a");
+    body["spec"]["pod"] = serde_json::json!({
+        "env": [{ "name": "LD_PRELOAD", "value": "/tmp/x.so" }]
+    });
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(store.get(&ClusterId("a".into())).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_grant_is_readable_through_the_api() {
+    // "What is this cluster actually mounting" must be answerable from GET,
+    // not from direct store access (docs/api-v1.md §3.1.1, dev-stack.md).
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), shaping_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body("a"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/a",
+            "mobula.example.com",
+            Some(&admin),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let view = body_json(res).await;
+    assert_eq!(
+        view["pod_resolved"]["volumes"][0]["claim_name"],
+        "nebari-home"
+    );
+    assert_eq!(view["pod_resolved"]["volumes"][0]["sub_path"], "home/demo");
+}
+
+#[tokio::test]
+async fn a_noop_pod_resubmit_does_not_roll_the_cluster() {
+    // A re-submit whose resolution is byte-identical must not bump the
+    // generation: a bump changes the pod-template annotation and KubeRay
+    // rolls head and every worker, killing in-flight jobs for nothing.
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    let app = authed_app_with_policy(&idp, store.clone(), shaping_policy()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body("a"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let g1 = store
+        .get(&ClusterId("a".into()))
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    // Explicitly-empty pod object: same resolution as absent.
+    let mut body = create_body("a");
+    body["spec"]["pod"] = serde_json::json!({});
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    // Redundantly requesting the default mount, twice: same resolution.
+    let mut body = create_body("a");
+    body["spec"]["pod"] = serde_json::json!({ "mounts": ["home", "home"] });
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    let g2 = store
+        .get(&ClusterId("a".into()))
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+    assert_eq!(g1, g2, "no-op re-submits must not bump the generation");
 }

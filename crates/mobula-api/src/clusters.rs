@@ -19,6 +19,7 @@ use mobula_core::{AuditDecision, AuditEvent, ClusterId, ClusterSpec};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use mobula_policy::podshape::{resolve as resolve_pod_shape, PodShapeCatalog};
 use mobula_policy::{admit, cluster_demand, PriceSheet, ResourceMap};
 use std::collections::HashMap;
 
@@ -48,6 +49,14 @@ pub struct PolicyConfig {
     /// `gpu_sharing` (`[gpu] default_sharing` in the policy file;
     /// `whole-gpu` when unconfigured).
     pub gpu_default_sharing: mobula_core::GpuSharing,
+    /// What callers may select in pod shaping (#66): mounts, placements and
+    /// service accounts the deployment offers, plus the defaults applied to
+    /// every cluster.
+    ///
+    /// Like `prices`/`quotas`, this is the BOOT SEED — the effective catalog
+    /// is store-backed and Admin-editable, so `create_cluster` resolves
+    /// against `effective_policy`, not against this field.
+    pub pod_shaping: PodShapeCatalog,
 }
 
 #[derive(Clone)]
@@ -102,6 +111,15 @@ pub struct ClusterView {
     pub est_min_hourly: Option<f64>,
     /// Estimated $/hr at max (fully scaled) size.
     pub est_max_hourly: Option<f64>,
+    /// The caller's pod-shaping selections (#66), as canonicalized at
+    /// admission. Absent when nothing was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod: Option<mobula_core::podspec::PodOverrides>,
+    /// The grant frozen at admission: what this cluster actually mounts,
+    /// runs as, and lands on. This is the answer to "what is this cluster
+    /// actually mounting" — it must be readable here, not only in the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_resolved: Option<mobula_core::podspec::ResolvedPodShape>,
 }
 
 impl ClusterView {
@@ -129,6 +147,8 @@ impl ClusterView {
             ray_version: c.spec.ray_version.clone(),
             est_min_hourly: cost.map(|c| c.min_hourly),
             est_max_hourly: cost.map(|c| c.max_hourly),
+            pod: c.spec.pod.clone(),
+            pod_resolved: c.spec.pod_resolved.clone(),
         }
     }
 }
@@ -306,7 +326,7 @@ async fn get_cluster(
 async fn create_cluster(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
-    Json(body): Json<CreateCluster>,
+    Json(mut body): Json<CreateCluster>,
 ) -> Response {
     // Scoped RBAC (#49): Write on Cluster granted globally (Operator/Admin)
     // or by an assignment covering the spec's project.
@@ -321,19 +341,71 @@ async fn create_cluster(
     {
         return deny;
     }
-    let id = ClusterId(body.id);
+    let id = ClusterId(std::mem::take(&mut body.id));
 
-    // Quota admission (Borg: quota is admission control). Only enforced for
-    // projects with a configured limit; unconfigured projects are
-    // unlimited in v0. Checked against max-demand of the project's other
-    // live clusters plus this request. The effective limits come from the
-    // store-backed policy (read per request — settings edits apply
-    // immediately).
+    // The effective policy — store-backed, read per request, so quota, price
+    // and pod-shaping edits all apply without a restart. Loaded once here and
+    // shared by every admission check below.
     let project = body.spec.project.clone();
     let policy = match effective_policy(&st.store, &st.policy).await {
         Ok(p) => p.map(|p| config_from_stored(&p)).unwrap_or_default(),
         Err(e) => return store_err(e),
     };
+
+    // Pod-shape admission (#66). The caller's `pod` selections are names;
+    // the catalog turns them into concrete claims, mount paths, service
+    // account, selectors and tolerations, or refuses. `pod_resolved` is
+    // ALWAYS overwritten from that resolution — a value that arrived in the
+    // request body is discarded, never trusted, because it is precisely the
+    // field that would let a caller mount a claim nobody granted them.
+    //
+    // The catalog comes from the effective policy, so an Admin's edit governs
+    // the very next create. Clusters already admitted keep the grant frozen
+    // on their spec until they are re-submitted.
+    //
+    // A refusal is 403, not 400: the request is well-formed, the caller may
+    // just not have what it asks for.
+    match resolve_pod_shape(
+        &policy.pod_shaping,
+        body.spec.pod.as_ref(),
+        &body.spec.project,
+    ) {
+        Ok(shape) => {
+            body.spec.pod_resolved = shape;
+            // Canonicalize the selections that were just authorized, so two
+            // requests that resolve identically also compare identically in
+            // `spec_changed`. Without this, a re-submit with an explicitly
+            // empty `pod`, a duplicated mount, or a default-implied mount
+            // bumps the generation — and a bump rolls head and every
+            // worker, killing in-flight Ray jobs for a no-op.
+            body.spec.pod = mobula_policy::podshape::canonical_overrides(
+                body.spec.pod.take(),
+                &policy.pod_shaping,
+            );
+        }
+        Err(e) => {
+            emit(
+                Some(&st.store),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(&identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Deny,
+                    reason: Some("pod_shape_denied".into()),
+                    action: Some("create_cluster".into()),
+                    cluster: Some(id.to_string()),
+                    status: Some(StatusCode::FORBIDDEN.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return (StatusCode::FORBIDDEN, e.to_string()).into_response();
+        }
+    }
+
+    // Quota admission (Borg: quota is admission control). Only enforced for
+    // projects with a configured limit; unconfigured projects are unlimited
+    // in v0. Checked against max-demand of the project's other live clusters
+    // plus this request, against the effective limits loaded above.
 
     // GPU tenant-isolation admission (#58): when the project's pool is
     // shared by more than one project, fractional GPU requests are rejected

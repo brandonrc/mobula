@@ -229,15 +229,98 @@ authoritative and the OpenAPI components are generated from it.
   "head_cpu": "4",
   "head_memory": "16Gi",
   "worker_groups": [ { "…": "WorkerGroup" } ],
-  "ttl_seconds": 3600
+  "ttl_seconds": 3600,
+  "pod": { "…": "PodOverrides" },
+  "pod_resolved": { "…": "ResolvedPodShape" }
 }
 ```
 
 `ttl_seconds: null` disables idle reaping. CPU/memory/gpu are **strings**
 (K8s quantity syntax, e.g. `"4"`, `"16Gi"`, `"nvidia.com/gpu: 4"`) — they map
-onto RayCluster CR fields; the API does not reinterpret them. Labels, env,
-volumes are *planned* fields (ui-ux-spec §5.3): they are not in the type
-today; when added they are additive optional fields.
+onto RayCluster CR fields; the API does not reinterpret them.
+
+`pod` / `pod_resolved` are pod shaping (#66) — see §3.1.1. Both are optional
+and absent by default, so a client that ignores them sends exactly the body
+it sent before.
+
+#### 3.1.1 Pod shaping — `PodOverrides` and `ResolvedPodShape`
+
+How a cluster reaches environments, data and identity: environment
+variables, volume mounts, service account, node placement. The split matters
+more than the fields.
+
+**`pod` is what the caller asks for** — literal env vars, plus *names*
+selected from a catalog the deployment declares:
+
+```json
+{
+  "env": [ { "name": "AWS_ENDPOINT_URL", "value": "https://s3.example.com" } ],
+  "mounts": ["home", "shared"],
+  "service_account": "ray-workload",
+  "placement": "gpu"
+}
+```
+
+**`pod_resolved` is what the platform granted** — concrete claim names,
+mount paths, sub-paths, selectors and tolerations:
+
+```json
+{
+  "env": [ { "name": "AWS_ENDPOINT_URL", "value": "https://s3.example.com" } ],
+  "volumes": [ {
+    "name": "home", "claim_name": "nebari-home",
+    "mount_path": "/home/ray", "read_only": false,
+    "sub_path": "home/ml-team"
+  } ],
+  "service_account": "ray-workload",
+  "node_selector": { "nvidia.com/gpu.present": "true" },
+  "tolerations": [ { "key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule" } ]
+}
+```
+
+**`pod_resolved` is server-computed and read-only.** The API overwrites it on
+every create from the catalog; a value sent by a client is discarded. It is
+returned (and persisted) so that "what is this cluster actually mounting"
+has an answer, and so the KubeRay translation stays a pure function of the
+spec.
+
+Rules the server enforces at admission, all of them 403 on failure — the
+request is well-formed, the caller just may not have what it asks for:
+
+| Refusal | Meaning |
+|---|---|
+| `unknown mount` / `unknown placement` | not in the deployment's catalog |
+| `service account … is not allowed` | not in the catalog's allowlist |
+| `invalid environment variable name` | not `[A-Za-z_][A-Za-z0-9_]*` |
+| `environment variable … is managed by the platform` | in `RESERVED_ENV` (`RAY_ADDRESS`, `RAY_PORT`, …) |
+| `project … cannot be used in a mount path` | project name is not a safe path segment, and a selected mount interpolates `{project}` |
+
+A catalog entry's `sub_path` may contain `{project}`, which expands to the
+cluster's project. That is what makes one shared home volume safe to offer to
+every project: without it, a single `nebari-home` claim mounted at `/home`
+hands every cluster every project's files.
+
+The catalog itself lives in the **store** and is Admin-editable through
+`PUT /api/v1/settings/policy` (§5.16), like prices and quotas; `[pod_shaping]`
+in the `--policy` file is its boot seed. (`[gpu] default_sharing` is different
+and stays boot-time-only — it is a safety default, not a catalog.)
+
+**A catalog edit is never retroactive.** Each cluster's grant is frozen onto
+its spec as `pod_resolved` at admission, and the reconciler reads only the
+spec, so editing or clearing the catalog leaves every running cluster exactly
+as it was. A cluster moves onto the current catalog only when it is
+**re-submitted**: the re-resolution changes `pod_resolved`, which bumps the
+generation and rolls the pods. Migration is deliberate, never ambient.
+
+**Operational consequence worth knowing:** because the catalog is live,
+whoever holds the Mobula Admin role can grant any PVC in the namespace to any
+project's pods — where previously that required deployment access. Every edit
+emits an `update_policy` audit event. A deployment wanting the tighter posture
+should bound which claims are mountable at the file level.
+
+With no catalog configured at all, pod shaping is off: `pod_resolved` is
+always absent and the generated RayCluster manifest is byte-identical to the
+pre-#66 form.
 
 ### 3.2 `WorkerGroup` (`cluster.rs:42`)
 
@@ -1155,8 +1238,9 @@ to the token store.
 ### 5.16 Settings — `/api/v1/settings/policy`
 
 Settings page (ui-ux-spec §5.9): view the effective governance policy and
-edit per-project quotas and the price sheet. **Implemented** (2026-08-16,
-`settings.rs`) — Admin-only (§2.2); mounted only when a store is configured.
+edit per-project quotas, the price sheet, and the pod-shaping catalog
+(§3.1.1). **Implemented** (2026-08-16, `settings.rs`) — Admin-only (§2.2);
+mounted only when a store is configured.
 
 **Precedence: the `--policy` TOML file is the boot-time DEFAULT; the store
 wins once edited.** The effective policy is a single store row (JSON in the
@@ -1166,28 +1250,67 @@ reports `source: "file"` until the first PUT, which rewrites it as
 `"store"`. Every consumer — quota admission in `POST /api/v1/clusters`, the
 `est_*_hourly` fields on `ClusterView`, and the `cost_usd` roll-up in
 `GET /api/v1/usage` — reads the store row per request, so edits take effect
-immediately, with no restart.
+immediately, with no restart. Pod-shape admission in `POST /api/v1/clusters`
+reads it the same way, so a catalog edit governs the very next create.
 
 - `GET /api/v1/settings/policy` → 200
   ```json
   {
     "prices": { "cpu": 0.048, "memory": 0.005, "nvidia.com/gpu": 2.50 } ,
     "quotas": { "ml-team": { "cpu": 500, "memory": 1000 } },
+    "pod_shaping": {
+      "mounts": [ {
+        "name": "home", "claim_name": "nebari-home",
+        "mount_path": "/home/ray", "read_only": false,
+        "sub_path": "home/{project}"
+      } ],
+      "placements": [ {
+        "name": "gpu",
+        "node_selector": { "nvidia.com/gpu.present": "true" },
+        "tolerations": [ { "key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule" } ]
+      } ],
+      "service_accounts": ["ray-workload"],
+      "default_mounts": ["home"],
+      "default_placement": null,
+      "default_service_account": null
+    },
     "source": "file",
     "editable": true
   }
   ```
   `prices` is `null` when no price sheet is configured; `quotas` is `{}`
-  when no project has a limit. `source` is `"file"` (the untouched
-  `--policy` boot seed), `"store"` (edited via PUT), or `"none"` (no policy
-  configured at all — `prices: null`, `quotas: {}`).
-- `PUT /api/v1/settings/policy` `{ prices?, quotas? }` → 200 with the
-  policy after the update (`source` is now `"store"`). **Section-replace**
-  semantics: a present key replaces that whole section — `prices: null`
-  clears the price sheet, `quotas: {}` clears all quotas; an absent key
-  leaves that section untouched. Prices and quota values must be
-  non-negative finite numbers → 400 with a message naming the key. Every
-  accepted edit emits an `update_policy` audit event (§5.9).
+  when no project has a limit; `pod_shaping` is all-empty when pod shaping is
+  not configured. `source` is `"file"` (the untouched `--policy` boot seed),
+  `"store"` (edited via PUT), or `"none"` (no policy configured at all).
+- `PUT /api/v1/settings/policy` `{ prices?, quotas?, pod_shaping? }` → 200
+  with the policy after the update (`source` is now `"store"`).
+  **Section-replace** semantics: a present key replaces that whole section —
+  `prices: null` clears the price sheet, `quotas: {}` clears all quotas,
+  `pod_shaping: {}` switches pod shaping off; an absent key leaves that
+  section untouched. Prices and quota values must be non-negative finite
+  numbers → 400 with a message naming the key. Every accepted edit emits an
+  `update_policy` audit event (§5.9).
+
+  `pod_shaping` is validated **as a unit** before it is stored → 400 naming
+  the offending entry. The checks are the ones that would otherwise fail
+  later and confusingly:
+
+  | Rejected | Why it matters |
+  |---|---|
+  | `default_mounts` / `default_placement` / `default_service_account` naming something not in the catalog | defaults resolve on *every* create, so this 403s all of them |
+  | duplicate mount or placement name | ambiguous selection |
+  | empty name, empty `claim_name`, relative `mount_path` | unusable entry |
+  | `sub_path` that is absolute or traverses upward | escapes its volume — checked with `{project}` still unexpanded |
+  | toleration `operator` not `Equal`/`Exists`, `effect` not one of the three K8s values | would be rejected by the API server at pod-create time |
+  | toleration with `operator: "Exists"` *and* a `value` | `Exists` ignores `value`; the author expected matching they will not get |
+
+  Not checked: whether the named claims, service accounts or node labels
+  actually exist in Kubernetes. That can stop being true after the edit, and
+  naming a claim created moments later is legitimate — Kubernetes surfaces
+  those as unschedulable pods, which the reconciler already reports.
+
+  The same validation runs at boot against `[pod_shaping]` in the `--policy`
+  file, so a bad seed is a startup failure rather than a fleet of 403s.
 
 Concurrent PUTs are last-writer-wins (v1; multi-replica compare-and-swap is
 a follow-up, same tracking as the quota-admission transaction note in

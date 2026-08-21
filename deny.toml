@@ -12,6 +12,17 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 
+# The FIPS crypto option (ADR-0012) pulls in AWS-LC's FIPS module, whose
+# license string carries the old OpenSSL license alongside ISC/Apache-2.0.
+# That is unavoidable if we want aws-lc FIPS at all — the OpenSSL portions
+# are inherited from the code AWS-LC derives from — so it is accepted as a
+# SCOPED exception rather than a global allow: any *other* dependency
+# arriving with OpenSSL licensing should still fail this gate and get its
+# own review.
+[[licenses.exceptions]]
+name = "aws-lc-fips-sys"
+allow = ["OpenSSL"]
+
 [advisories]
 yanked = "deny"
 ignore = [
