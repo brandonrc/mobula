@@ -31,7 +31,7 @@ serde_json.workspace = true
 sha2.workspace = true
 # `runtime-tokio` only: the TLS provider feature (`tls-ring` /
 # `tls-aws-lc-rs`) is selected above so FIPS builds can swap it.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
@@ -39,4 +39,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 # The Postgres conformance tests create a per-test schema over sqlx directly.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-ring"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-ring"] }
