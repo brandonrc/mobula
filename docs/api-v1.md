@@ -1182,47 +1182,54 @@ mobula_pool_nominal{pool="gpu-pool",resource="cpu"} 64
 
 #### `GET /api/v1/clusters/{id}/metrics` — cluster resource summary (#52)
 
-A **normalized cluster resource-usage summary** for the metrics tab's stat
-tiles (ui-ux-spec §5.4), distilled from the Ray dashboard's autoscaler /
-load-metrics report (`GET /api/cluster_status`). **Implemented** (Milestone
-C, `cluster_obs.rs`). This replaces the earlier raw-Prometheus passthrough
-(#52 first slice): the browser wants CPU/GPU/mem used-vs-total tiles, not a
-4MiB exposition to parse, and — critically — an unreachable head now degrades
-to a clean **503**, never the 502/panic the passthrough produced.
+A **normalized cluster resource summary** for the metrics tab's stat tiles
+(ui-ux-spec §5.4). **Implemented** (Milestone C, `cluster_obs.rs`). This
+replaces the earlier raw-Prometheus passthrough (#52 first slice): the browser
+wants CPU/GPU/mem capacity tiles, not a 4MiB exposition to parse, and —
+critically — an unreachable head now degrades to a clean **503**, never the
+502/panic the passthrough produced.
 
 - **Auth:** `Read` on `Target::Cluster` (Viewer+), read-scoped (#49).
+- **Source:** the Ray **state API `GET /api/v0/nodes`** is the primary source
+  — it reports each node's `resources_total` and liveness, and answers on
+  **every live Ray, autoscaler or not**. (The autoscaler's
+  `/api/cluster_status` is `null` on a static KubeRay cluster, so it is used
+  only as a best-effort enrichment for the live `used` half of each stat.)
+  Capacity is summed across `ALIVE` nodes.
 - **Southbound resolution + credential discipline:** identical to the jobs
   proxy (§5.6) — a registered cluster uses the registry's `api_base_url` +
   static token; a lifecycle-managed cluster uses the provisioner-derived
-  head-service dashboard (`…-head-svc:8265`, no token). The request is built
+  head-service dashboard (`…-head-svc:8265`, no token). Requests are built
   from scratch (caller JWT never travels southbound); 5s connect / 30s read;
-  the body is capped at 4MiB; redirects are never followed. When no endpoint
-  can be named (gateway-only / demo) → **404 `metrics unavailable`**.
+  body capped at 4MiB; redirects never followed. When no endpoint can be named
+  (gateway-only / demo) → **404 `metrics unavailable`**.
 - **Response 200:**
 
 ```json
 {
   "cluster_id": "team-b-scoring",
-  "cpu": { "used": 6.0, "total": 8.0 },
-  "gpu": { "used": 1.0, "total": 2.0 },
-  "memory": { "used": 10.0, "total": 32.0 },
-  "object_store_memory": { "used": 1.0, "total": 4.0 },
-  "active_nodes": 3,
-  "pending_nodes": 0,
+  "cpu": { "used": 3.0, "total": 4.0 },
+  "gpu": { "total": 2.0 },
+  "memory": { "total": 17179869184 },
+  "object_store_memory": { "total": 4294967296 },
+  "active_nodes": 2,
   "failed_nodes": 0
 }
 ```
 
-CPU is cores, GPU is device count, memory is bytes. Each stat is omitted when
-the Ray report does not carry it (a cluster with no GPUs omits `gpu`), so the
-UI renders only the tiles present. The `loadMetricsReport.usage` map is read
-defensively across the shapes Ray has shipped.
+CPU is cores, GPU is device count, memory is bytes. `total` is the reported
+capacity; `used` is present **only when the autoscaler report carries a live
+usage figure** (omitted otherwise — the tile then shows capacity only). A
+resource with no capacity reported (e.g. `gpu` on a CPU-only cluster) is
+omitted entirely, so the UI renders only the tiles that apply. `active_nodes`
+counts `ALIVE` nodes; `failed_nodes` counts `DEAD` ones (omitted when none).
 - **Errors:** 403; 404 (no reachable dashboard to name); **503** when the Ray
-  dashboard can't be reached, answers non-2xx, or returns a body that isn't
-  parseable — the UI's cluster-unreachable state, never a crash.
-- **Deferred:** raw Prometheus exposition (the old passthrough — reintroduce
-  behind a distinct path if a scrape target is needed), SSE/event streaming,
-  OpenTelemetry export, and Grafana deep-links.
+  state API can't be reached, answers non-2xx, or returns an unparseable body
+  — the UI's cluster-unreachable state, never a crash.
+- **Deferred:** live per-resource `used` on non-autoscaling clusters (needs
+  Ray's per-node `resources_available`, or the Prometheus scrape); raw
+  Prometheus exposition (the old passthrough); SSE/event streaming;
+  OpenTelemetry export; Grafana deep-links.
 
 ### 5.14 Registry — `GET /api/v1/registry/clusters`
 
