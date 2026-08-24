@@ -764,44 +764,63 @@ async fn events_read_scoping_hides_foreign_cluster() {
 // Metrics (resource summary from the Ray dashboard /api/cluster_status)
 // ---------------------------------------------------------------------------
 
-/// A mock Ray head serving `GET /api/cluster_status`, recording each request's
-/// Authorization header.
+/// A mock Ray head serving both metrics sources: the primary state API
+/// `GET /api/v0/nodes` (resource capacity + liveness) and the best-effort
+/// autoscaler `GET /api/cluster_status` (live `used`). Records every request's
+/// Authorization header so the credential discipline can be asserted.
 async fn spawn_mock_status_head() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
     let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
-    let seen_handler = seen.clone();
-    let app = axum::Router::new().route(
-        "/api/cluster_status",
-        axum::routing::get(move |headers: HeaderMap| {
-            let seen = seen_handler.clone();
-            async move {
-                seen.lock().unwrap().push(
-                    headers
-                        .get(header::AUTHORIZATION)
-                        .and_then(|v| v.to_str().ok().map(String::from)),
-                );
-                axum::Json(serde_json::json!({
-                    "result": true,
-                    "data": {
-                        "clusterStatus": {
-                            "loadMetricsReport": {
-                                "usage": {
-                                    "CPU": [6.0, 8.0],
-                                    "GPU": [1.0, 2.0],
-                                    "memory": [10.0, 32.0],
-                                    "object_store_memory": [1.0, 4.0]
-                                }
-                            },
-                            "autoscalerReport": {
-                                "activeNodes": { "head": 1, "gpu-workers": 2 },
-                                "pendingNodes": [],
-                                "failedNodes": []
-                            }
-                        }
-                    }
-                }))
-            }
-        }),
-    );
+    let record = {
+        let seen = seen.clone();
+        move |headers: &HeaderMap| {
+            seen.lock().unwrap().push(
+                headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok().map(String::from)),
+            );
+        }
+    };
+    let r_nodes = record.clone();
+    let r_status = record.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/v0/nodes",
+            axum::routing::get(move |headers: HeaderMap| {
+                let r = r_nodes.clone();
+                async move {
+                    r(&headers);
+                    // Two ALIVE nodes, 4 CPU + 16Gi + 2 GPU total.
+                    axum::Json(serde_json::json!({
+                        "result": true,
+                        "data": { "result": { "result": [
+                            { "state": "ALIVE", "is_head_node": true, "resources_total": {
+                                "CPU": 2.0, "GPU": 1.0, "memory": 8589934592.0,
+                                "object_store_memory": 2147483648.0 } },
+                            { "state": "ALIVE", "is_head_node": false, "resources_total": {
+                                "CPU": 2.0, "GPU": 1.0, "memory": 8589934592.0,
+                                "object_store_memory": 2147483648.0 } }
+                        ] } }
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/cluster_status",
+            axum::routing::get(move |headers: HeaderMap| {
+                let r = r_status.clone();
+                async move {
+                    r(&headers);
+                    axum::Json(serde_json::json!({
+                        "result": true,
+                        "data": { "clusterStatus": { "loadMetricsReport": { "usage": {
+                            "CPU": [3.0, 4.0],
+                            "GPU": [1.0, 2.0],
+                            "memory": [10.0, 17179869184.0]
+                        } } } }
+                    }))
+                }
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -834,17 +853,22 @@ async fn metrics_returns_resource_summary_and_injects_registry_token_not_jwt() {
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     assert_eq!(v["cluster_id"], "c1");
-    assert_eq!(v["cpu"]["used"], 6.0);
-    assert_eq!(v["cpu"]["total"], 8.0);
+    // total from the state API (2 ALIVE nodes × 2 CPU); used from the
+    // autoscaler cluster_status enrichment.
+    assert_eq!(v["cpu"]["total"], 4.0);
+    assert_eq!(v["cpu"]["used"], 3.0);
     assert_eq!(v["gpu"]["total"], 2.0);
-    assert_eq!(v["memory"]["total"], 32.0);
-    assert_eq!(v["active_nodes"], 3);
+    assert_eq!(v["memory"]["total"], 17179869184.0f64);
+    assert_eq!(v["active_nodes"], 2);
 
-    // Credential discipline: registry token southbound, JWT nowhere.
+    // Credential discipline: the registry token goes southbound on EVERY
+    // request (nodes + cluster_status), the caller JWT on none.
     let requests = seen.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].as_deref(), Some("Bearer ray-static-token"));
-    assert!(!requests[0].as_ref().unwrap().contains(&viewer));
+    assert!(!requests.is_empty());
+    for r in requests.iter() {
+        assert_eq!(r.as_deref(), Some("Bearer ray-static-token"));
+        assert!(!r.as_ref().unwrap().contains(&viewer));
+    }
 }
 
 #[tokio::test]
@@ -873,8 +897,10 @@ async fn metrics_lifecycle_managed_uses_provisioner_base_no_credential() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let requests = seen.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0], None, "no Authorization may go southbound");
+    assert!(!requests.is_empty());
+    for r in requests.iter() {
+        assert_eq!(*r, None, "no Authorization may go southbound");
+    }
 }
 
 /// The key robustness guarantee for metrics: an unreachable dashboard is a

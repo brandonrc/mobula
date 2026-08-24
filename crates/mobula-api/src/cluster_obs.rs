@@ -52,8 +52,8 @@ const MAX_JOBS_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Cap on concurrent southbound jobs proxies (mirrors the gateway's inflight
 /// cap, #30/#31): excess requests are refused with 503 rather than piling up.
 const MAX_INFLIGHT: usize = 64;
-/// Cap on the proxied `/api/cluster_status` body: the autoscaler report is
-/// small, but a misconfigured head must not stream unbounded memory in.
+/// Cap on a proxied metrics body (`/api/v0/nodes`, `/api/cluster_status`):
+/// both are small, but a misconfigured head must not stream unbounded memory.
 const MAX_STATUS_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Default log tail when the caller names none.
 const DEFAULT_LOG_TAIL: usize = 200;
@@ -481,68 +481,162 @@ async fn cluster_events(
 // Metrics (§5.x resource summary)
 // ---------------------------------------------------------------------------
 
-/// Read a Ray usage pair (`[used, total]`) from the load-metrics `usage` map.
-fn usage_stat(usage: &serde_json::Value, key: &str) -> Option<ResourceStat> {
-    let arr = usage.get(key).and_then(|v| v.as_array())?;
-    let used = arr.first().and_then(|v| v.as_f64())?;
-    let total = arr.get(1).and_then(|v| v.as_f64())?;
-    Some(ResourceStat { used, total })
+/// The Ray state-API node list (`GET /api/v0/nodes`): the resource capacity
+/// the cluster actually reports, node-by-node, and node liveness. Unlike
+/// `/api/cluster_status` (autoscaler-only — `null` on a static KubeRay
+/// cluster), this answers on every live Ray, autoscaler or not. Returns the
+/// summed capacity per resource (across ALIVE nodes) and live node counts.
+struct StateNodesSummary {
+    cpu: Option<f64>,
+    gpu: Option<f64>,
+    memory: Option<f64>,
+    object_store_memory: Option<f64>,
+    active_nodes: u64,
+    dead_nodes: u64,
 }
 
-/// Sum the counts an autoscaler `activeNodes`-style value carries: it may be a
-/// `{node-type: count}` object or a `[...]` list of nodes.
-fn count_nodes(v: Option<&serde_json::Value>) -> Option<u64> {
-    match v? {
-        serde_json::Value::Object(m) => Some(m.values().filter_map(|c| c.as_u64()).sum()),
-        serde_json::Value::Array(a) => Some(a.len() as u64),
-        _ => None,
+/// The rows of the state API's `/api/v0/nodes` response (`data.result.result`).
+fn state_node_rows(raw: &serde_json::Value) -> &[serde_json::Value] {
+    raw.get("data")
+        .and_then(|d| d.get("result"))
+        .and_then(|r| r.get("result"))
+        .and_then(|r| r.as_array())
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+}
+
+/// Sum `resources_total` across ALIVE nodes and count node liveness.
+fn summarize_state_nodes(raw: &serde_json::Value) -> StateNodesSummary {
+    let mut cpu = 0.0;
+    let mut gpu = 0.0;
+    let mut memory = 0.0;
+    let mut oss = 0.0;
+    let (mut have_cpu, mut have_gpu, mut have_mem, mut have_oss) = (false, false, false, false);
+    let mut active = 0u64;
+    let mut dead = 0u64;
+    for node in state_node_rows(raw) {
+        let alive = node.get("state").and_then(|v| v.as_str()) == Some("ALIVE");
+        if alive {
+            active += 1;
+        } else {
+            dead += 1;
+            continue; // only ALIVE nodes contribute capacity
+        }
+        let Some(res) = node.get("resources_total").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        if let Some(v) = res.get("CPU").and_then(|v| v.as_f64()) {
+            cpu += v;
+            have_cpu = true;
+        }
+        if let Some(v) = res.get("GPU").and_then(|v| v.as_f64()) {
+            gpu += v;
+            have_gpu = true;
+        }
+        if let Some(v) = res.get("memory").and_then(|v| v.as_f64()) {
+            memory += v;
+            have_mem = true;
+        }
+        if let Some(v) = res.get("object_store_memory").and_then(|v| v.as_f64()) {
+            oss += v;
+            have_oss = true;
+        }
+    }
+    StateNodesSummary {
+        cpu: have_cpu.then_some(cpu),
+        gpu: have_gpu.then_some(gpu),
+        memory: have_mem.then_some(memory),
+        object_store_memory: have_oss.then_some(oss),
+        active_nodes: active,
+        dead_nodes: dead,
     }
 }
 
-/// Normalize the Ray dashboard `GET /api/cluster_status` body into a stable
-/// resource summary (api-v1.md §5.x). Ray nests the report differently across
-/// versions, so the load-metrics `usage` map is looked up along several paths;
-/// missing stats simply yield `None` (the UI renders only the tiles present).
-fn normalize_cluster_status(cluster_id: &str, raw: &serde_json::Value) -> ClusterMetrics {
-    // Locate the clusterStatus object (structured form). Ray has shipped both
-    // `data.clusterStatus` and a top-level `clusterStatus`; also tolerate the
-    // report living directly under `data`.
-    let cluster_status = raw
-        .get("data")
-        .and_then(|d| d.get("clusterStatus"))
-        .or_else(|| raw.get("clusterStatus"))
-        .or_else(|| raw.get("data"))
-        .unwrap_or(raw);
+/// Read the used amount for `key` from an autoscaler `loadMetricsReport.usage`
+/// map (`{ key: [used, total] }`). `None` when absent — the common case on a
+/// non-autoscaling cluster, where `/api/cluster_status` carries no report.
+fn usage_used(usage: Option<&serde_json::Value>, key: &str) -> Option<f64> {
+    usage?
+        .get(key)?
+        .as_array()?
+        .first()
+        .and_then(|v| v.as_f64())
+}
 
-    let usage = cluster_status
-        .get("loadMetricsReport")
-        .and_then(|r| r.get("usage"));
-
-    let (cpu, gpu, memory, object_store_memory) = match usage {
-        Some(u) => (
-            usage_stat(u, "CPU"),
-            usage_stat(u, "GPU"),
-            usage_stat(u, "memory"),
-            usage_stat(u, "object_store_memory"),
-        ),
-        None => (None, None, None, None),
+/// Build the normalized resource summary (api-v1.md §5.x) from the state-API
+/// node list (capacity + node counts — always available on a live Ray) and,
+/// when present, the autoscaler's load-metrics `usage` map (for the `used`
+/// half of each stat). `used` stays `None` when no report is available, so the
+/// tile shows capacity only rather than a misleading meter.
+fn summarize_metrics(
+    cluster_id: &str,
+    nodes_raw: &serde_json::Value,
+    status_raw: Option<&serde_json::Value>,
+) -> ClusterMetrics {
+    let s = summarize_state_nodes(nodes_raw);
+    // Locate the autoscaler usage map when a cluster_status report exists.
+    let usage = status_raw.and_then(|raw| {
+        raw.get("data")
+            .and_then(|d| d.get("clusterStatus"))
+            .or_else(|| raw.get("clusterStatus"))
+            .and_then(|cs| cs.get("loadMetricsReport"))
+            .and_then(|r| r.get("usage"))
+            .cloned()
+    });
+    let stat = |total: Option<f64>, key: &str| {
+        total.map(|total| ResourceStat {
+            used: usage_used(usage.as_ref(), key),
+            total,
+        })
     };
-
-    let autoscaler = cluster_status.get("autoscalerReport");
-    let active_nodes = count_nodes(autoscaler.and_then(|a| a.get("activeNodes")));
-    let pending_nodes = count_nodes(autoscaler.and_then(|a| a.get("pendingNodes")));
-    let failed_nodes = count_nodes(autoscaler.and_then(|a| a.get("failedNodes")));
-
     ClusterMetrics {
         cluster_id: cluster_id.to_string(),
-        cpu,
-        gpu,
-        memory,
-        object_store_memory,
-        active_nodes,
-        pending_nodes,
-        failed_nodes,
+        cpu: stat(s.cpu, "CPU"),
+        gpu: stat(s.gpu, "GPU"),
+        memory: stat(s.memory, "memory"),
+        object_store_memory: stat(s.object_store_memory, "object_store_memory"),
+        active_nodes: Some(s.active_nodes),
+        pending_nodes: None, // the state API does not surface pending pods
+        failed_nodes: (s.dead_nodes > 0).then_some(s.dead_nodes),
     }
+}
+
+/// Fetch and JSON-parse a southbound dashboard endpoint with the shared body
+/// cap. `Err(())` on any transport / status / parse failure — the caller
+/// decides whether that is a hard 503 (the primary source) or a soft skip (the
+/// best-effort usage enrichment).
+async fn fetch_dashboard_json(
+    st: &ObsApiState,
+    url: &str,
+    bearer: Option<&HeaderValue>,
+    id: &ClusterId,
+) -> Result<serde_json::Value, ()> {
+    let mut req = st.client.get(url);
+    if let Some(v) = bearer {
+        req = req.header(header::AUTHORIZATION, v.clone());
+    }
+    let upstream = req.send().await.map_err(|e| {
+        tracing::warn!(cluster = %id.0, error = %e.without_url(), "metrics upstream error");
+    })?;
+    if !upstream.status().is_success() {
+        tracing::warn!(cluster = %id.0, status = %upstream.status(), "metrics upstream non-success");
+        return Err(());
+    }
+    let mut body = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| {
+            tracing::warn!(cluster = %id.0, error = %e.without_url(), "metrics stream error");
+        })?;
+        if body.len() + bytes.len() > MAX_STATUS_BODY_BYTES {
+            tracing::warn!(cluster = %id.0, cap = MAX_STATUS_BODY_BYTES, "metrics response exceeded the size cap");
+            return Err(());
+        }
+        body.extend_from_slice(&bytes);
+    }
+    serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(cluster = %id.0, error = %e, "metrics response was not valid JSON");
+    })
 }
 
 #[utoipa::path(
@@ -584,7 +678,7 @@ async fn cluster_metrics(
     } else {
         return (StatusCode::NOT_FOUND, "metrics unavailable").into_response();
     };
-    let url = format!("{}/api/cluster_status", base.trim_end_matches('/'));
+    let base = base.trim_end_matches('/').to_string();
 
     let _permit = match st.inflight.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -597,66 +691,39 @@ async fn cluster_metrics(
         }
     };
 
-    let mut req = st.client.get(&url);
-    if let Some(token) = &token {
-        match HeaderValue::from_str(&format!("Bearer {token}")) {
-            Ok(v) => req = req.header(header::AUTHORIZATION, v),
+    // Build the southbound bearer once (a token that isn't a legal header value
+    // is a config error → fail closed, not scrape unauthenticated).
+    let bearer = match &token {
+        Some(t) => match HeaderValue::from_str(&format!("Bearer {t}")) {
+            Ok(v) => Some(v),
             Err(_) => {
                 tracing::warn!(cluster = %id.0, "registry token is not a legal header value");
                 return (StatusCode::INTERNAL_SERVER_ERROR, "invalid cluster token")
                     .into_response();
             }
-        }
-    }
-
-    let upstream = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            // A transport failure is a clean 503 (task: never a 502/panic) —
-            // the UI renders it as the cluster-unreachable state.
-            tracing::warn!(cluster = %id.0, error = %e.without_url(), "cluster_status upstream error");
-            return (StatusCode::SERVICE_UNAVAILABLE, "cluster unreachable").into_response();
-        }
+        },
+        None => None,
     };
-    let status = upstream.status();
 
-    let mut body = Vec::new();
-    let mut stream = upstream.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => {
-                if body.len() + bytes.len() > MAX_STATUS_BODY_BYTES {
-                    tracing::warn!(cluster = %id.0, cap = MAX_STATUS_BODY_BYTES, "cluster_status response exceeded the size cap");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "metrics response too large",
-                    )
-                        .into_response();
-                }
-                body.extend_from_slice(&bytes);
-            }
-            Err(e) => {
-                tracing::warn!(cluster = %id.0, error = %e.without_url(), "cluster_status stream error");
-                return (StatusCode::SERVICE_UNAVAILABLE, "cluster unreachable").into_response();
-            }
-        }
-    }
-
-    if !status.is_success() {
-        // The dashboard answered but not with a 2xx — treat as unreachable for
-        // this summary (the tab shows the clean cluster-unreachable state)
-        // rather than passing Ray's raw error through as metrics.
-        tracing::warn!(cluster = %id.0, status = %status, "cluster_status non-success");
+    // Primary source: the Ray state API `/api/v0/nodes` — the cluster's actual
+    // resource capacity + node liveness, present on every live Ray (autoscaler
+    // or not). Unreachable / non-2xx / unparseable → clean 503 (never a
+    // 502/panic); the UI renders the cluster-unreachable state.
+    let nodes_url = format!("{base}/api/v0/nodes");
+    let Ok(nodes_raw) = fetch_dashboard_json(&st, &nodes_url, bearer.as_ref(), &id).await else {
         return (StatusCode::SERVICE_UNAVAILABLE, "cluster unreachable").into_response();
-    }
+    };
 
-    match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(raw) => Json(normalize_cluster_status(&id.0, &raw)).into_response(),
-        Err(e) => {
-            tracing::warn!(cluster = %id.0, error = %e, "cluster_status was not valid JSON");
-            (StatusCode::SERVICE_UNAVAILABLE, "invalid metrics response").into_response()
-        }
-    }
+    // Best-effort enrichment: the autoscaler's `/api/cluster_status` carries
+    // live `used` per resource. It is `null` on a static (non-autoscaling)
+    // cluster, so a failure here is NOT fatal — `used` simply stays absent and
+    // the tiles show capacity only.
+    let status_url = format!("{base}/api/cluster_status");
+    let status_raw = fetch_dashboard_json(&st, &status_url, bearer.as_ref(), &id)
+        .await
+        .ok();
+
+    Json(summarize_metrics(&id.0, &nodes_raw, status_raw.as_ref())).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -799,94 +866,104 @@ mod tests {
         assert!(normalize_jobs(&json!([])).is_empty());
     }
 
-    #[test]
-    fn normalize_cluster_status_structured() {
-        // The shape Ray's dashboard serves under data.clusterStatus.
-        let raw = json!({
+    /// The real `/api/v0/nodes` shape (Ray 2.56, static KubeRay cluster): a
+    /// head + a worker, each with `resources_total`, and no autoscaler report.
+    fn state_nodes_sample() -> serde_json::Value {
+        json!({
             "result": true,
-            "data": {
-                "clusterStatus": {
-                    "loadMetricsReport": {
-                        "usage": {
-                            "CPU": [6.0, 8.0],
-                            "GPU": [1.0, 2.0],
-                            "memory": [10.0, 32.0],
-                            "object_store_memory": [1.0, 4.0],
-                            "node:10.0.0.1": [0.0, 1.0]
-                        }
-                    },
-                    "autoscalerReport": {
-                        "activeNodes": { "head": 1, "gpu-workers": 2 },
-                        "pendingNodes": [{ "n": 1 }],
-                        "failedNodes": []
+            "data": { "result": { "total": 2, "result": [
+                {
+                    "state": "ALIVE", "is_head_node": false,
+                    "resources_total": {
+                        "CPU": 1.0, "memory": 3221225472.0,
+                        "object_store_memory": 927966412.0, "node:10.1.213.197": 1.0
+                    }
+                },
+                {
+                    "state": "ALIVE", "is_head_node": true,
+                    "resources_total": {
+                        "CPU": 1.0, "memory": 3221225472.0,
+                        "object_store_memory": 682360012.0,
+                        "node:__internal_head__": 1.0, "node:10.1.213.216": 1.0
                     }
                 }
-            }
-        });
-        let m = normalize_cluster_status("team-b-scoring", &raw);
+            ] } }
+        })
+    }
+
+    #[test]
+    fn metrics_capacity_from_state_api_no_autoscaler() {
+        // No cluster_status report (static cluster): capacity + node counts
+        // from the state API, `used` absent (tiles show capacity only).
+        let m = summarize_metrics("team-b-scoring", &state_nodes_sample(), None);
         assert_eq!(m.cluster_id, "team-b-scoring");
         assert_eq!(
             m.cpu,
             Some(ResourceStat {
-                used: 6.0,
-                total: 8.0
-            })
-        );
-        assert_eq!(
-            m.gpu,
-            Some(ResourceStat {
-                used: 1.0,
+                used: None,
                 total: 2.0
             })
         );
         assert_eq!(
             m.memory,
             Some(ResourceStat {
-                used: 10.0,
-                total: 32.0
+                used: None,
+                total: 6442450944.0
             })
         );
-        assert_eq!(
-            m.object_store_memory,
-            Some(ResourceStat {
-                used: 1.0,
-                total: 4.0
-            })
-        );
-        assert_eq!(m.active_nodes, Some(3));
-        assert_eq!(m.pending_nodes, Some(1));
-        assert_eq!(m.failed_nodes, Some(0));
+        assert!(m.object_store_memory.is_some());
+        assert_eq!(m.gpu, None, "no GPU resource reported → no tile");
+        assert_eq!(m.active_nodes, Some(2));
+        assert_eq!(m.failed_nodes, None);
+        assert_eq!(m.pending_nodes, None);
     }
 
     #[test]
-    fn normalize_cluster_status_top_level_report() {
-        // Tolerate the report living directly under `data` (no clusterStatus).
-        let raw = json!({
-            "data": {
-                "loadMetricsReport": { "usage": { "CPU": [2.0, 4.0] } }
-            }
+    fn metrics_used_enriched_from_autoscaler_report() {
+        // When the autoscaler cluster_status carries a usage map, `used` fills
+        // in against the state-API capacity.
+        let status = json!({
+            "data": { "clusterStatus": { "loadMetricsReport": { "usage": {
+                "CPU": [1.5, 2.0],
+                "memory": [1000.0, 6442450944.0]
+            } } } }
         });
-        let m = normalize_cluster_status("c", &raw);
+        let m = summarize_metrics("c", &state_nodes_sample(), Some(&status));
         assert_eq!(
             m.cpu,
             Some(ResourceStat {
-                used: 2.0,
-                total: 4.0
+                used: Some(1.5),
+                total: 2.0
             })
         );
-        assert_eq!(m.gpu, None);
-        assert_eq!(m.active_nodes, None);
+        assert_eq!(m.memory.unwrap().used, Some(1000.0));
+        // object_store has capacity but no usage entry → used stays None.
+        assert_eq!(m.object_store_memory.unwrap().used, None);
     }
 
     #[test]
-    fn normalize_cluster_status_tolerates_garbage() {
-        // No usable report: a well-formed summary with all stats absent, never
-        // a panic.
-        let m = normalize_cluster_status("c", &json!({ "result": false }));
-        assert_eq!(m.cluster_id, "c");
-        assert_eq!(m.cpu, None);
-        assert_eq!(m.gpu, None);
-        assert_eq!(m.memory, None);
-        assert_eq!(m.active_nodes, None);
+    fn metrics_counts_dead_nodes_and_tolerates_garbage() {
+        let with_dead = json!({
+            "data": { "result": { "result": [
+                { "state": "ALIVE", "resources_total": { "CPU": 4.0 } },
+                { "state": "DEAD", "resources_total": { "CPU": 4.0 } }
+            ] } }
+        });
+        let m = summarize_metrics("c", &with_dead, None);
+        // Only the ALIVE node contributes capacity.
+        assert_eq!(
+            m.cpu,
+            Some(ResourceStat {
+                used: None,
+                total: 4.0
+            })
+        );
+        assert_eq!(m.active_nodes, Some(1));
+        assert_eq!(m.failed_nodes, Some(1));
+
+        // No usable node list: a well-formed empty summary, never a panic.
+        let empty = summarize_metrics("c", &json!({ "result": false }), None);
+        assert_eq!(empty.cpu, None);
+        assert_eq!(empty.active_nodes, Some(0));
     }
 }

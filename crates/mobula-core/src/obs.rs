@@ -67,12 +67,15 @@ pub struct ClusterEvents {
 // Metrics (§5.x resource summary)
 // ---------------------------------------------------------------------------
 
-/// A single resource's used-vs-total pair. `used`/`total` are in the
-/// resource's natural unit: CPU in cores, GPU in device count, memory in
-/// bytes.
+/// A single resource's capacity, and its used amount when known. `used`/
+/// `total` are in the resource's natural unit: CPU in cores, GPU in device
+/// count, memory in bytes. `used` is `None` when the cluster does not report
+/// live utilization (e.g. a non-autoscaling cluster whose Ray dashboard has
+/// no load-metrics report) — the tile then shows capacity only.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ResourceStat {
-    pub used: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
     pub total: f64,
 }
 
