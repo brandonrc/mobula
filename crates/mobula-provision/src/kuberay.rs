@@ -1256,6 +1256,7 @@ mod tests {
 
     fn spec(autoscale_groups: &[(&str, u32, u32, u32)]) -> ClusterSpec {
         ClusterSpec {
+            engine: Default::default(),
             name: "demo".into(),
             project: "p".into(),
             ray_version: "2.57.0".into(),

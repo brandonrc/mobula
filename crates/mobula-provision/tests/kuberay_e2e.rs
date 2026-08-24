@@ -18,6 +18,7 @@ use mobula_provision::{KubeRayProvisioner, Provisioner};
 
 fn tiny_spec() -> ClusterSpec {
     ClusterSpec {
+        engine: Default::default(),
         name: "e2e-demo".into(),
         project: "e2e".into(),
         ray_version: "2.57.0".into(),

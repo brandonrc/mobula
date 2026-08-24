@@ -225,6 +225,7 @@ mod tests {
 
     fn spec(min: u32, max: u32, gpu: Option<&str>) -> ClusterSpec {
         ClusterSpec {
+            engine: Default::default(),
             name: "c".into(),
             project: "p".into(),
             ray_version: "2.57.0".into(),
