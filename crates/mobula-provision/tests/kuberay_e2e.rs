@@ -11,7 +11,8 @@ use kube::discovery::ApiResource;
 use kube::Client;
 use mobula_core::{ClusterId, ClusterSpec, ClusterState, WorkerGroup};
 use mobula_provision::kuberay::{
-    DEFAULT_DENY_POLICY_NAME, PSS_ENFORCE_LABEL, TENANT_ALLOW_POLICY_NAME,
+    cluster_allow_policy_name, CLUSTER_ID_LABEL, DEFAULT_DENY_POLICY_NAME, PSS_ENFORCE_LABEL,
+    TENANT_ALLOW_POLICY_NAME,
 };
 use mobula_provision::{KubeRayProvisioner, Provisioner};
 
@@ -70,12 +71,14 @@ async fn provisions_observes_and_terminates() {
         kind: "NetworkPolicy".into(),
     });
     let policies: Api<DynamicObject> = Api::namespaced_with(client.clone(), &ns, &np_resource);
-    let names: Vec<String> = policies
+    let listed = policies
         .list(&ListParams::default())
         .await
-        .expect("list networkpolicies")
-        .into_iter()
-        .filter_map(|p| p.metadata.name)
+        .expect("list networkpolicies");
+    let names: Vec<String> = listed
+        .items
+        .iter()
+        .filter_map(|p| p.metadata.name.clone())
         .collect();
     assert!(
         names.iter().any(|n| n == DEFAULT_DENY_POLICY_NAME),
@@ -85,6 +88,32 @@ async fn provisions_observes_and_terminates() {
         names.iter().any(|n| n == TENANT_ALLOW_POLICY_NAME),
         "tenant-allow policy must exist (found: {names:?})"
     );
+    // #86: no Mobula policy may be namespace-wide — the deny/allow pair
+    // selects only tenant pods (cluster-id label), so the control plane and
+    // any colocated non-Ray pod stay unaffected.
+    let ours = |p: &&DynamicObject| {
+        p.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("app.kubernetes.io/managed-by"))
+            .is_some_and(|v| v == "mobula")
+    };
+    for p in listed.items.iter().filter(ours) {
+        let sel = &p.data["spec"]["podSelector"];
+        assert_ne!(
+            sel,
+            &serde_json::json!({}),
+            "policy {:?} must not select the whole namespace",
+            p.metadata.name
+        );
+        assert!(
+            serde_json::to_string(sel)
+                .expect("serialize selector")
+                .contains(CLUSTER_ID_LABEL),
+            "policy {:?} must scope to the tenant pod label (selector: {sel})",
+            p.metadata.name
+        );
+    }
     let ns_resource = ApiResource::from_gvk(&kube::core::GroupVersionKind {
         group: "".into(),
         version: "v1".into(),
@@ -108,10 +137,23 @@ async fn provisions_observes_and_terminates() {
         .expect("second apply is idempotent");
 
     // It should appear in the field-manager-scoped list immediately.
-    let listed = prov.list().await.expect("list");
+    let clusters = prov.list().await.expect("list");
     assert!(
-        listed.iter().any(|c| c.id == id),
+        clusters.iter().any(|c| c.id == id),
         "applied cluster must be listed"
+    );
+
+    // #86: the apply also ensured the per-cluster intra-tenant allow.
+    let allow_name = cluster_allow_policy_name(&id.0);
+    let allow = policies
+        .get_opt(&allow_name)
+        .await
+        .expect("get per-cluster allow policy")
+        .unwrap_or_else(|| panic!("{allow_name} must exist after apply"));
+    assert_eq!(
+        allow.data["spec"]["podSelector"]["matchLabels"][CLUSTER_ID_LABEL],
+        serde_json::json!(id.0),
+        "per-cluster allow must select exactly this cluster's pods"
     );
 
     // Poll observe until the head reports Running (image pulls are slow).
@@ -145,9 +187,18 @@ async fn provisions_observes_and_terminates() {
     }
     assert_eq!(last, ClusterState::Running);
 
-    // Teardown is idempotent.
+    // Teardown is idempotent, and takes the per-cluster allow policy with
+    // it (#86).
     prov.terminate(&id).await.expect("terminate");
     prov.terminate(&id)
         .await
         .expect("terminate again is a no-op");
+    assert!(
+        policies
+            .get_opt(&allow_name)
+            .await
+            .expect("get per-cluster allow policy after terminate")
+            .is_none(),
+        "{allow_name} must be deleted with the cluster"
+    );
 }

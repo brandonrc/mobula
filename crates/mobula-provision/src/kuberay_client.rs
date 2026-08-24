@@ -119,10 +119,117 @@ impl KubeRayProvisioner {
         Ok(())
     }
 
+    /// A namespaced NetworkPolicy API handle.
+    fn policies_api(&self, namespace: &str) -> Api<DynamicObject> {
+        Api::namespaced_with(self.client.clone(), namespace, &networkpolicy_resource())
+    }
+
+    /// Check-then-apply probe (#56): does `namespace` carry a default-deny
+    /// NetworkPolicy Mobula does not manage? If so an admin runs their own
+    /// (stricter or differently shaped) network posture, and Mobula must
+    /// leave ALL network policy untouched — its allow rules could only
+    /// widen it.
+    async fn admin_managed_deny(&self, namespace: &str) -> Result<bool, ProvisionError> {
+        let existing = self
+            .policies_api(namespace)
+            .list(&ListParams::default())
+            .await?;
+        Ok(existing.items.iter().any(|p| {
+            let ours = p
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(MANAGED_BY_LABEL))
+                .is_some_and(|v| v == FIELD_MANAGER);
+            !ours && kuberay::is_default_deny(&p.data)
+        }))
+    }
+
+    /// Server-side-apply one Mobula NetworkPolicy manifest into `namespace`.
+    async fn apply_network_policy(
+        &self,
+        namespace: &str,
+        manifest: serde_json::Value,
+    ) -> Result<(), ProvisionError> {
+        let name = manifest["metadata"]["name"]
+            .as_str()
+            .expect("policy manifests carry a name")
+            .to_string();
+        let labels: std::collections::BTreeMap<String, String> =
+            serde_json::from_value(manifest["metadata"]["labels"].clone())
+                .map_err(|e| ProvisionError::Backend(e.to_string()))?;
+        let mut obj = DynamicObject::new(&name, &networkpolicy_resource());
+        obj.metadata = ObjectMeta {
+            name: Some(name.clone()),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        obj.data = serde_json::json!({ "spec": manifest["spec"] });
+        // SSA is idempotent for identical desired state; force so a
+        // field conflict with a previous Mobula-shaped apply repairs
+        // instead of erroring.
+        let params = PatchParams::apply(FIELD_MANAGER).force();
+        self.policies_api(namespace)
+            .patch(&name, &params, &Patch::Apply(&obj))
+            .await?;
+        Ok(())
+    }
+
+    /// Ensure the per-cluster intra-tenant allow policy for `id` (#86, see
+    /// [`kuberay::cluster_allow_network_policy`]): cluster pods may talk to
+    /// each other, and to nothing else — tenant clusters stay isolated from
+    /// each other. Skipped (like the namespace posture) when an admin runs
+    /// their own default-deny: Mobula never widens an admin posture.
+    async fn ensure_cluster_allow(&self, id: &str) -> Result<(), ProvisionError> {
+        if self.admin_managed_deny(&self.namespace).await? {
+            tracing::info!(
+                target: "mobula::audit",
+                namespace = %self.namespace, cluster = id,
+                "admin-managed default-deny NetworkPolicy present; not adding per-cluster allow"
+            );
+            return Ok(());
+        }
+        self.apply_network_policy(&self.namespace, kuberay::cluster_allow_network_policy(id))
+            .await?;
+        tracing::info!(
+            target: "mobula::audit",
+            namespace = %self.namespace, cluster = id, "per-cluster allow NetworkPolicy ensured"
+        );
+        Ok(())
+    }
+
+    /// Delete the per-cluster allow policy for `id`. Idempotent: already
+    /// gone (or never created, e.g. under an admin-managed posture) is
+    /// success.
+    async fn delete_cluster_allow(&self, id: &str) -> Result<(), ProvisionError> {
+        let name = kuberay::cluster_allow_policy_name(id);
+        match self
+            .policies_api(&self.namespace)
+            .delete(&name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    target: "mobula::audit",
+                    namespace = %self.namespace, cluster = id, "per-cluster allow NetworkPolicy deleted"
+                );
+                Ok(())
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Ensure the namespace security posture (#56/#62) in `namespace`:
-    /// default-deny + tenant-allow NetworkPolicies and Pod Security
-    /// Standards labels (see [`kuberay::default_deny_network_policy`] /
+    /// default-deny + tenant-allow NetworkPolicies — both scoped to
+    /// Mobula-provisioned tenant pods only, NEVER namespace-wide (#86: the
+    /// kuberay namespace can be Mobula's own, and a namespace-wide deny
+    /// locks the control plane and the gateway's upstreams out of it) —
+    /// and Pod Security Standards labels (see
+    /// [`kuberay::default_deny_network_policy`] /
     /// [`kuberay::tenant_allow_network_policy`] / [`kuberay::namespace_pss_labels`]).
+    /// The per-cluster intra-tenant allow rides the cluster apply/terminate
+    /// path instead ([`kuberay::cluster_allow_network_policy`]).
     ///
     /// Check-then-apply, never weakening a stricter existing posture:
     /// - if a default-deny policy Mobula does not manage already exists in
@@ -138,19 +245,7 @@ impl KubeRayProvisioner {
     /// RayCluster apply); a missing namespace is an error, not silently
     /// skipped — provisioning must not proceed without isolation.
     pub async fn ensure_namespace_posture(&self, namespace: &str) -> Result<(), ProvisionError> {
-        let policies: Api<DynamicObject> =
-            Api::namespaced_with(self.client.clone(), namespace, &networkpolicy_resource());
-        let existing = policies.list(&ListParams::default()).await?;
-        let admin_managed_deny = existing.items.iter().any(|p| {
-            let ours = p
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|l| l.get(MANAGED_BY_LABEL))
-                .is_some_and(|v| v == FIELD_MANAGER);
-            !ours && kuberay::is_default_deny(&p.data)
-        });
-        if admin_managed_deny {
+        if self.admin_managed_deny(namespace).await? {
             tracing::info!(
                 target: "mobula::audit",
                 namespace, "admin-managed default-deny NetworkPolicy present; leaving network posture untouched"
@@ -160,29 +255,11 @@ impl KubeRayProvisioner {
                 kuberay::default_deny_network_policy(),
                 kuberay::tenant_allow_network_policy(),
             ] {
-                let name = manifest["metadata"]["name"]
-                    .as_str()
-                    .expect("policy manifests carry a name")
-                    .to_string();
-                let mut obj = DynamicObject::new(&name, &networkpolicy_resource());
-                obj.metadata = ObjectMeta {
-                    name: Some(name.clone()),
-                    labels: Some(std::collections::BTreeMap::from([(
-                        MANAGED_BY_LABEL.to_string(),
-                        FIELD_MANAGER.to_string(),
-                    )])),
-                    ..Default::default()
-                };
-                obj.data = serde_json::json!({ "spec": manifest["spec"] });
-                // SSA is idempotent for identical desired state; force so a
-                // field conflict with a previous Mobula-shaped apply repairs
-                // instead of erroring.
-                let params = PatchParams::apply(FIELD_MANAGER).force();
-                policies.patch(&name, &params, &Patch::Apply(&obj)).await?;
+                self.apply_network_policy(namespace, manifest).await?;
             }
             tracing::info!(
                 target: "mobula::audit",
-                namespace, "default-deny + tenant-allow NetworkPolicies ensured"
+                namespace, "default-deny + tenant-allow NetworkPolicies ensured (tenant-pod scoped)"
             );
         }
 
@@ -249,6 +326,10 @@ impl Provisioner for KubeRayProvisioner {
         idempotency_key: &str,
         queue: Option<&crate::kuberay::QueueAssignment>,
     ) -> Result<ApplyResponse, ProvisionError> {
+        // #86: the per-cluster intra-tenant allow goes in first, so the
+        // cluster's pods are never up under the default-deny without their
+        // own allow (head↔worker traffic would stall the rollout).
+        self.ensure_cluster_allow(&id.0).await?;
         let manifest = kuberay::to_raycluster(id, spec, self.autoscaling, generation, queue);
         // Wrap the manifest as a DynamicObject the dynamic Api can apply.
         let mut labels = std::collections::BTreeMap::from([
@@ -302,11 +383,13 @@ impl Provisioner for KubeRayProvisioner {
 
     async fn terminate(&self, id: &ClusterId) -> Result<(), ProvisionError> {
         match self.api().delete(&id.0, &DeleteParams::default()).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {}
             // Already gone is success (idempotent teardown).
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => return Err(e.into()),
         }
+        // The cluster's allow policy goes with it (#86); idempotent too.
+        self.delete_cluster_allow(&id.0).await
     }
 
     async fn suspend(&self, id: &ClusterId) -> Result<(), ProvisionError> {
@@ -375,6 +458,11 @@ impl Provisioner for KubeRayProvisioner {
 #[async_trait]
 impl ServiceProvisioner for KubeRayProvisioner {
     async fn deploy(&self, name: &str, spec: &ServiceSpec) -> Result<(), ProvisionError> {
+        // #86: service pods carry the same cluster-id label (stamped by
+        // to_rayservice's pod templates), so they get the same per-cluster
+        // allow — including across a RayService zero-downtime upgrade,
+        // where old and new generated RayClusters coexist but share it.
+        self.ensure_cluster_allow(name).await?;
         let manifest = kuberay::to_rayservice(name, spec);
         let mut obj = DynamicObject::new(name, &rayservice_resource());
         obj.metadata = ObjectMeta {
@@ -417,10 +505,12 @@ impl ServiceProvisioner for KubeRayProvisioner {
         let api: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), &self.namespace, &rayservice_resource());
         match api.delete(name, &DeleteParams::default()).await {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => return Err(e.into()),
         }
+        // The service's allow policy goes with it (#86); idempotent too.
+        self.delete_cluster_allow(name).await
     }
 
     async fn list(&self) -> Result<Vec<ObservedService>, ProvisionError> {

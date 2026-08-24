@@ -68,7 +68,7 @@ pub fn to_raycluster(
     let worker_specs: Vec<Value> = spec
         .worker_groups
         .iter()
-        .map(|g| worker_group_spec(g, &spec.image, autoscaling, Some(generation)))
+        .map(|g| worker_group_spec(&id.0, g, &spec.image, autoscaling, Some(generation)))
         .collect();
 
     let mut labels = json!({
@@ -105,7 +105,7 @@ pub fn to_raycluster(
             // false once admitted, so Mobula's desired false never fights
             // Kueue — an admitted cluster converges to running pods.
             "suspend": false,
-            "headGroupSpec": head_group_spec(spec, Some(generation)),
+            "headGroupSpec": head_group_spec(&id.0, spec, Some(generation)),
             "workerGroupSpecs": worker_specs,
         },
     })
@@ -213,10 +213,11 @@ fn container_image(group: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn head_group_spec(spec: &ClusterSpec, generation: Option<u64>) -> Value {
+fn head_group_spec(id: &str, spec: &ClusterSpec, generation: Option<u64>) -> Value {
     json!({
         "rayStartParams": { "dashboard-host": "0.0.0.0" },
         "template": pod_template(
+            id,
             "ray-head",
             &spec.image,
             &spec.head_cpu,
@@ -228,6 +229,7 @@ fn head_group_spec(spec: &ClusterSpec, generation: Option<u64>) -> Value {
 }
 
 fn worker_group_spec(
+    id: &str,
     g: &WorkerGroup,
     image: &str,
     autoscaling: bool,
@@ -241,7 +243,7 @@ fn worker_group_spec(
         "minReplicas": g.min_replicas,
         "maxReplicas": g.max_replicas,
         "rayStartParams": {},
-        "template": pod_template("ray-worker", image, &g.cpu, &g.memory, g.gpu.as_deref(), generation),
+        "template": pod_template(id, "ray-worker", image, &g.cpu, &g.memory, g.gpu.as_deref(), generation),
     });
     // ADR-0007: only set `replicas` when we own it (autoscaling off). With
     // the in-tree autoscaler on, the sidecar owns replicas + scaleStrategy;
@@ -253,6 +255,7 @@ fn worker_group_spec(
 }
 
 fn pod_template(
+    cluster_id: &str,
     container_name: &str,
     image: &str,
     cpu: &str,
@@ -275,14 +278,22 @@ fn pod_template(
     if !image.is_empty() {
         container["image"] = json!(image);
     }
-    let mut template = json!({ "spec": { "containers": [container] } });
+    // Every tenant pod carries the cluster-id label (#86): it is what the
+    // scoped NetworkPolicies select on — the default-deny/tenant-allow pair
+    // matches pods with the label at all, and the per-cluster allow matches
+    // this exact value, keeping tenant clusters isolated from each other.
+    // KubeRay merges its own ray.io/* labels alongside it.
+    let mut template = json!({
+        "metadata": {
+            "labels": { CLUSTER_ID_LABEL: cluster_id },
+        },
+        "spec": { "containers": [container] },
+    });
     // Stamp the generation into the pod template so a spec bump changes the
     // template hash and KubeRay rolls the pods (#40). Services pass None —
     // KubeRay's RayService controller owns their rollout, not Mobula.
     if let Some(gen) = generation {
-        template["metadata"] = json!({
-            "annotations": { GENERATION_ANNOTATION: gen.to_string() },
-        });
+        template["metadata"]["annotations"] = json!({ GENERATION_ANNOTATION: gen.to_string() });
     }
     template
 }
@@ -303,19 +314,53 @@ pub const NETWORK_POLICY_KIND: &str = "NetworkPolicy";
 pub const DEFAULT_DENY_POLICY_NAME: &str = "mobula-default-deny";
 /// The explicit-allow policy paired with the default-deny.
 pub const TENANT_ALLOW_POLICY_NAME: &str = "mobula-tenant-allow";
+/// Name prefix of the per-cluster intra-tenant allow policy
+/// ([`cluster_allow_network_policy`]); the suffix is the cluster id.
+pub const CLUSTER_ALLOW_POLICY_PREFIX: &str = "mobula-cluster-";
 /// Namespace label marking the namespace(s) the Mobula control plane
 /// (API / reconciler / job gateway) runs in. The tenant allow policy opens
-/// ingress from those namespaces so the control plane can reach the Ray
-/// head (dashboard/jobs/metrics 8265, Ray client 10001). Operators label
-/// the control-plane namespace once:
+/// ingress from control-plane pods in those namespaces so the control plane
+/// can reach the Ray head (dashboard/jobs/metrics 8265, Ray client 10001).
+/// Operators label the control-plane namespace once:
 /// `kubectl label namespace <ns> mobula.dev/control-plane=true`.
 pub const CONTROL_PLANE_NAMESPACE_LABEL: &str = "mobula.dev/control-plane";
+/// Pod label marking the Mobula control-plane pods themselves (#86): the
+/// tenant allow policy admits ingress from pods carrying this label, never
+/// from a whole namespace — a namespace-wide peer would let colocated
+/// tenant pods reach each other's head ports. Deployments set it on the
+/// Mobula pod template: `mobula.dev/control-plane: "true"`.
+pub const CONTROL_PLANE_POD_LABEL: &str = "mobula.dev/control-plane";
+
+/// The pod selector every Mobula tenant policy scopes to (#86): only pods
+/// Mobula itself provisioned, recognized by the [`CLUSTER_ID_LABEL`] that
+/// [`to_raycluster`] / [`to_rayservice`] stamp onto every head and worker
+/// pod template. NEVER an empty (namespace-wide) selector: the kuberay
+/// namespace can be — and in the pack deployment is — Mobula's own
+/// namespace, and a namespace-wide default-deny locks the control plane,
+/// the UI, and the gateway's upstreams out of it (#86). Admin- or
+/// pack-managed Ray clusters colocated in the namespace are equally out of
+/// scope: their network posture belongs to whoever provisioned them.
+fn tenant_pod_selector() -> Value {
+    json!({
+        "matchExpressions": [
+            { "key": CLUSTER_ID_LABEL, "operator": "Exists" },
+        ],
+    })
+}
+
+/// The name of the per-cluster allow policy for cluster `id`.
+pub fn cluster_allow_policy_name(id: &str) -> String {
+    format!("{CLUSTER_ALLOW_POLICY_PREFIX}{id}")
+}
 
 /// The default-deny NetworkPolicy (#56, research: compliance gap §4.3 —
-/// the single highest-impact isolation fix): select every pod in the
-/// namespace, deny all ingress and egress. NetworkPolicies are additive
-/// (union of allows), so pairing this with [`tenant_allow_network_policy`]
-/// yields exactly the allow rules and nothing else.
+/// the single highest-impact isolation fix): select every *Mobula-
+/// provisioned tenant* pod ([`tenant_pod_selector`], #86 — never every pod
+/// in the namespace), deny all ingress and egress. NetworkPolicies are
+/// additive (union of allows), so pairing this with
+/// [`tenant_allow_network_policy`] + the per-cluster
+/// [`cluster_allow_network_policy`] yields exactly the allow rules and
+/// nothing else — and non-tenant pods in the namespace are untouched.
 pub fn default_deny_network_policy() -> Value {
     json!({
         "apiVersion": NETWORK_POLICY_API_VERSION,
@@ -325,24 +370,36 @@ pub fn default_deny_network_policy() -> Value {
             "labels": { MANAGED_BY_LABEL: FIELD_MANAGER },
         },
         "spec": {
-            "podSelector": {},
+            "podSelector": tenant_pod_selector(),
             "policyTypes": ["Ingress", "Egress"],
         },
     })
 }
 
-/// The explicit allows a Ray cluster needs under the default-deny (#56):
+/// The allows every Mobula tenant pod needs under the default-deny (#56),
+/// scoped to [`tenant_pod_selector`] (#86). Intra-cluster traffic is NOT
+/// here — it is per-cluster ([`cluster_allow_network_policy`]) so tenant
+/// clusters stay isolated from each other. This policy carries only the
+/// cross-cutting allows:
 ///
-/// - same-namespace pod-to-pod, all ports (Ray head↔workers: GCS 6379,
-///   dashboard 8265, client 10001, plus the raylet's dynamic ports — too
-///   many to enumerate, and they stay inside the tenant boundary);
-/// - ingress from Mobula control-plane namespaces
-///   ([`CONTROL_PLANE_NAMESPACE_LABEL`]) to the head's dashboard (8265) and
-///   Ray client (10001) ports only — GCS is not a control-plane surface;
+/// - ingress from Mobula control-plane pods ([`CONTROL_PLANE_POD_LABEL`],
+///   same namespace or a [`CONTROL_PLANE_NAMESPACE_LABEL`]-labeled one) to
+///   the head's dashboard (8265) and Ray client (10001) ports only — GCS
+///   is not a control-plane surface;
+/// - ingress from the KubeRay operator (any namespace, pods labeled
+///   `app.kubernetes.io/name: kuberay-operator`) to the dashboard (8265),
+///   dashboard agent (52365) and serve (8000) ports — RayService health
+///   checking and serve-config submission need it;
 /// - egress to kube-dns (namespace `kube-system`, `k8s-app: kube-dns`,
 ///   port 53 UDP+TCP) — default-deny otherwise breaks DNS
 ///   (research §4.3). The `kubernetes.io/metadata.name` namespace label is
 ///   API-server-managed since 1.22, so this needs no admin labeling.
+///
+/// TODO(#86): dashboards of provisioned clusters are not reachable from
+/// the ingress gateway's namespace (e.g. a NebariApp-exposed dashboard).
+/// If that exposure is wanted, it needs an explicit, configurable
+/// gateway-namespace ingress knob here — deliberately not built as part of
+/// the #86 lockout fix.
 pub fn tenant_allow_network_policy() -> Value {
     json!({
         "apiVersion": NETWORK_POLICY_API_VERSION,
@@ -352,26 +409,50 @@ pub fn tenant_allow_network_policy() -> Value {
             "labels": { MANAGED_BY_LABEL: FIELD_MANAGER },
         },
         "spec": {
-            "podSelector": {},
+            "podSelector": tenant_pod_selector(),
             "policyTypes": ["Ingress", "Egress"],
             "ingress": [
-                // Ray head↔workers, unrestricted ports inside the tenant.
-                { "from": [ { "podSelector": {} } ] },
                 // The Mobula control plane → Ray head dashboard/client.
+                // Pod-labeled peers only (#86): same-namespace control-plane
+                // pods, and control-plane pods in a labeled namespace.
                 {
                     "from": [
-                        { "namespaceSelector": {
-                            "matchLabels": { CONTROL_PLANE_NAMESPACE_LABEL: "true" },
+                        { "podSelector": {
+                            "matchLabels": { CONTROL_PLANE_POD_LABEL: "true" },
                         } },
+                        {
+                            "namespaceSelector": {
+                                "matchLabels": { CONTROL_PLANE_NAMESPACE_LABEL: "true" },
+                            },
+                            "podSelector": {
+                                "matchLabels": { CONTROL_PLANE_POD_LABEL: "true" },
+                            },
+                        },
                     ],
                     "ports": [
                         { "protocol": "TCP", "port": 8265 },
                         { "protocol": "TCP", "port": 10001 },
                     ],
                 },
+                // The KubeRay operator (wherever it runs) → dashboard,
+                // dashboard agent, serve.
+                {
+                    "from": [
+                        {
+                            "namespaceSelector": {},
+                            "podSelector": {
+                                "matchLabels": { "app.kubernetes.io/name": "kuberay-operator" },
+                            },
+                        },
+                    ],
+                    "ports": [
+                        { "protocol": "TCP", "port": 8265 },
+                        { "protocol": "TCP", "port": 52365 },
+                        { "protocol": "TCP", "port": 8000 },
+                    ],
+                },
             ],
             "egress": [
-                { "to": [ { "podSelector": {} } ] },
                 {
                     "to": [
                         {
@@ -388,6 +469,41 @@ pub fn tenant_allow_network_policy() -> Value {
                         { "protocol": "TCP", "port": 53 },
                     ],
                 },
+            ],
+        },
+    })
+}
+
+/// The per-cluster intra-tenant allow (#86, preserving #56's tenant-vs-
+/// tenant isolation): pods of cluster `id` (matched by the exact
+/// [`CLUSTER_ID_LABEL`] value) may talk to each other on every port — Ray
+/// head↔workers use GCS 6379, dashboard 8265, client 10001 plus the
+/// raylet's dynamic ports, too many to enumerate — and to nothing else.
+/// Pods of a different cluster carry a different label value, match
+/// neither the subject nor the peer selector, and stay unreachable.
+/// Applied with the cluster's RayCluster/RayService and deleted with it.
+pub fn cluster_allow_network_policy(id: &str) -> Value {
+    let same_cluster = json!({
+        "matchLabels": { CLUSTER_ID_LABEL: id },
+    });
+    json!({
+        "apiVersion": NETWORK_POLICY_API_VERSION,
+        "kind": NETWORK_POLICY_KIND,
+        "metadata": {
+            "name": cluster_allow_policy_name(id),
+            "labels": {
+                MANAGED_BY_LABEL: FIELD_MANAGER,
+                CLUSTER_ID_LABEL: id,
+            },
+        },
+        "spec": {
+            "podSelector": &same_cluster,
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [
+                { "from": [ { "podSelector": &same_cluster } ] },
+            ],
+            "egress": [
+                { "to": [ { "podSelector": &same_cluster } ] },
             ],
         },
     })
@@ -484,11 +600,11 @@ pub fn to_rayservice(name: &str, spec: &ServiceSpec) -> Value {
                 "rayVersion": spec.ray_version,
                 "headGroupSpec": {
                     "rayStartParams": { "dashboard-host": "0.0.0.0" },
-                    "template": pod_template("ray-head", &spec.image, &spec.head_cpu, &spec.head_memory, None, None),
+                    "template": pod_template(name, "ray-head", &spec.image, &spec.head_cpu, &spec.head_memory, None, None),
                 },
                 // Serve worker replicas are fixed here; Serve autoscaling is
                 // Ray Serve's own concern (deployment num_replicas).
-                "workerGroupSpecs": [worker_group_spec(&worker, &spec.image, false, None)],
+                "workerGroupSpecs": [worker_group_spec(name, &worker, &spec.image, false, None)],
             },
         },
     })
@@ -810,34 +926,57 @@ mod tests {
         assert_eq!(m["spec"]["workerGroupSpecs"][0]["maxReplicas"], 4);
     }
 
+    /// The tenant selector every namespace-level policy must scope to:
+    /// pods carrying the Mobula cluster-id label at all.
+    fn tenant_selector() -> Value {
+        json!({
+            "matchExpressions": [
+                { "key": CLUSTER_ID_LABEL, "operator": "Exists" },
+            ],
+        })
+    }
+
     #[test]
     fn default_deny_policy_shape() {
-        // #56: select every pod, deny all ingress+egress, carry no allow
-        // rules — the allow rules live only in the tenant-allow policy.
+        // #56: deny all ingress+egress, carry no allow rules — the allow
+        // rules live only in the tenant-allow / per-cluster policies.
+        // #86: select ONLY Mobula-provisioned tenant pods, never every pod
+        // in the namespace — a namespace-wide deny locks the control plane
+        // (and the gateway's upstreams) out of its own namespace.
         let p = default_deny_network_policy();
         assert_eq!(p["apiVersion"], "networking.k8s.io/v1");
         assert_eq!(p["kind"], "NetworkPolicy");
         assert_eq!(p["metadata"]["name"], DEFAULT_DENY_POLICY_NAME);
         assert_eq!(p["metadata"]["labels"][MANAGED_BY_LABEL], "mobula");
         let spec = &p["spec"];
-        assert_eq!(spec["podSelector"], json!({}));
+        assert_eq!(spec["podSelector"], tenant_selector());
+        assert_ne!(
+            spec["podSelector"],
+            json!({}),
+            "the deny must never be namespace-wide (#86)"
+        );
         assert_eq!(spec["policyTypes"], json!(["Ingress", "Egress"]));
         assert!(spec.get("ingress").is_none());
         assert!(spec.get("egress").is_none());
-        // Our own default-deny is recognized by the check-then-apply probe.
-        assert!(is_default_deny(&p));
+        // The scoped deny is NOT a namespace-wide default-deny: the
+        // check-then-apply probe only skips posture setup for an
+        // admin-managed deny-all, which this deliberately is not.
+        assert!(!is_default_deny(&p));
     }
 
     #[test]
     fn tenant_allow_policy_shape() {
-        // #56: exactly the allows a Ray cluster needs — same-namespace
-        // pod-to-pod, control-plane ingress to the head's dashboard/client
-        // ports, kube-dns egress — and nothing else.
+        // #56/#86: exactly the cross-cutting allows every tenant pod needs —
+        // control-plane-pod ingress to the head's dashboard/client ports,
+        // KubeRay-operator ingress, kube-dns egress — and nothing else.
+        // Intra-cluster traffic is per-cluster (cluster_allow_network_policy),
+        // NOT here: a namespace-wide pod-to-pod allow would let tenant A
+        // reach tenant B.
         let p = tenant_allow_network_policy();
         assert_eq!(p["metadata"]["name"], TENANT_ALLOW_POLICY_NAME);
         assert_eq!(p["metadata"]["labels"][MANAGED_BY_LABEL], "mobula");
         let spec = &p["spec"];
-        assert_eq!(spec["podSelector"], json!({}));
+        assert_eq!(spec["podSelector"], tenant_selector());
         assert_eq!(spec["policyTypes"], json!(["Ingress", "Egress"]));
         // An allow policy is not a default-deny (the probe must not skip
         // posture setup because of it).
@@ -845,34 +984,58 @@ mod tests {
 
         let ingress = spec["ingress"].as_array().unwrap();
         assert_eq!(ingress.len(), 2);
-        // Ray head↔workers: same-namespace pods, all ports (GCS 6379,
-        // dashboard 8265, client 10001, raylet dynamic ports).
-        assert_eq!(ingress[0]["from"], json!([{ "podSelector": {} }]));
-        assert!(ingress[0].get("ports").is_none());
-        // Control plane → head: dashboard (8265) + Ray client (10001) only,
-        // from namespaces carrying the documented control-plane label.
+        // Mobula control plane → head: dashboard (8265) + Ray client
+        // (10001) only, and only from pods carrying the control-plane pod
+        // label (#86) — same namespace or a labeled one. Never a bare
+        // namespaceSelector: that would admit colocated tenant pods.
         assert_eq!(
-            ingress[1]["from"],
-            json!([{ "namespaceSelector": {
-                "matchLabels": { CONTROL_PLANE_NAMESPACE_LABEL: "true" },
-            } }])
+            ingress[0]["from"],
+            json!([
+                { "podSelector": {
+                    "matchLabels": { CONTROL_PLANE_POD_LABEL: "true" },
+                } },
+                {
+                    "namespaceSelector": {
+                        "matchLabels": { CONTROL_PLANE_NAMESPACE_LABEL: "true" },
+                    },
+                    "podSelector": {
+                        "matchLabels": { CONTROL_PLANE_POD_LABEL: "true" },
+                    },
+                },
+            ])
         );
         assert_eq!(
-            ingress[1]["ports"],
+            ingress[0]["ports"],
             json!([
                 { "protocol": "TCP", "port": 8265 },
                 { "protocol": "TCP", "port": 10001 },
             ])
         );
+        // KubeRay operator (any namespace, operator pods only) → dashboard,
+        // dashboard agent, serve.
+        assert_eq!(
+            ingress[1]["from"],
+            json!([{
+                "namespaceSelector": {},
+                "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "kuberay-operator" },
+                },
+            }])
+        );
+        assert_eq!(
+            ingress[1]["ports"],
+            json!([
+                { "protocol": "TCP", "port": 8265 },
+                { "protocol": "TCP", "port": 52365 },
+                { "protocol": "TCP", "port": 8000 },
+            ])
+        );
 
         let egress = spec["egress"].as_array().unwrap();
-        assert_eq!(egress.len(), 2);
-        // Same-namespace pod-to-pod (workers → head).
-        assert_eq!(egress[0]["to"], json!([{ "podSelector": {} }]));
-        assert!(egress[0].get("ports").is_none());
+        assert_eq!(egress.len(), 1);
         // kube-dns only: kube-system namespace + kube-dns pods, 53 UDP+TCP.
         assert_eq!(
-            egress[1]["to"],
+            egress[0]["to"],
             json!([{
                 "namespaceSelector": {
                     "matchLabels": { "kubernetes.io/metadata.name": "kube-system" },
@@ -881,11 +1044,162 @@ mod tests {
             }])
         );
         assert_eq!(
-            egress[1]["ports"],
+            egress[0]["ports"],
             json!([
                 { "protocol": "UDP", "port": 53 },
                 { "protocol": "TCP", "port": 53 },
             ])
+        );
+    }
+
+    #[test]
+    fn cluster_allow_policy_is_scoped_to_one_cluster() {
+        // #86: intra-cluster traffic is allowed per cluster — the subject
+        // and every peer match the exact cluster-id label value, all ports
+        // (GCS 6379, dashboard 8265, client 10001, raylet dynamic ports).
+        let p = cluster_allow_network_policy("tenant-a");
+        assert_eq!(p["apiVersion"], "networking.k8s.io/v1");
+        assert_eq!(p["kind"], "NetworkPolicy");
+        assert_eq!(p["metadata"]["name"], "mobula-cluster-tenant-a");
+        assert_eq!(p["metadata"]["labels"][MANAGED_BY_LABEL], "mobula");
+        assert_eq!(p["metadata"]["labels"][CLUSTER_ID_LABEL], "tenant-a");
+        let spec = &p["spec"];
+        let own = json!({ "matchLabels": { CLUSTER_ID_LABEL: "tenant-a" } });
+        assert_eq!(spec["podSelector"], own);
+        assert_eq!(spec["policyTypes"], json!(["Ingress", "Egress"]));
+        let ingress = spec["ingress"].as_array().unwrap();
+        assert_eq!(ingress.len(), 1);
+        assert_eq!(ingress[0]["from"], json!([{ "podSelector": own }]));
+        assert!(ingress[0].get("ports").is_none());
+        let egress = spec["egress"].as_array().unwrap();
+        assert_eq!(egress.len(), 1);
+        assert_eq!(egress[0]["to"], json!([{ "podSelector": own }]));
+        assert!(egress[0].get("ports").is_none());
+        assert!(!is_default_deny(&p));
+    }
+
+    #[test]
+    fn tenant_clusters_stay_isolated_from_each_other() {
+        // #56 intent under the #86 rescope: a pod of tenant-b (labels
+        // cluster-id=tenant-b) matches neither the subject nor any allow
+        // peer of tenant-a's policy — and the namespace-level tenant-allow
+        // has no pod-to-pod rule at all — so B cannot reach A.
+        let a = cluster_allow_network_policy("tenant-a");
+        let b_labels = json!({ CLUSTER_ID_LABEL: "tenant-b" });
+        for rule in a["spec"]["ingress"].as_array().unwrap() {
+            for peer in rule["from"].as_array().unwrap() {
+                let sel = &peer["podSelector"]["matchLabels"];
+                assert_ne!(sel, &b_labels, "tenant-b must not be an allowed peer");
+                assert_eq!(sel, &json!({ CLUSTER_ID_LABEL: "tenant-a" }));
+            }
+        }
+        let shared = tenant_allow_network_policy();
+        for rule in shared["spec"]["ingress"].as_array().unwrap() {
+            for peer in rule["from"].as_array().unwrap() {
+                assert_ne!(
+                    peer["podSelector"],
+                    json!({}),
+                    "no allow rule may admit arbitrary same-namespace pods"
+                );
+                assert!(
+                    peer["podSelector"].get("matchLabels").is_some(),
+                    "every peer must be pod-label-scoped: {peer}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_mobula_policy_selects_namespace_wide() {
+        // #86 regression pin: no Mobula NetworkPolicy may carry an empty
+        // (namespace-wide) podSelector — that is exactly the shape that
+        // locked the control plane out of its own namespace. Non-tenant
+        // pods (the Mobula API/UI, gateway upstreams, colocated services)
+        // must be unaffected by every policy Mobula ensures.
+        for p in [
+            default_deny_network_policy(),
+            tenant_allow_network_policy(),
+            cluster_allow_network_policy("demo"),
+        ] {
+            let sel = &p["spec"]["podSelector"];
+            assert_ne!(
+                sel,
+                &json!({}),
+                "{} must not select the whole namespace",
+                p["metadata"]["name"]
+            );
+            let non_empty = sel
+                .get("matchLabels")
+                .and_then(|m| m.as_object())
+                .is_some_and(|m| !m.is_empty())
+                || sel
+                    .get("matchExpressions")
+                    .and_then(|m| m.as_array())
+                    .is_some_and(|a| !a.is_empty());
+            assert!(
+                non_empty,
+                "{} podSelector must positively select tenant pods",
+                p["metadata"]["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn pod_templates_carry_the_cluster_id_label() {
+        // #86: the scoped policies select on the cluster-id pod label, so
+        // every head and worker template Mobula renders must carry it —
+        // RayCluster and RayService alike (a RayService's generated
+        // RayClusters inherit the template labels across upgrades).
+        let m = to_raycluster(
+            &ClusterId("demo".into()),
+            &spec(&[("cpu", 0, 4, 2)]),
+            false,
+            1,
+            None,
+        );
+        assert_eq!(
+            m["spec"]["headGroupSpec"]["template"]["metadata"]["labels"][CLUSTER_ID_LABEL],
+            "demo"
+        );
+        assert_eq!(
+            m["spec"]["workerGroupSpecs"][0]["template"]["metadata"]["labels"][CLUSTER_ID_LABEL],
+            "demo"
+        );
+        // The generation annotation still rides the same metadata (#40).
+        assert_eq!(
+            m["spec"]["headGroupSpec"]["template"]["metadata"]["annotations"]
+                [GENERATION_ANNOTATION],
+            "1"
+        );
+
+        let s = to_rayservice("svc", &service_spec(UpgradeStrategy::Canary));
+        let cfg = &s["spec"]["rayClusterConfig"];
+        assert_eq!(
+            cfg["headGroupSpec"]["template"]["metadata"]["labels"][CLUSTER_ID_LABEL],
+            "svc"
+        );
+        assert_eq!(
+            cfg["workerGroupSpecs"][0]["template"]["metadata"]["labels"][CLUSTER_ID_LABEL],
+            "svc"
+        );
+    }
+
+    #[test]
+    fn control_plane_reaches_the_head_dashboard() {
+        // #86: the job gateway / lifecycle path (mobula pod → head:8265)
+        // must stay explicitly allowed — as a pod-label-scoped peer, not
+        // namespace-wide openness.
+        let p = tenant_allow_network_policy();
+        let rule = &p["spec"]["ingress"][0];
+        let same_ns_peer = &rule["from"][0];
+        assert_eq!(
+            same_ns_peer["podSelector"]["matchLabels"][CONTROL_PLANE_POD_LABEL],
+            "true"
+        );
+        let ports = rule["ports"].as_array().unwrap();
+        assert!(
+            ports.iter().any(|p| p["port"] == 8265),
+            "dashboard/job port 8265 must be allowed from the control plane"
         );
     }
 
