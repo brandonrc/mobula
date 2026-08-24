@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -33,10 +33,10 @@ use axum::{Extension, Json, Router};
 use futures::StreamExt;
 use mobula_auth::{Identity, PermissionType, Target};
 use mobula_controller::Store;
-use mobula_core::{ClusterId, ClusterRegistry};
+use mobula_core::{ClusterId, ClusterMetrics, ClusterRegistry, ResourceStat};
 use mobula_provision::{ProvisionError, Provisioner};
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::auth_layer::{authorize, authorize_scoped};
 use crate::clusters::read_scope;
@@ -52,6 +52,14 @@ const MAX_JOBS_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Cap on concurrent southbound jobs proxies (mirrors the gateway's inflight
 /// cap, #30/#31): excess requests are refused with 503 rather than piling up.
 const MAX_INFLIGHT: usize = 64;
+/// Cap on the proxied `/api/cluster_status` body: the autoscaler report is
+/// small, but a misconfigured head must not stream unbounded memory in.
+const MAX_STATUS_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Default log tail when the caller names none.
+const DEFAULT_LOG_TAIL: usize = 200;
+/// Hard cap on the log tail a caller may request (bounds the K8s log fetch and
+/// the response body).
+const MAX_LOG_TAIL: usize = 5_000;
 
 #[derive(Clone)]
 pub struct ObsApiState {
@@ -386,6 +394,329 @@ async fn cluster_jobs(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared read authorization
+// ---------------------------------------------------------------------------
+
+/// Authorize a cluster read (`Read` on `Target::Cluster`, Viewer+), scoped to
+/// the cluster's project when it has one. Returns the deny response, or `None`
+/// when allowed. Shared by the events/metrics/logs reads, which — like nodes —
+/// read as cluster data.
+async fn deny_cluster_read(
+    st: &ObsApiState,
+    identity: &Option<Extension<Identity>>,
+    scope: &ClusterScope,
+) -> Option<Response> {
+    match scope {
+        ClusterScope::Project(project) => {
+            authorize_scoped(
+                Some(&st.store),
+                ident(identity),
+                PermissionType::Read,
+                Target::Cluster,
+                project,
+            )
+            .await
+        }
+        ClusterScope::Registered => {
+            authorize(
+                Some(&st.store),
+                ident(identity),
+                PermissionType::Read,
+                Target::Cluster,
+            )
+            .await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Events (§5.8)
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    get, path = "/api/v1/clusters/{id}/events", tag = "clusters",
+    params(("id" = String, Path, description = "Cluster id")),
+    responses(
+        (status = 200, description = "Kubernetes Events for the cluster's objects, newest first (capped)", body = mobula_core::ClusterEvents),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Missing Read on cluster"),
+        (status = 404, description = "No such cluster, or the backend exposes no events"),
+        (status = 503, description = "The event source (Kubernetes) could not be reached")),
+    security(("bearer" = []))
+)]
+async fn cluster_events(
+    State(st): State<ObsApiState>,
+    identity: Option<Extension<Identity>>,
+    Path(id): Path<String>,
+) -> Response {
+    let id = ClusterId(id);
+    let scope = match scope_for_read(&st, &identity, &id).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    if let Some(deny) = deny_cluster_read(&st, &identity, &scope).await {
+        return deny;
+    }
+
+    let Some(provisioner) = st.provisioner.as_ref() else {
+        return (StatusCode::NOT_FOUND, "events unavailable").into_response();
+    };
+    match provisioner.cluster_events(&id).await {
+        Ok(Some(events)) => Json(events).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "events unavailable").into_response(),
+        Err(ProvisionError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, "no such cluster").into_response()
+        }
+        Err(e) => {
+            // The event source is Kubernetes; a failure means the control plane
+            // can't reach its own cluster API. 503, not 500.
+            tracing::warn!(cluster = %id.0, error = %e, "events backend error");
+            (StatusCode::SERVICE_UNAVAILABLE, "event source unavailable").into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metrics (§5.x resource summary)
+// ---------------------------------------------------------------------------
+
+/// Read a Ray usage pair (`[used, total]`) from the load-metrics `usage` map.
+fn usage_stat(usage: &serde_json::Value, key: &str) -> Option<ResourceStat> {
+    let arr = usage.get(key).and_then(|v| v.as_array())?;
+    let used = arr.first().and_then(|v| v.as_f64())?;
+    let total = arr.get(1).and_then(|v| v.as_f64())?;
+    Some(ResourceStat { used, total })
+}
+
+/// Sum the counts an autoscaler `activeNodes`-style value carries: it may be a
+/// `{node-type: count}` object or a `[...]` list of nodes.
+fn count_nodes(v: Option<&serde_json::Value>) -> Option<u64> {
+    match v? {
+        serde_json::Value::Object(m) => Some(m.values().filter_map(|c| c.as_u64()).sum()),
+        serde_json::Value::Array(a) => Some(a.len() as u64),
+        _ => None,
+    }
+}
+
+/// Normalize the Ray dashboard `GET /api/cluster_status` body into a stable
+/// resource summary (api-v1.md §5.x). Ray nests the report differently across
+/// versions, so the load-metrics `usage` map is looked up along several paths;
+/// missing stats simply yield `None` (the UI renders only the tiles present).
+fn normalize_cluster_status(cluster_id: &str, raw: &serde_json::Value) -> ClusterMetrics {
+    // Locate the clusterStatus object (structured form). Ray has shipped both
+    // `data.clusterStatus` and a top-level `clusterStatus`; also tolerate the
+    // report living directly under `data`.
+    let cluster_status = raw
+        .get("data")
+        .and_then(|d| d.get("clusterStatus"))
+        .or_else(|| raw.get("clusterStatus"))
+        .or_else(|| raw.get("data"))
+        .unwrap_or(raw);
+
+    let usage = cluster_status
+        .get("loadMetricsReport")
+        .and_then(|r| r.get("usage"));
+
+    let (cpu, gpu, memory, object_store_memory) = match usage {
+        Some(u) => (
+            usage_stat(u, "CPU"),
+            usage_stat(u, "GPU"),
+            usage_stat(u, "memory"),
+            usage_stat(u, "object_store_memory"),
+        ),
+        None => (None, None, None, None),
+    };
+
+    let autoscaler = cluster_status.get("autoscalerReport");
+    let active_nodes = count_nodes(autoscaler.and_then(|a| a.get("activeNodes")));
+    let pending_nodes = count_nodes(autoscaler.and_then(|a| a.get("pendingNodes")));
+    let failed_nodes = count_nodes(autoscaler.and_then(|a| a.get("failedNodes")));
+
+    ClusterMetrics {
+        cluster_id: cluster_id.to_string(),
+        cpu,
+        gpu,
+        memory,
+        object_store_memory,
+        active_nodes,
+        pending_nodes,
+        failed_nodes,
+    }
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/clusters/{id}/metrics", tag = "clusters",
+    params(("id" = String, Path, description = "Cluster id")),
+    responses(
+        (status = 200, description = "Normalized cluster resource-usage summary (CPU/GPU/mem used vs total + node counts)", body = mobula_core::ClusterMetrics),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Missing Read on cluster"),
+        (status = 404, description = "No such cluster, or no reachable Ray dashboard for it"),
+        (status = 503, description = "The cluster's Ray dashboard could not be reached")),
+    security(("bearer" = []))
+)]
+async fn cluster_metrics(
+    State(st): State<ObsApiState>,
+    identity: Option<Extension<Identity>>,
+    Path(id): Path<String>,
+) -> Response {
+    let id = ClusterId(id);
+    let scope = match scope_for_read(&st, &identity, &id).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    if let Some(deny) = deny_cluster_read(&st, &identity, &scope).await {
+        return deny;
+    }
+
+    // Resolve the southbound dashboard base + token, exactly as the jobs proxy
+    // does: registered cluster from the registry (explicit token), else the
+    // lifecycle-managed head-service dashboard (no token, in-cluster).
+    let (base, token) = if let Some(ep) = st.registry.by_id(&id) {
+        (ep.api_base_url.clone(), ep.auth_token.clone())
+    } else if let Some(base) = st
+        .provisioner
+        .as_ref()
+        .and_then(|p| p.dashboard_api_base(&id))
+    {
+        (base, None)
+    } else {
+        return (StatusCode::NOT_FOUND, "metrics unavailable").into_response();
+    };
+    let url = format!("{}/api/cluster_status", base.trim_end_matches('/'));
+
+    let _permit = match st.inflight.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway busy: too many inflight proxied requests",
+            )
+                .into_response()
+        }
+    };
+
+    let mut req = st.client.get(&url);
+    if let Some(token) = &token {
+        match HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(v) => req = req.header(header::AUTHORIZATION, v),
+            Err(_) => {
+                tracing::warn!(cluster = %id.0, "registry token is not a legal header value");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "invalid cluster token")
+                    .into_response();
+            }
+        }
+    }
+
+    let upstream = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // A transport failure is a clean 503 (task: never a 502/panic) —
+            // the UI renders it as the cluster-unreachable state.
+            tracing::warn!(cluster = %id.0, error = %e.without_url(), "cluster_status upstream error");
+            return (StatusCode::SERVICE_UNAVAILABLE, "cluster unreachable").into_response();
+        }
+    };
+    let status = upstream.status();
+
+    let mut body = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                if body.len() + bytes.len() > MAX_STATUS_BODY_BYTES {
+                    tracing::warn!(cluster = %id.0, cap = MAX_STATUS_BODY_BYTES, "cluster_status response exceeded the size cap");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "metrics response too large",
+                    )
+                        .into_response();
+                }
+                body.extend_from_slice(&bytes);
+            }
+            Err(e) => {
+                tracing::warn!(cluster = %id.0, error = %e.without_url(), "cluster_status stream error");
+                return (StatusCode::SERVICE_UNAVAILABLE, "cluster unreachable").into_response();
+            }
+        }
+    }
+
+    if !status.is_success() {
+        // The dashboard answered but not with a 2xx — treat as unreachable for
+        // this summary (the tab shows the clean cluster-unreachable state)
+        // rather than passing Ray's raw error through as metrics.
+        tracing::warn!(cluster = %id.0, status = %status, "cluster_status non-success");
+        return (StatusCode::SERVICE_UNAVAILABLE, "cluster unreachable").into_response();
+    }
+
+    match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(raw) => Json(normalize_cluster_status(&id.0, &raw)).into_response(),
+        Err(e) => {
+            tracing::warn!(cluster = %id.0, error = %e, "cluster_status was not valid JSON");
+            (StatusCode::SERVICE_UNAVAILABLE, "invalid metrics response").into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logs (§5.6, non-streaming first cut)
+// ---------------------------------------------------------------------------
+
+/// Query params for the log tail: which pod, and how many lines.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct LogsQuery {
+    /// Pod to tail (one of the cluster's pods); defaults to the head pod.
+    pub node: Option<String>,
+    /// Number of trailing lines to return (default 200, capped at 5000).
+    pub tail: Option<usize>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/clusters/{id}/logs", tag = "clusters",
+    params(("id" = String, Path, description = "Cluster id"), LogsQuery),
+    responses(
+        (status = 200, description = "Recent (tail-capped) pod logs plus the list of tailable pods", body = mobula_core::ClusterLogs),
+        (status = 401, description = "No/invalid token"),
+        (status = 403, description = "Missing Read on cluster"),
+        (status = 404, description = "No such cluster/pod, or the backend exposes no logs"),
+        (status = 503, description = "The log source (Kubernetes) could not be reached")),
+    security(("bearer" = []))
+)]
+async fn cluster_logs(
+    State(st): State<ObsApiState>,
+    identity: Option<Extension<Identity>>,
+    Path(id): Path<String>,
+    Query(q): Query<LogsQuery>,
+) -> Response {
+    let id = ClusterId(id);
+    let scope = match scope_for_read(&st, &identity, &id).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    if let Some(deny) = deny_cluster_read(&st, &identity, &scope).await {
+        return deny;
+    }
+
+    let tail = q.tail.unwrap_or(DEFAULT_LOG_TAIL).clamp(1, MAX_LOG_TAIL);
+
+    let Some(provisioner) = st.provisioner.as_ref() else {
+        return (StatusCode::NOT_FOUND, "logs unavailable").into_response();
+    };
+    match provisioner.cluster_logs(&id, q.node.as_deref(), tail).await {
+        Ok(Some(logs)) => Json(logs).into_response(),
+        // A named pod that is not part of this cluster (or no log source).
+        Ok(None) => (StatusCode::NOT_FOUND, "no such pod for this cluster").into_response(),
+        Err(ProvisionError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, "no such cluster").into_response()
+        }
+        Err(e) => {
+            tracing::warn!(cluster = %id.0, error = %e, "logs backend error");
+            (StatusCode::SERVICE_UNAVAILABLE, "log source unavailable").into_response()
+        }
+    }
+}
+
 pub fn router(
     store: Arc<dyn Store>,
     registry: Arc<ClusterRegistry>,
@@ -402,6 +733,9 @@ pub fn router(
     Router::new()
         .route("/api/v1/clusters/{id}/nodes", get(cluster_nodes))
         .route("/api/v1/clusters/{id}/jobs", get(cluster_jobs))
+        .route("/api/v1/clusters/{id}/events", get(cluster_events))
+        .route("/api/v1/clusters/{id}/metrics", get(cluster_metrics))
+        .route("/api/v1/clusters/{id}/logs", get(cluster_logs))
         .with_state(ObsApiState {
             store,
             registry,
@@ -463,5 +797,96 @@ mod tests {
         assert!(normalize_jobs(&json!("nope")).is_empty());
         assert!(normalize_jobs(&json!(42)).is_empty());
         assert!(normalize_jobs(&json!([])).is_empty());
+    }
+
+    #[test]
+    fn normalize_cluster_status_structured() {
+        // The shape Ray's dashboard serves under data.clusterStatus.
+        let raw = json!({
+            "result": true,
+            "data": {
+                "clusterStatus": {
+                    "loadMetricsReport": {
+                        "usage": {
+                            "CPU": [6.0, 8.0],
+                            "GPU": [1.0, 2.0],
+                            "memory": [10.0, 32.0],
+                            "object_store_memory": [1.0, 4.0],
+                            "node:10.0.0.1": [0.0, 1.0]
+                        }
+                    },
+                    "autoscalerReport": {
+                        "activeNodes": { "head": 1, "gpu-workers": 2 },
+                        "pendingNodes": [{ "n": 1 }],
+                        "failedNodes": []
+                    }
+                }
+            }
+        });
+        let m = normalize_cluster_status("team-b-scoring", &raw);
+        assert_eq!(m.cluster_id, "team-b-scoring");
+        assert_eq!(
+            m.cpu,
+            Some(ResourceStat {
+                used: 6.0,
+                total: 8.0
+            })
+        );
+        assert_eq!(
+            m.gpu,
+            Some(ResourceStat {
+                used: 1.0,
+                total: 2.0
+            })
+        );
+        assert_eq!(
+            m.memory,
+            Some(ResourceStat {
+                used: 10.0,
+                total: 32.0
+            })
+        );
+        assert_eq!(
+            m.object_store_memory,
+            Some(ResourceStat {
+                used: 1.0,
+                total: 4.0
+            })
+        );
+        assert_eq!(m.active_nodes, Some(3));
+        assert_eq!(m.pending_nodes, Some(1));
+        assert_eq!(m.failed_nodes, Some(0));
+    }
+
+    #[test]
+    fn normalize_cluster_status_top_level_report() {
+        // Tolerate the report living directly under `data` (no clusterStatus).
+        let raw = json!({
+            "data": {
+                "loadMetricsReport": { "usage": { "CPU": [2.0, 4.0] } }
+            }
+        });
+        let m = normalize_cluster_status("c", &raw);
+        assert_eq!(
+            m.cpu,
+            Some(ResourceStat {
+                used: 2.0,
+                total: 4.0
+            })
+        );
+        assert_eq!(m.gpu, None);
+        assert_eq!(m.active_nodes, None);
+    }
+
+    #[test]
+    fn normalize_cluster_status_tolerates_garbage() {
+        // No usable report: a well-formed summary with all stats absent, never
+        // a panic.
+        let m = normalize_cluster_status("c", &json!({ "result": false }));
+        assert_eq!(m.cluster_id, "c");
+        assert_eq!(m.cpu, None);
+        assert_eq!(m.gpu, None);
+        assert_eq!(m.memory, None);
+        assert_eq!(m.active_nodes, None);
     }
 }

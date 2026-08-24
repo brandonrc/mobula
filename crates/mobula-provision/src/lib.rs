@@ -161,6 +161,37 @@ pub trait Provisioner: Send + Sync {
         let _ = id;
         Ok(None)
     }
+
+    /// Kubernetes Events for `id`'s objects (the RayCluster + the pods/services
+    /// KubeRay owns), normalized newest-first (`GET /api/v1/clusters/{id}/events`,
+    /// api-v1.md §5.8). Sourced from the K8s API — NOT the Ray dashboard — so it
+    /// answers even when Ray is down; the highest-value signal for scheduling /
+    /// image-pull / probe failures. `Ok(None)` (the default) when the backend
+    /// cannot produce one (the route then answers 404 `events unavailable`).
+    async fn cluster_events(
+        &self,
+        id: &ClusterId,
+    ) -> Result<Option<mobula_core::ClusterEvents>, ProvisionError> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Tail-capped pod logs for `id` (`GET /api/v1/clusters/{id}/logs`,
+    /// api-v1.md §5.6, non-streaming first cut). Reads pod logs through the K8s
+    /// API (the kubectl-logs equivalent). `pod` selects one of the cluster's
+    /// pods; `None` tails the head pod. `tail` bounds the returned lines.
+    /// `Ok(None)` (the default, or when the requested pod is not part of the
+    /// cluster) → the route answers 404; a K8s failure → `Err`, which the route
+    /// maps to 503. WS streaming is the eventual design (Milestone C).
+    async fn cluster_logs(
+        &self,
+        id: &ClusterId,
+        pod: Option<&str>,
+        tail: usize,
+    ) -> Result<Option<mobula_core::ClusterLogs>, ProvisionError> {
+        let _ = (id, pod, tail);
+        Ok(None)
+    }
 }
 
 /// Observed state of a Serve service.

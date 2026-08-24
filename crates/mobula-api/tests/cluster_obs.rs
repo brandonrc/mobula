@@ -18,8 +18,8 @@ use axum::response::Response;
 use mobula_auth::{AuthConfig, RoleMappings, Validator};
 use mobula_controller::{InMemoryStore, Store};
 use mobula_core::{
-    ClusterEndpoint, ClusterId, ClusterNodes, ClusterRegistry, ClusterSpec, NodeView,
-    WorkerGroupNodes,
+    ClusterEndpoint, ClusterEvent, ClusterEvents, ClusterId, ClusterLogs, ClusterNodes,
+    ClusterRegistry, ClusterSpec, NodeView, WorkerGroupNodes,
 };
 use mobula_provision::{DemoProvisioner, ProvisionError, Provisioner};
 use tower::ServiceExt;
@@ -59,14 +59,40 @@ async fn body_json(res: Response) -> serde_json::Value {
 }
 
 /// A provisioner wrapping the demo lifecycle, with a configurable node
-/// breakdown and dashboard base so the obs routes have something to reach.
+/// breakdown, dashboard base, events and logs so the obs routes have
+/// something to reach. `Default` provides the empty case so a test sets only
+/// the fields it exercises (`..Default::default()`).
 struct ObsProvisioner {
     inner: DemoProvisioner,
     /// The node breakdown to return; `None` → the trait-default `Ok(None)`
     /// (route answers 404 `nodes unavailable`).
     nodes: Option<ClusterNodes>,
-    /// The dashboard base URL for the jobs proxy; `None` → default `None`.
+    /// The dashboard base URL for the jobs + metrics proxies; `None` →
+    /// default `None`.
     dashboard_base: Option<String>,
+    /// The events to return; `None` → `Ok(None)` (404 `events unavailable`).
+    events: Option<ClusterEvents>,
+    /// When set, `cluster_events` returns `Err(Backend)` (the K8s-unreachable
+    /// path → the route answers 503).
+    events_fail: bool,
+    /// The logs to return; `None` → `Ok(None)` (404 — e.g. a bad pod).
+    logs: Option<ClusterLogs>,
+    /// When set, `cluster_logs` returns `Err(Backend)` → 503.
+    logs_fail: bool,
+}
+
+impl Default for ObsProvisioner {
+    fn default() -> Self {
+        Self {
+            inner: DemoProvisioner::new(),
+            nodes: None,
+            dashboard_base: None,
+            events: None,
+            events_fail: false,
+            logs: None,
+            logs_fail: false,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -106,6 +132,26 @@ impl Provisioner for ObsProvisioner {
     }
     async fn cluster_nodes(&self, _id: &ClusterId) -> Result<Option<ClusterNodes>, ProvisionError> {
         Ok(self.nodes.clone())
+    }
+    async fn cluster_events(
+        &self,
+        _id: &ClusterId,
+    ) -> Result<Option<ClusterEvents>, ProvisionError> {
+        if self.events_fail {
+            return Err(ProvisionError::Backend("k8s unreachable".into()));
+        }
+        Ok(self.events.clone())
+    }
+    async fn cluster_logs(
+        &self,
+        _id: &ClusterId,
+        _pod: Option<&str>,
+        _tail: usize,
+    ) -> Result<Option<ClusterLogs>, ProvisionError> {
+        if self.logs_fail {
+            return Err(ProvisionError::Backend("k8s unreachable".into()));
+        }
+        Ok(self.logs.clone())
     }
 }
 
@@ -244,6 +290,7 @@ async fn nodes_returns_head_and_worker_groups() {
         inner: DemoProvisioner::new(),
         nodes: Some(sample_nodes("c1")),
         dashboard_base: None,
+        ..Default::default()
     });
     let app = obs_app(
         &idp,
@@ -304,6 +351,7 @@ async fn nodes_unknown_cluster_is_404() {
         inner: DemoProvisioner::new(),
         nodes: Some(sample_nodes("c1")),
         dashboard_base: None,
+        ..Default::default()
     });
     let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
     let viewer = idp_token(&idp, &["/observers"]);
@@ -331,6 +379,7 @@ async fn nodes_rbac_unauthenticated_401_roleless_403() {
         inner: DemoProvisioner::new(),
         nodes: Some(sample_nodes("c1")),
         dashboard_base: None,
+        ..Default::default()
     });
     let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
 
@@ -376,6 +425,7 @@ async fn nodes_read_scoping_hides_foreign_cluster() {
         inner: DemoProvisioner::new(),
         nodes: Some(sample_nodes("vision")),
         dashboard_base: None,
+        ..Default::default()
     });
     let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
 
@@ -426,6 +476,7 @@ async fn jobs_proxies_normalizes_and_injects_registry_token_not_jwt() {
         inner: DemoProvisioner::new(),
         nodes: None,
         dashboard_base: None,
+        ..Default::default()
     });
     let app = obs_app(&idp, store, registry, Some(provisioner)).await;
 
@@ -471,6 +522,7 @@ async fn jobs_lifecycle_managed_uses_provisioner_base_and_no_credential() {
         inner: DemoProvisioner::new(),
         nodes: None,
         dashboard_base: Some(base_url),
+        ..Default::default()
     });
     let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
 
@@ -504,6 +556,7 @@ async fn jobs_unreachable_cluster_is_503() {
         inner: DemoProvisioner::new(),
         nodes: None,
         dashboard_base: Some("http://127.0.0.1:1".into()),
+        ..Default::default()
     });
     let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
 
@@ -537,6 +590,7 @@ async fn jobs_read_scoping_hides_foreign_cluster() {
         inner: DemoProvisioner::new(),
         nodes: None,
         dashboard_base: Some(base_url),
+        ..Default::default()
     });
     let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
 
@@ -554,4 +608,458 @@ async fn jobs_read_scoping_hides_foreign_cluster() {
         StatusCode::NOT_FOUND,
         "foreign cluster hidden"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Events (§5.8)
+// ---------------------------------------------------------------------------
+
+fn sample_events(cluster_id: &str) -> ClusterEvents {
+    ClusterEvents {
+        cluster_id: cluster_id.into(),
+        events: vec![
+            ClusterEvent {
+                event_type: "Warning".into(),
+                reason: Some("FailedScheduling".into()),
+                message: Some("0/3 nodes available".into()),
+                count: 4,
+                first_seen: Some("2026-08-22T10:00:00Z".into()),
+                last_seen: Some("2026-08-22T10:05:00Z".into()),
+                object: Some(format!("Pod/{cluster_id}-head-abc")),
+            },
+            ClusterEvent {
+                event_type: "Normal".into(),
+                reason: Some("Pulled".into()),
+                message: Some("Container image pulled".into()),
+                count: 1,
+                first_seen: Some("2026-08-22T09:00:00Z".into()),
+                last_seen: Some("2026-08-22T09:00:00Z".into()),
+                object: Some(format!("Pod/{cluster_id}-worker-1")),
+            },
+        ],
+    }
+}
+
+#[tokio::test]
+async fn events_returns_normalized_list() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    let provisioner = Arc::new(ObsProvisioner {
+        events: Some(sample_events("c1")),
+        ..Default::default()
+    });
+    let app = obs_app(
+        &idp,
+        store,
+        registry_for("c1", "http://unused", None),
+        Some(provisioner),
+    )
+    .await;
+
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/events",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["cluster_id"], "c1");
+    assert_eq!(v["events"][0]["type"], "Warning");
+    assert_eq!(v["events"][0]["reason"], "FailedScheduling");
+    assert_eq!(v["events"][0]["count"], 4);
+    assert_eq!(v["events"][0]["object"], "Pod/c1-head-abc");
+}
+
+#[tokio::test]
+async fn events_gateway_only_deployment_is_404() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    let app = obs_app(&idp, store, ClusterRegistry::default(), None).await;
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/events",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert!(body_text(res).await.contains("events unavailable"));
+}
+
+/// K8s unreachable → a clean 503, never a panic or a 500.
+#[tokio::test]
+async fn events_backend_error_is_503() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    let provisioner = Arc::new(ObsProvisioner {
+        events_fail: true,
+        ..Default::default()
+    });
+    let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/events",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body_text(res).await.contains("event source unavailable"));
+}
+
+#[tokio::test]
+async fn events_read_scoping_hides_foreign_cluster() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_role_assignment("alice", "operator", "project:ml-team")
+        .await
+        .unwrap();
+    store
+        .upsert_desired(&ClusterId("genai".into()), cluster_spec("genai"))
+        .await
+        .unwrap();
+    let provisioner = Arc::new(ObsProvisioner {
+        events: Some(sample_events("genai")),
+        ..Default::default()
+    });
+    let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
+    let alice = idp_token_sub(&idp, "alice", &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/genai/events",
+            "mobula.example.com",
+            Some(&alice),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "foreign cluster hidden"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Metrics (resource summary from the Ray dashboard /api/cluster_status)
+// ---------------------------------------------------------------------------
+
+/// A mock Ray head serving `GET /api/cluster_status`, recording each request's
+/// Authorization header.
+async fn spawn_mock_status_head() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_handler = seen.clone();
+    let app = axum::Router::new().route(
+        "/api/cluster_status",
+        axum::routing::get(move |headers: HeaderMap| {
+            let seen = seen_handler.clone();
+            async move {
+                seen.lock().unwrap().push(
+                    headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok().map(String::from)),
+                );
+                axum::Json(serde_json::json!({
+                    "result": true,
+                    "data": {
+                        "clusterStatus": {
+                            "loadMetricsReport": {
+                                "usage": {
+                                    "CPU": [6.0, 8.0],
+                                    "GPU": [1.0, 2.0],
+                                    "memory": [10.0, 32.0],
+                                    "object_store_memory": [1.0, 4.0]
+                                }
+                            },
+                            "autoscalerReport": {
+                                "activeNodes": { "head": 1, "gpu-workers": 2 },
+                                "pendingNodes": [],
+                                "failedNodes": []
+                            }
+                        }
+                    }
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), seen)
+}
+
+#[tokio::test]
+async fn metrics_returns_resource_summary_and_injects_registry_token_not_jwt() {
+    let idp = spawn_idp().await;
+    let (base_url, seen) = spawn_mock_status_head().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    let registry = registry_for("c1", &base_url, Some("ray-static-token"));
+    let app = obs_app(&idp, store, registry, None).await;
+
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/metrics",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["cluster_id"], "c1");
+    assert_eq!(v["cpu"]["used"], 6.0);
+    assert_eq!(v["cpu"]["total"], 8.0);
+    assert_eq!(v["gpu"]["total"], 2.0);
+    assert_eq!(v["memory"]["total"], 32.0);
+    assert_eq!(v["active_nodes"], 3);
+
+    // Credential discipline: registry token southbound, JWT nowhere.
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].as_deref(), Some("Bearer ray-static-token"));
+    assert!(!requests[0].as_ref().unwrap().contains(&viewer));
+}
+
+#[tokio::test]
+async fn metrics_lifecycle_managed_uses_provisioner_base_no_credential() {
+    let idp = spawn_idp().await;
+    let (base_url, seen) = spawn_mock_status_head().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    let provisioner = Arc::new(ObsProvisioner {
+        dashboard_base: Some(base_url),
+        ..Default::default()
+    });
+    let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
+
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/metrics",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0], None, "no Authorization may go southbound");
+}
+
+/// The key robustness guarantee for metrics: an unreachable dashboard is a
+/// clean 503, NOT the 502/panic the old passthrough produced.
+#[tokio::test]
+async fn metrics_unreachable_cluster_is_503() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    let provisioner = Arc::new(ObsProvisioner {
+        dashboard_base: Some("http://127.0.0.1:1".into()),
+        ..Default::default()
+    });
+    let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
+
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/metrics",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body_text(res).await.contains("cluster unreachable"));
+}
+
+#[tokio::test]
+async fn metrics_gateway_only_no_endpoint_is_404() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    // No registry entry and no provisioner → no reachable dashboard to name.
+    let app = obs_app(&idp, store, ClusterRegistry::default(), None).await;
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/metrics",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert!(body_text(res).await.contains("metrics unavailable"));
+}
+
+// ---------------------------------------------------------------------------
+// Logs (§5.6, non-streaming first cut)
+// ---------------------------------------------------------------------------
+
+fn sample_logs(cluster_id: &str) -> ClusterLogs {
+    ClusterLogs {
+        cluster_id: cluster_id.into(),
+        pods: vec![
+            format!("{cluster_id}-head-abc"),
+            format!("{cluster_id}-worker-1"),
+        ],
+        pod: format!("{cluster_id}-head-abc"),
+        tail: 200,
+        lines: vec![
+            "2026-08-22T10:00:00Z ray start --head".into(),
+            "2026-08-22T10:00:01Z dashboard listening on :8265".into(),
+        ],
+        truncated: false,
+    }
+}
+
+#[tokio::test]
+async fn logs_returns_tail_and_pod_list() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    let provisioner = Arc::new(ObsProvisioner {
+        logs: Some(sample_logs("c1")),
+        ..Default::default()
+    });
+    let app = obs_app(
+        &idp,
+        store,
+        registry_for("c1", "http://unused", None),
+        Some(provisioner),
+    )
+    .await;
+
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/logs?tail=200",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["cluster_id"], "c1");
+    assert_eq!(v["pod"], "c1-head-abc");
+    assert_eq!(v["pods"][0], "c1-head-abc");
+    assert_eq!(v["pods"][1], "c1-worker-1");
+    assert_eq!(v["lines"].as_array().unwrap().len(), 2);
+    assert_eq!(v["truncated"], false);
+}
+
+/// A named pod that is not part of the cluster → 404 (never tail an
+/// out-of-cluster pod); the backend signals this with `Ok(None)`.
+#[tokio::test]
+async fn logs_unknown_pod_is_404() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    // logs: None → cluster_logs returns Ok(None).
+    let provisioner = Arc::new(ObsProvisioner {
+        ..Default::default()
+    });
+    let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/logs?node=nope",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert!(body_text(res).await.contains("no such pod"));
+}
+
+/// K8s unreachable → clean 503.
+#[tokio::test]
+async fn logs_backend_error_is_503() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    let provisioner = Arc::new(ObsProvisioner {
+        logs_fail: true,
+        ..Default::default()
+    });
+    let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/clusters/c1/logs",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body_text(res).await.contains("log source unavailable"));
+}
+
+#[tokio::test]
+async fn logs_rbac_unauthenticated_401() {
+    let idp = spawn_idp().await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    store
+        .upsert_desired(&ClusterId("c1".into()), cluster_spec("proj-a"))
+        .await
+        .unwrap();
+    let provisioner = Arc::new(ObsProvisioner {
+        logs: Some(sample_logs("c1")),
+        ..Default::default()
+    });
+    let app = obs_app(&idp, store, ClusterRegistry::default(), Some(provisioner)).await;
+    let res = app
+        .oneshot(get("/api/v1/clusters/c1/logs", "mobula.example.com", None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }

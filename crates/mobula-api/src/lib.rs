@@ -11,7 +11,6 @@ pub mod cluster_obs;
 pub mod clusters;
 pub mod gateway;
 pub mod local_auth;
-pub mod metrics;
 pub mod pools;
 pub mod registry;
 pub mod services;
@@ -48,9 +47,11 @@ use utoipa_swagger_ui::SwaggerUi;
         clusters::suspend_cluster,
         clusters::resume_cluster,
         clusters::list_jobs,
-        metrics::cluster_metrics,
         cluster_obs::cluster_nodes,
         cluster_obs::cluster_jobs,
+        cluster_obs::cluster_events,
+        cluster_obs::cluster_metrics,
+        cluster_obs::cluster_logs,
         pools::list_pools,
         pools::get_pool,
         pools::create_pool,
@@ -112,6 +113,11 @@ use utoipa_swagger_ui::SwaggerUi;
             mobula_core::NodeView,
             mobula_core::WorkerGroupNodes,
             mobula_core::ClusterNodes,
+            mobula_core::ClusterEvent,
+            mobula_core::ClusterEvents,
+            mobula_core::ResourceStat,
+            mobula_core::ClusterMetrics,
+            mobula_core::ClusterLogs,
             pools::CreatePool,
             pools::PoolView,
             pools::PoolUsageView,
@@ -426,8 +432,9 @@ async fn refuse_non_loopback(req: Request, next: Next) -> Response {
 /// explicitly allowed, the outermost [`refuse_non_loopback`] layer keeps
 /// the control plane closed to remote peers even if an embedder
 /// `axum::serve`s this router directly. `provisioner` backs the per-cluster
-/// metrics passthrough (`/api/v1/clusters/{id}/metrics`, #52); `None`
-/// leaves the route mounted but answering 404 `metrics unavailable`.
+/// observability tabs — nodes/events/logs (Kubernetes-sourced) and the
+/// metrics resource summary (Ray dashboard); `None` leaves the routes
+/// mounted but answering 404 `… unavailable`.
 #[allow(clippy::too_many_arguments)]
 fn build_app_full_svc_inner(
     registry: ClusterRegistry,
@@ -491,11 +498,6 @@ fn build_app_full_svc_inner(
             .merge(pools::router(store.clone(), policy.clone()))
             .merge(usage::router(store.clone(), policy.clone()))
             .merge(settings::router(store.clone(), policy))
-            .merge(metrics::router(
-                store.clone(),
-                registry.clone(),
-                provisioner.clone(),
-            ))
             .merge(cluster_obs::router(
                 store.clone(),
                 registry.clone(),
@@ -604,10 +606,9 @@ pub struct ServeOptions {
     /// Serve-service provisioner; when present, the `/api/v1/services`
     /// routes are mounted (Phase 4).
     pub services: Option<Arc<dyn mobula_provision::ServiceProvisioner>>,
-    /// Cluster provisioner backing the per-cluster metrics passthrough
-    /// (`/api/v1/clusters/{id}/metrics`, #52) via
-    /// [`mobula_provision::Provisioner::metrics_endpoint`]. `None` leaves
-    /// the route answering 404 `metrics unavailable`.
+    /// Cluster provisioner backing the per-cluster observability tabs
+    /// (`/api/v1/clusters/{id}/{nodes,events,metrics,logs}`). `None` leaves
+    /// those routes answering 404 `… unavailable`.
     pub provisioner: Option<Arc<dyn mobula_provision::Provisioner>>,
 }
 
@@ -783,8 +784,16 @@ mod tests {
         assert!(doc["paths"]["/api/v1/pools/{name}/usage"]["get"].is_object());
         assert!(doc["paths"]["/api/v1/usage"]["get"].is_object());
         assert!(doc["paths"]["/api/v1/metrics"]["get"].is_object());
-        // The per-cluster Ray metrics passthrough (#52).
+        // The per-cluster observability tabs (nodes/jobs #91; events/metrics/
+        // logs — the resource-summary rework of the #52 metrics route).
+        assert!(doc["paths"]["/api/v1/clusters/{id}/nodes"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/clusters/{id}/jobs"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/clusters/{id}/events"]["get"].is_object());
         assert!(doc["paths"]["/api/v1/clusters/{id}/metrics"]["get"].is_object());
+        assert!(doc["paths"]["/api/v1/clusters/{id}/logs"]["get"].is_object());
+        assert!(doc["components"]["schemas"]["ClusterEvents"].is_object());
+        assert!(doc["components"]["schemas"]["ClusterMetrics"].is_object());
+        assert!(doc["components"]["schemas"]["ClusterLogs"].is_object());
         assert!(doc["components"]["schemas"]["UsageReport"].is_object());
         assert!(doc["components"]["schemas"]["PoolUsageView"].is_object());
         // The settings/policy contract (Admin-only, api-v1.md §5.16).

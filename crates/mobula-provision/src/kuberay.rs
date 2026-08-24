@@ -10,8 +10,8 @@
 //! top of these functions.
 
 use mobula_core::{
-    ClusterId, ClusterNodes, ClusterSpec, ClusterState, NodeView, ServiceSpec, UpgradeStrategy,
-    WorkerGroup, WorkerGroupNodes,
+    ClusterEvent, ClusterEvents, ClusterId, ClusterNodes, ClusterSpec, ClusterState, NodeView,
+    ServiceSpec, UpgradeStrategy, WorkerGroup, WorkerGroupNodes,
 };
 use serde_json::{json, Value};
 
@@ -953,6 +953,115 @@ pub fn node_breakdown(cluster_id: &str, raycluster: &Value, pods: &[Value]) -> C
     }
 }
 
+// ---------------------------------------------------------------------------
+// Events (§5.8) and logs (§5.6) — pure normalization helpers
+// ---------------------------------------------------------------------------
+
+/// Cap on returned events: a busy namespace can hold thousands; the newest
+/// window is what the tab shows.
+pub const MAX_EVENTS: usize = 200;
+
+/// Does a Kubernetes object name belong to the cluster `id`? True for the
+/// RayCluster itself (exact match) and for everything KubeRay names under it
+/// (head/worker pods, the head service, …), which all carry the `<id>-`
+/// prefix. Kubernetes-sourced, so it works even when the Ray dashboard is
+/// down (api-v1.md §5.8).
+fn object_belongs_to_cluster(id: &str, object_name: &str) -> bool {
+    object_name == id || object_name.starts_with(&format!("{id}-"))
+}
+
+/// Pull the involved object's `Kind/name` from either Event schema: core/v1
+/// uses `involvedObject`, events.k8s.io/v1 uses `regarding`. Returns
+/// `(name, "Kind/name")`.
+fn event_object(ev: &Value) -> Option<(String, String)> {
+    let obj = ev.get("involvedObject").or_else(|| ev.get("regarding"))?;
+    let name = obj.get("name").and_then(|v| v.as_str())?.to_string();
+    let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("Object");
+    let label = format!("{kind}/{name}");
+    Some((name, label))
+}
+
+/// Normalize a list of raw Kubernetes Event objects (core/v1 or
+/// events.k8s.io/v1) into the cluster's events (api-v1.md §5.8): keep only
+/// events about `cluster_id`'s objects, sort newest-first by last-seen, and
+/// cap at [`MAX_EVENTS`]. Pure so the filtering/normalization is unit-tested
+/// without a cluster.
+pub fn events_from_k8s(cluster_id: &str, raw_events: &[Value]) -> ClusterEvents {
+    let mut events: Vec<ClusterEvent> = raw_events
+        .iter()
+        .filter_map(|ev| {
+            let (name, object) = event_object(ev)?;
+            if !object_belongs_to_cluster(cluster_id, &name) {
+                return None;
+            }
+            let s = |k: &str| ev.get(k).and_then(|v| v.as_str()).map(String::from);
+            // count: core/v1 `count`, events.k8s.io `deprecatedCount` or
+            // `series.count`; default 1 for a first, un-collapsed event.
+            let count = ev
+                .get("count")
+                .and_then(|v| v.as_u64())
+                .or_else(|| ev.get("deprecatedCount").and_then(|v| v.as_u64()))
+                .or_else(|| {
+                    ev.get("series")
+                        .and_then(|s| s.get("count"))
+                        .and_then(|v| v.as_u64())
+                })
+                .unwrap_or(1) as u32;
+            // timestamps: core/v1 `firstTimestamp`/`lastTimestamp`;
+            // events.k8s.io `eventTime` + `series.lastObservedTime`.
+            let first_seen = s("firstTimestamp").or_else(|| s("eventTime"));
+            let last_seen = s("lastTimestamp")
+                .or_else(|| {
+                    ev.get("series")
+                        .and_then(|se| se.get("lastObservedTime"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .or_else(|| s("eventTime"))
+                .or_else(|| first_seen.clone());
+            Some(ClusterEvent {
+                event_type: s("type").unwrap_or_else(|| "Normal".to_string()),
+                reason: s("reason"),
+                message: s("message").or_else(|| s("note")),
+                count,
+                first_seen,
+                last_seen,
+                object: Some(object),
+            })
+        })
+        .collect();
+
+    // Newest first by last-seen (RFC3339 sorts lexicographically). Events with
+    // no timestamp sink to the bottom.
+    events.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    events.truncate(MAX_EVENTS);
+
+    ClusterEvents {
+        cluster_id: cluster_id.to_string(),
+        events,
+    }
+}
+
+/// Split a raw pod-log blob into the last `tail` lines (oldest first) and a
+/// flag for whether the tail was filled (older lines may exist beyond it).
+/// The K8s API already tail-caps server-side; this defends against a source
+/// that ignores the cap and computes the `truncated` hint. Pure and tested.
+pub fn tail_lines(raw: &str, tail: usize) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = raw.lines().map(String::from).collect();
+    // Drop a trailing empty line from a final newline so it is not counted.
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let total = lines.len();
+    if tail > 0 && total > tail {
+        lines = lines.split_off(total - tail);
+    }
+    // `truncated`: the tail is full, so there may be older lines the caller
+    // did not receive.
+    let truncated = tail > 0 && total >= tail;
+    (lines, truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1756,5 +1865,125 @@ mod tests {
         assert!(!is_default_deny(&ingress_only));
         assert!(!is_default_deny(&json!({})));
         assert!(!is_default_deny(&json!({ "spec": {} })));
+    }
+
+    #[test]
+    fn events_filter_by_cluster_and_sort_newest_first() {
+        let raw = vec![
+            json!({
+                "type": "Warning", "reason": "FailedScheduling",
+                "message": "0/3 nodes available",
+                "count": 4,
+                "firstTimestamp": "2026-08-22T10:00:00Z",
+                "lastTimestamp": "2026-08-22T10:05:00Z",
+                "involvedObject": { "kind": "Pod", "name": "team-b-scoring-head-abc" }
+            }),
+            json!({
+                "type": "Normal", "reason": "Pulled",
+                "message": "Container image pulled",
+                "count": 1,
+                "firstTimestamp": "2026-08-22T10:10:00Z",
+                "lastTimestamp": "2026-08-22T10:10:00Z",
+                "involvedObject": { "kind": "Pod", "name": "team-b-scoring-worker-xyz" }
+            }),
+            // Belongs to a DIFFERENT cluster — must be excluded.
+            json!({
+                "type": "Normal", "reason": "Created",
+                "involvedObject": { "kind": "Pod", "name": "other-cluster-head-1" }
+            }),
+            // The RayCluster object itself (exact-name match).
+            json!({
+                "type": "Normal", "reason": "Created",
+                "lastTimestamp": "2026-08-22T09:00:00Z",
+                "involvedObject": { "kind": "RayCluster", "name": "team-b-scoring" }
+            }),
+        ];
+        let out = events_from_k8s("team-b-scoring", &raw);
+        assert_eq!(out.cluster_id, "team-b-scoring");
+        assert_eq!(out.events.len(), 3, "the other-cluster event is excluded");
+        // Newest last-seen first: 10:10 (Pulled), 10:05 (FailedScheduling), 09:00.
+        assert_eq!(out.events[0].reason.as_deref(), Some("Pulled"));
+        assert_eq!(out.events[1].reason.as_deref(), Some("FailedScheduling"));
+        assert_eq!(out.events[1].event_type, "Warning");
+        assert_eq!(out.events[1].count, 4);
+        assert_eq!(
+            out.events[1].object.as_deref(),
+            Some("Pod/team-b-scoring-head-abc")
+        );
+        assert_eq!(
+            out.events[2].object.as_deref(),
+            Some("RayCluster/team-b-scoring")
+        );
+    }
+
+    #[test]
+    fn events_from_events_k8s_v1_schema() {
+        // events.k8s.io/v1 uses `regarding`, `note`, `deprecatedCount`, `series`.
+        let raw = vec![json!({
+            "type": "Warning", "reason": "BackOff",
+            "note": "Back-off restarting failed container",
+            "deprecatedCount": 7,
+            "eventTime": "2026-08-22T11:00:00Z",
+            "series": { "count": 7, "lastObservedTime": "2026-08-22T11:30:00Z" },
+            "regarding": { "kind": "Pod", "name": "team-b-scoring-worker-1" }
+        })];
+        let out = events_from_k8s("team-b-scoring", &raw);
+        assert_eq!(out.events.len(), 1);
+        let e = &out.events[0];
+        assert_eq!(
+            e.message.as_deref(),
+            Some("Back-off restarting failed container")
+        );
+        assert_eq!(e.count, 7);
+        assert_eq!(e.last_seen.as_deref(), Some("2026-08-22T11:30:00Z"));
+        assert_eq!(e.object.as_deref(), Some("Pod/team-b-scoring-worker-1"));
+    }
+
+    #[test]
+    fn events_default_count_and_type() {
+        let raw = vec![json!({
+            "reason": "Scheduled",
+            "involvedObject": { "kind": "Pod", "name": "c-head-0" }
+        })];
+        let out = events_from_k8s("c", &raw);
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(out.events[0].count, 1);
+        assert_eq!(out.events[0].event_type, "Normal");
+    }
+
+    #[test]
+    fn events_capped_at_max() {
+        let raw: Vec<Value> = (0..(MAX_EVENTS + 50))
+            .map(|i| {
+                json!({
+                    "type": "Normal", "reason": "Ping",
+                    "lastTimestamp": format!("2026-08-22T10:{:02}:00Z", i % 60),
+                    "involvedObject": { "kind": "Pod", "name": "c-head-0" }
+                })
+            })
+            .collect();
+        let out = events_from_k8s("c", &raw);
+        assert_eq!(out.events.len(), MAX_EVENTS);
+    }
+
+    #[test]
+    fn tail_lines_caps_and_flags_truncation() {
+        let raw = "a\nb\nc\nd\ne\n";
+        let (lines, truncated) = tail_lines(raw, 3);
+        assert_eq!(lines, vec!["c", "d", "e"]);
+        assert!(truncated);
+
+        let (all, trunc) = tail_lines(raw, 10);
+        assert_eq!(all, vec!["a", "b", "c", "d", "e"]);
+        assert!(!trunc, "fewer lines than the tail: not truncated");
+
+        // exactly the tail: full, so flagged truncated (there may be more).
+        let (exact, exact_trunc) = tail_lines("x\ny\n", 2);
+        assert_eq!(exact, vec!["x", "y"]);
+        assert!(exact_trunc);
+
+        let (empty, empty_trunc) = tail_lines("", 100);
+        assert!(empty.is_empty());
+        assert!(!empty_trunc);
     }
 }

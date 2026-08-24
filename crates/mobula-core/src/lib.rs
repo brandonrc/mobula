@@ -11,6 +11,7 @@ pub mod cluster;
 pub mod crypto;
 pub mod job;
 pub mod node;
+pub mod obs;
 pub mod pool;
 pub mod registry;
 pub mod service;
@@ -22,6 +23,7 @@ pub use cluster::{
 };
 pub use job::JobRecord;
 pub use node::{ClusterNodes, NodeView, WorkerGroupNodes};
+pub use obs::{ClusterEvent, ClusterEvents, ClusterLogs, ClusterMetrics, ResourceStat};
 pub use pool::{
     AllocationSpec, AllocationSpecError, FlavorSpec, FlavorSpecError, GpuSharing, PoolSpec,
     PoolSpecError, TaintSpec, TaintSpecError,
