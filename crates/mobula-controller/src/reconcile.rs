@@ -24,6 +24,12 @@ use crate::store::{
 /// grow one row per (cluster, generation) forever.
 const INTENT_RETENTION_SECS: u64 = 3600;
 
+/// Default window a terminated cluster's tombstone row is retained before the
+/// run loop hard-deletes it (Truthful Console). Generous by design: an
+/// operator and the dashboard have a full day to see that a cluster died
+/// before its row disappears from `GET /api/v1/clusters`.
+pub const TERMINATED_RETENTION_SECS: u64 = 24 * 3600;
+
 /// Exponential-backoff base and ceiling for a no-progress cluster (#43).
 const BACKOFF_BASE_SECS: u64 = 5;
 const BACKOFF_CEIL_SECS: u64 = 300;
@@ -119,6 +125,9 @@ pub struct Reconciler<S, P> {
     provisioner: Arc<P>,
     /// Global actuation token bucket (#43); `None` = unlimited.
     limits: Option<Mutex<TokenBucket>>,
+    /// How long a terminated cluster's tombstone row is retained before the
+    /// run loop hard-deletes it (Truthful Console).
+    terminated_retention_secs: u64,
 }
 
 impl<S: Store, P: Provisioner> Reconciler<S, P> {
@@ -128,6 +137,7 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
             store,
             provisioner,
             limits: None,
+            terminated_retention_secs: TERMINATED_RETENTION_SECS,
         }
     }
 
@@ -137,7 +147,15 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
             store,
             provisioner,
             limits: Some(Mutex::new(TokenBucket::new(limits, 0))),
+            terminated_retention_secs: TERMINATED_RETENTION_SECS,
         }
+    }
+
+    /// Override the terminated-tombstone retention window (Truthful Console).
+    /// Default is [`TERMINATED_RETENTION_SECS`].
+    pub fn with_terminated_retention(mut self, secs: u64) -> Self {
+        self.terminated_retention_secs = secs;
+        self
     }
 
     /// Take one actuation token, or `true` when unlimited. `false` means the
@@ -413,6 +431,31 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
         Ok(reaped)
     }
 
+    /// Tombstone retention sweep (Truthful Console): hard-delete cluster rows
+    /// that have been desired=Terminated and observed gone for longer than the
+    /// retention window, so a reaped cluster stops lingering forever in
+    /// `GET /api/v1/clusters`. A row still tearing down (observed_state still a
+    /// live state) is left alone — only a genuinely dead tombstone is removed.
+    /// Returns the ids removed.
+    pub async fn reap_terminated(&self, now: u64) -> Result<Vec<String>, ReconcileError> {
+        let clusters = self.store.list().await?;
+        let mut removed = Vec::new();
+        for c in clusters {
+            if is_purgeable_tombstone(&c, now, self.terminated_retention_secs)
+                && self.store.remove_cluster(&c.id).await?
+            {
+                tracing::info!(
+                    target: "mobula::audit",
+                    cluster = %c.id,
+                    age = c.terminated_at.map(|t| now.saturating_sub(t)),
+                    "terminated cluster row reaped (retention window elapsed)"
+                );
+                removed.push(c.id.0);
+            }
+        }
+        Ok(removed)
+    }
+
     /// Boot check for a stale DB restore (ADR-0007 restore quarantine, #41):
     /// if any backing cluster reports a generation *newer* than what the store
     /// holds, the store was restored behind reality — actuating would stomp a
@@ -465,6 +508,15 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "intent reap pass failed"),
                     }
+                    // Truthful Console: drop terminated tombstone rows older
+                    // than the retention window.
+                    match self.reap_terminated(now_unix()).await {
+                        Ok(ids) if !ids.is_empty() => {
+                            tracing::info!(reaped = ids.len(), "terminated cluster rows reaped")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "terminated-row reap pass failed"),
+                    }
                     for (id, res) in self.reconcile_all().await {
                         if let Err(e) = res {
                             tracing::warn!(cluster = %id, error = %e, "reconcile failed");
@@ -478,6 +530,23 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
             }
         }
     }
+}
+
+/// Whether a cluster's backing resource is gone (or was never observed), so
+/// the row is safe to treat as a dead tombstone rather than a live cluster
+/// (Truthful Console). Shared by the retention sweep and the API purge guard.
+pub fn observed_gone(observed: Option<ClusterState>) -> bool {
+    matches!(observed, None | Some(ClusterState::Terminated))
+}
+
+/// A terminated cluster row is a purgeable tombstone once it is
+/// desired=Terminated, observed gone, and its `terminated_at` stamp is older
+/// than the retention window.
+fn is_purgeable_tombstone(c: &StoredCluster, now: u64, retention_secs: u64) -> bool {
+    matches!(c.desired, DesiredState::Terminated)
+        && observed_gone(c.observed_state)
+        && c.terminated_at
+            .is_some_and(|t| now.saturating_sub(t) >= retention_secs)
 }
 
 /// A running cluster is expired when it has a TTL and its age exceeds it.
@@ -549,6 +618,7 @@ mod tests {
             failure_count: 0,
             next_attempt_at: 0,
             created_at,
+            terminated_at: None,
         }
     }
 
@@ -607,6 +677,132 @@ mod tests {
         assert_eq!(backoff_secs(10), 300);
         // …and a saturated failure_count can't overflow the shift.
         assert_eq!(backoff_secs(u32::MAX), 300);
+    }
+
+    fn spec() -> ClusterSpec {
+        ClusterSpec {
+            name: "c".into(),
+            project: "p".into(),
+            ray_version: "2.57.0".into(),
+            image: "img".into(),
+            head_cpu: "1".into(),
+            head_memory: "2Gi".into(),
+            worker_groups: vec![],
+            ttl_seconds: None,
+            owner: None,
+        }
+    }
+
+    fn tombstone(observed: Option<ClusterState>, terminated_at: Option<u64>) -> StoredCluster {
+        let mut c = stored(None, 0, observed);
+        c.desired = DesiredState::Terminated;
+        c.terminated_at = terminated_at;
+        c
+    }
+
+    #[test]
+    fn purgeable_tombstone_matrix() {
+        let retention = 3600;
+        // Terminated, never observed, old enough → purgeable.
+        assert!(is_purgeable_tombstone(
+            &tombstone(None, Some(0)),
+            4000,
+            retention
+        ));
+        // Terminated, observed Terminated, old enough → purgeable.
+        assert!(is_purgeable_tombstone(
+            &tombstone(Some(ClusterState::Terminated), Some(0)),
+            4000,
+            retention
+        ));
+        // Too recent → not yet.
+        assert!(!is_purgeable_tombstone(
+            &tombstone(None, Some(1000)),
+            2000,
+            retention
+        ));
+        // Still observed live (teardown in flight) → never, even if old.
+        assert!(!is_purgeable_tombstone(
+            &tombstone(Some(ClusterState::Running), Some(0)),
+            999_999,
+            retention
+        ));
+        // No terminated_at stamp → never.
+        assert!(!is_purgeable_tombstone(
+            &tombstone(None, None),
+            999_999,
+            retention
+        ));
+        // Not terminated (desired Running) → never.
+        assert!(!is_purgeable_tombstone(
+            &stored(None, 0, None),
+            999_999,
+            retention
+        ));
+    }
+
+    #[tokio::test]
+    async fn reap_terminated_removes_only_dead_tombstones() {
+        use crate::store::memory::InMemoryStore;
+        let store = Arc::new(InMemoryStore::new());
+
+        // A dead tombstone: terminated and never observed (gone).
+        let dead = ClusterId("dead".into());
+        store.upsert_desired(&dead, spec()).await.unwrap();
+        store
+            .set_desired(&dead, DesiredState::Terminated)
+            .await
+            .unwrap();
+
+        // Terminated but still observed Running (teardown in flight): keep.
+        let live = ClusterId("live".into());
+        store.upsert_desired(&live, spec()).await.unwrap();
+        store
+            .set_desired(&live, DesiredState::Terminated)
+            .await
+            .unwrap();
+        store
+            .record_observation(&live, Some(ClusterState::Running), 1)
+            .await
+            .unwrap();
+
+        // A running cluster (not a tombstone): keep.
+        let run = ClusterId("run".into());
+        store.upsert_desired(&run, spec()).await.unwrap();
+
+        let recon = Reconciler::new(store.clone(), Arc::new(ErrProv)).with_terminated_retention(0);
+        // `now` in the future so age (now - terminated_at) clears the (zero)
+        // retention window.
+        let mut reaped = recon.reap_terminated(now_unix() + 10).await.unwrap();
+        reaped.sort();
+        assert_eq!(reaped, vec!["dead".to_string()]);
+        assert!(store.get(&dead).await.unwrap().is_none());
+        assert!(store.get(&live).await.unwrap().is_some());
+        assert!(store.get(&run).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn set_desired_stamps_and_clears_terminated_at() {
+        use crate::store::memory::InMemoryStore;
+        let store = InMemoryStore::new();
+        let id = ClusterId("c".into());
+        store.upsert_desired(&id, spec()).await.unwrap();
+        assert_eq!(store.get(&id).await.unwrap().unwrap().terminated_at, None);
+        // Terminate → stamped.
+        store
+            .set_desired(&id, DesiredState::Terminated)
+            .await
+            .unwrap();
+        assert!(store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminated_at
+            .is_some());
+        // Resume → cleared (a resumed cluster is never a tombstone).
+        store.set_desired(&id, DesiredState::Running).await.unwrap();
+        assert_eq!(store.get(&id).await.unwrap().unwrap().terminated_at, None);
     }
 
     /// A provisioner whose `observe` always fails with a backend error.

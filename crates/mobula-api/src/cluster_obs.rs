@@ -232,7 +232,7 @@ pub struct RayJobSummary {
 /// Normalize the Ray `GET /api/jobs/` body into a stable list. Ray returns a
 /// JSON array of job records; some older versions return an object keyed by
 /// submission id. Both are accepted; anything else yields an empty list.
-fn normalize_jobs(raw: &serde_json::Value) -> Vec<RayJobSummary> {
+pub(crate) fn normalize_jobs(raw: &serde_json::Value) -> Vec<RayJobSummary> {
     let items: Vec<&serde_json::Value> = match raw {
         serde_json::Value::Array(a) => a.iter().collect(),
         serde_json::Value::Object(m) => m.values().collect(),

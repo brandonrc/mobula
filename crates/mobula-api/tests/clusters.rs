@@ -44,6 +44,9 @@ impl Store for SlowListStore {
     async fn set_desired(&self, id: &ClusterId, desired: DesiredState) -> Result<(), StoreError> {
         self.inner.set_desired(id, desired).await
     }
+    async fn remove_cluster(&self, id: &ClusterId) -> Result<bool, StoreError> {
+        self.inner.remove_cluster(id).await
+    }
     async fn record_observation(
         &self,
         id: &ClusterId,

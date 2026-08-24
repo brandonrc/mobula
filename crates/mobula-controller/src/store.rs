@@ -70,6 +70,11 @@ pub struct StoredCluster {
     pub next_attempt_at: u64,
     /// Unix seconds when the cluster was first created (for TTL reaping).
     pub created_at: u64,
+    /// Unix seconds when desired state last became `Terminated`, or `None`
+    /// while the cluster is running/suspended. Anchors the terminated-row
+    /// retention sweep (Truthful Console): a tombstone older than the
+    /// window is hard-deleted. Cleared if the cluster is resumed.
+    pub terminated_at: Option<u64>,
 }
 
 /// Current unix time in whole seconds.
@@ -440,6 +445,14 @@ pub trait Store: Send + Sync {
 
     /// Flip desired state (e.g. request termination).
     async fn set_desired(&self, id: &ClusterId, desired: DesiredState) -> Result<(), StoreError>;
+
+    /// Hard-delete a cluster row (Truthful Console tombstone purge). Unlike
+    /// [`set_desired`]`(Terminated)`, which only records intent, this removes
+    /// the row entirely — used to clear the tombstone a reaped cluster leaves
+    /// behind. The caller is responsible for confirming the cluster is
+    /// already terminated/gone before removing it. Returns `true` if a row
+    /// was removed, `false` if none existed.
+    async fn remove_cluster(&self, id: &ClusterId) -> Result<bool, StoreError>;
 
     /// Record the reconstructed observation and the generation it reflects.
     /// The stored `observed_generation` is monotonic non-decreasing (ADR-0007
@@ -974,6 +987,7 @@ pub mod memory {
                 failure_count: observed.map(|c| c.failure_count).unwrap_or(0),
                 next_attempt_at: observed.map(|c| c.next_attempt_at).unwrap_or(0),
                 created_at: observed.map(|c| c.created_at).unwrap_or_else(now_unix),
+                terminated_at: observed.and_then(|c| c.terminated_at),
             };
             map.insert(id.0.clone(), record);
             Ok(generation)
@@ -997,7 +1011,20 @@ pub mod memory {
                 .get_mut(&id.0)
                 .ok_or_else(|| StoreError::Backend(format!("no such cluster {id}")))?;
             c.desired = desired;
+            // Anchor (or clear) the tombstone-retention clock (Truthful
+            // Console): first transition into Terminated stamps the time;
+            // any move away from Terminated clears it.
+            match desired {
+                DesiredState::Terminated => {
+                    c.terminated_at.get_or_insert_with(now_unix);
+                }
+                _ => c.terminated_at = None,
+            }
             Ok(())
+        }
+
+        async fn remove_cluster(&self, id: &ClusterId) -> Result<bool, StoreError> {
+            Ok(self.clusters.lock().unwrap().remove(&id.0).is_some())
         }
 
         async fn record_observation(
@@ -1570,6 +1597,10 @@ pub(crate) mod testkit {
         ) -> Result<(), StoreError> {
             self.check("set_desired")?;
             self.inner.set_desired(id, desired).await
+        }
+        async fn remove_cluster(&self, id: &ClusterId) -> Result<bool, StoreError> {
+            self.check("remove_cluster")?;
+            self.inner.remove_cluster(id).await
         }
         async fn record_observation(
             &self,

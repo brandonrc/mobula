@@ -437,6 +437,7 @@ mod tests {
             failure_count: 0,
             next_attempt_at: 0,
             created_at: 0,
+            terminated_at: None,
         }
     }
 

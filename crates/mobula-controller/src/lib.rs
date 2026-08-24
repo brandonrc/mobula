@@ -15,7 +15,7 @@ pub mod store_sqlite;
 
 pub use metering::Metering;
 pub use pool_reconcile::{PoolAction, PoolReconciler};
-pub use reconcile::{Action, RateLimits, ReconcileError, Reconciler};
+pub use reconcile::{observed_gone, Action, RateLimits, ReconcileError, Reconciler};
 pub use store::{
     audit_chain_hash, memory::InMemoryStore, now_unix, queue_assignment_for_project,
     verify_audit_chain, AuditChainVerification, AuditChainWindow, ChainedAuditRow, DesiredState,

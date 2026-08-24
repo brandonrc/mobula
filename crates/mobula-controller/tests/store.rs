@@ -62,10 +62,10 @@ async fn conformance(store: &dyn Store) {
         .set_desired(&id, DesiredState::Terminated)
         .await
         .unwrap();
-    assert_eq!(
-        store.get(&id).await.unwrap().unwrap().desired,
-        DesiredState::Terminated
-    );
+    let got = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(got.desired, DesiredState::Terminated);
+    // Terminating stamps the tombstone-retention clock (Truthful Console).
+    assert!(got.terminated_at.is_some());
 
     // #51: the Suspended desired state round-trips too (persisted as the
     // string "suspended" by the sqlx stores; old "running"/"terminated"
@@ -79,10 +79,11 @@ async fn conformance(store: &dyn Store) {
         DesiredState::Suspended
     );
     store.set_desired(&id, DesiredState::Running).await.unwrap();
-    assert_eq!(
-        store.get(&id).await.unwrap().unwrap().desired,
-        DesiredState::Running
-    );
+    let got = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(got.desired, DesiredState::Running);
+    // Moving away from Terminated clears the retention clock: a resumed
+    // cluster is never a tombstone.
+    assert_eq!(got.terminated_at, None);
 
     // list.
     assert_eq!(store.list().await.unwrap().len(), 1);
@@ -197,6 +198,13 @@ async fn conformance(store: &dyn Store) {
         .set_desired(&ClusterId("ghost".into()), DesiredState::Running)
         .await
         .is_err());
+
+    // remove_cluster hard-deletes the row and reports whether one existed
+    // (Truthful Console tombstone purge).
+    assert!(store.remove_cluster(&id).await.unwrap());
+    assert!(store.get(&id).await.unwrap().is_none());
+    // Idempotent: removing an absent row is Ok(false), not an error.
+    assert!(!store.remove_cluster(&id).await.unwrap());
 }
 
 #[tokio::test]
