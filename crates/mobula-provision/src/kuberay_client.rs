@@ -7,11 +7,12 @@
 //! manifest simply omits it, see [`super::kuberay`]).
 
 use async_trait::async_trait;
-use kube::api::{Api, DeleteParams, DynamicObject, ListParams, Patch, PatchParams};
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams};
 use kube::core::{GroupVersionKind, ObjectMeta};
 use kube::discovery::ApiResource;
 use kube::Client;
-use mobula_core::{ClusterId, ClusterSpec, ServiceSpec};
+use mobula_core::{ClusterEvents, ClusterId, ClusterLogs, ClusterSpec, ServiceSpec};
 
 use crate::kuberay::{
     self, CLUSTER_ID_LABEL, FIELD_MANAGER, GENERATION_ANNOTATION, MANAGED_BY_LABEL,
@@ -74,6 +75,14 @@ fn pod_resource() -> ApiResource {
         group: "".into(),
         version: "v1".into(),
         kind: "Pod".into(),
+    })
+}
+
+fn event_resource() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind {
+        group: "".into(),
+        version: "v1".into(),
+        kind: "Event".into(),
     })
 }
 
@@ -506,6 +515,105 @@ impl Provisioner for KubeRayProvisioner {
             .collect();
 
         Ok(Some(kuberay::node_breakdown(&id.0, &cr_value, &pod_values)))
+    }
+
+    async fn cluster_events(
+        &self,
+        id: &ClusterId,
+    ) -> Result<Option<ClusterEvents>, ProvisionError> {
+        // Kubernetes is the source (api-v1.md §5.8): list core/v1 Events in the
+        // cluster's namespace and keep those about the cluster's objects (the
+        // RayCluster + everything KubeRay names under it). Works even when the
+        // Ray dashboard is unreachable — the point of the events tab. No
+        // fieldSelector: it can't express the `<id>-` name prefix, so the
+        // filtering is done in the pure `events_from_k8s` helper.
+        let events: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &event_resource());
+        let list = events.list(&ListParams::default()).await?;
+        let raw: Vec<serde_json::Value> = list
+            .into_iter()
+            .filter_map(|e| serde_json::to_value(&e).ok())
+            .collect();
+        Ok(Some(kuberay::events_from_k8s(&id.0, &raw)))
+    }
+
+    async fn cluster_logs(
+        &self,
+        id: &ClusterId,
+        pod: Option<&str>,
+        tail: usize,
+    ) -> Result<Option<ClusterLogs>, ProvisionError> {
+        // The set of pods the caller may tail: exactly the pods KubeRay owns
+        // for this cluster (label `ray.io/cluster=<id>`). This is also the
+        // guard against tailing an arbitrary pod in the namespace — only a pod
+        // in this set is fetched. Head first so the default target is the head.
+        let pods: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &pod_resource());
+        let params =
+            ListParams::default().labels(&format!("{}={}", kuberay::RAY_CLUSTER_LABEL, id.0));
+        let pod_list = pods.list(&params).await?;
+        let mut ranked: Vec<(bool, String)> = pod_list
+            .iter()
+            .filter_map(|p| {
+                let name = p.metadata.name.clone()?;
+                let is_head = p
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get(kuberay::RAY_NODE_TYPE_LABEL))
+                    .map(|v| v == "head")
+                    .unwrap_or(false);
+                Some((is_head, name))
+            })
+            .collect();
+        // Head first, then name-sorted for a stable selector order.
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let ordered: Vec<String> = ranked.into_iter().map(|(_, n)| n).collect();
+
+        if ordered.is_empty() {
+            // Cluster exists but has no pods yet (e.g. just applied / suspended):
+            // return an empty view rather than 404 so the tab renders cleanly.
+            return Ok(Some(ClusterLogs {
+                cluster_id: id.0.clone(),
+                pods: Vec::new(),
+                pod: String::new(),
+                tail: tail as u32,
+                lines: Vec::new(),
+                truncated: false,
+            }));
+        }
+
+        let target = match pod {
+            Some(p) if ordered.iter().any(|n| n == p) => p.to_string(),
+            // A pod not in this cluster: 404 (never tail an out-of-cluster pod).
+            Some(_) => return Ok(None),
+            None => ordered[0].clone(),
+        };
+
+        // The logs subresource via a typed Pod handle (kubectl-logs equivalent).
+        // `tail_lines` server-side-caps; the pure helper re-caps + flags
+        // truncation. `previous`/`since` are future knobs (not this first cut).
+        let typed: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let lp = LogParams {
+            tail_lines: Some(tail as i64),
+            timestamps: true,
+            ..Default::default()
+        };
+        let raw = match typed.logs(&target, &lp).await {
+            Ok(s) => s,
+            // The pod vanished between list and fetch: empty tail, not an error.
+            Err(kube::Error::Api(e)) if e.code == 404 => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let (lines, truncated) = kuberay::tail_lines(&raw, tail);
+        Ok(Some(ClusterLogs {
+            cluster_id: id.0.clone(),
+            pods: ordered,
+            pod: target,
+            tail: tail as u32,
+            lines,
+            truncated,
+        }))
     }
 }
 

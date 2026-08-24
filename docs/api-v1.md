@@ -706,6 +706,85 @@ needs cluster hostnames (ADR-0002 scope discipline, §1).
   by content-type/envelope, which is why the control-plane envelope is
   uniform (§2.3).
 
+### 5.6a Events — `GET /api/v1/clusters/{id}/events`
+
+Kubernetes Events for the cluster's objects, for the events tab
+(ui-ux-spec §5.4/§5.8). **Implemented** (Milestone C, `cluster_obs.rs`).
+The highest-value drill-down for "why won't this cluster come up" — it
+surfaces scheduling, image-pull, and probe failures.
+
+- **Auth:** `Read` on `Target::Cluster`, read-scoped (#49) — identical to
+  §5.3.
+- **Source:** **Kubernetes**, not the Ray API. Core `v1` Events in the
+  cluster's namespace are listed via the provisioner and filtered to the
+  cluster's objects (the RayCluster itself, plus everything KubeRay names
+  under it — the `<id>-` prefix that catches head/worker pods and the head
+  service). Works even when the Ray dashboard is down — which is exactly when
+  events matter most. Both Event schemas (core/v1 `involvedObject` and
+  events.k8s.io/v1 `regarding`/`note`/`series`) are normalized to one shape.
+- **Response 200:**
+
+```json
+{
+  "cluster_id": "team-b-scoring",
+  "events": [
+    {
+      "type": "Warning",
+      "reason": "FailedScheduling",
+      "message": "0/3 nodes available: 3 Insufficient nvidia.com/gpu",
+      "count": 4,
+      "first_seen": "2026-08-22T10:00:00Z",
+      "last_seen": "2026-08-22T10:05:00Z",
+      "object": "Pod/team-b-scoring-head-abc12"
+    }
+  ]
+}
+```
+
+Newest-first by `last_seen`, capped at 200. `type` is `Normal` | `Warning`
+verbatim; `count` collapses K8s's own repeat-count (default 1); `object` is
+`Kind/name`. Optional keys are omitted when the source has no value.
+- **Errors:** 403; 404 (cluster unknown, or the backend exposes no events —
+  gateway-only / demo); 503 when the event source (Kubernetes) can't be
+  reached (graceful degrade, never a panic).
+
+### 5.6b Logs — `GET /api/v1/clusters/{id}/logs`
+
+Tail-capped pod logs for the logs tab (ui-ux-spec §5.4). **Implemented as a
+non-streaming first cut** (Milestone C, `cluster_obs.rs`). The eventual
+design is a control-plane WS tail (§5.6 / this section's TODO); the GET-tail
+form removes the pending-backend stub now.
+
+- **Auth:** `Read` on `Target::Cluster`, read-scoped (#49).
+- **Source:** **Kubernetes** — the kubectl-logs equivalent through the K8s
+  API (`GET …/pods/{name}/log`, `tailLines`). The tailable pod set is exactly
+  the pods KubeRay owns for the cluster (`ray.io/cluster=<id>`); a pod outside
+  that set is never tailed (404).
+- **Query:** `node=<pod>` selects a pod (defaults to the head pod);
+  `tail=<N>` bounds the returned lines (default 200, clamped to 5000).
+- **Response 200:**
+
+```json
+{
+  "cluster_id": "team-b-scoring",
+  "pods": ["team-b-scoring-head-abc12", "team-b-scoring-worker-gpu-1"],
+  "pod": "team-b-scoring-head-abc12",
+  "tail": 200,
+  "lines": ["2026-08-22T10:00:00Z ray start --head", "…"],
+  "truncated": true
+}
+```
+
+`pods` lets the UI offer a pod selector; `pod` is the one these `lines` came
+from; `truncated` is `true` when the tail was filled (older lines may exist
+beyond it).
+- **Errors:** 403; 404 (cluster unknown, requested pod not in the cluster, or
+  the backend exposes no logs); 503 when the log source (Kubernetes) can't be
+  reached.
+- **TODO (Milestone C):** upgrade to a WS streaming tail
+  (`WS …/logs/tail`) — this GET-tail is the pragmatic first cut. Container
+  selection, `previous` (crashed container), and `since` are also deferred.
+
 ### 5.7 Job history — `GET /api/v1/jobs` (+ `GET /api/v1/jobs/{job_id}`)
 
 Cross-cluster, persistent job records (ui-ux-spec §5.5) — the "history
@@ -1101,29 +1180,49 @@ mobula_pool_nominal{pool="gpu-pool",resource="cpu"} 64
     `PoolView.total_nominal`); a resource key that fails to parse on any
     flavor is omitted entirely rather than summed partially.
 
-#### `GET /api/v1/clusters/{id}/metrics` — Ray head passthrough (#52)
+#### `GET /api/v1/clusters/{id}/metrics` — cluster resource summary (#52)
 
-Proxies the Ray head's own Prometheus exposition (`/metrics` on the
-dashboard port 8265) through the control plane, so one scrape/config path
-covers the control-plane gauges above and every cluster's Ray metrics.
+A **normalized cluster resource-usage summary** for the metrics tab's stat
+tiles (ui-ux-spec §5.4), distilled from the Ray dashboard's autoscaler /
+load-metrics report (`GET /api/cluster_status`). **Implemented** (Milestone
+C, `cluster_obs.rs`). This replaces the earlier raw-Prometheus passthrough
+(#52 first slice): the browser wants CPU/GPU/mem used-vs-total tiles, not a
+4MiB exposition to parse, and — critically — an unreachable head now degrades
+to a clean **503**, never the 502/panic the passthrough produced.
 
-- **Auth:** `Read` on `Target::Cluster` (Viewer+).
-- **Head URL:** `Provisioner::metrics_endpoint(id)` — for KubeRay
-  `http://{name}-head-svc.{namespace}.svc:8265/metrics` (the head service
-  KubeRay creates is `<name>-head-svc`). The demo provisioner names no
-  endpoint → **404 `metrics unavailable`**.
-- **Credential discipline (ADR-0003, same as the job gateway):** the
-  southbound request is built from scratch — no inbound header is
-  forwarded, so the caller's JWT never reaches the cluster — and the only
-  credential injected is the cluster's static token from the registry
-  (`Authorization: Bearer …`), when one is registered.
-- **Response:** the upstream status with the exposition body as
-  `text/plain; version=0.0.4`. Southbound timeouts are 5s connect / 30s
-  read; the body is capped at 4MiB (a larger response → 502
-  `metrics response too large`); an unreachable head → 502
-  `metrics upstream error`. Redirects are never followed.
-- **Out of scope for this slice** (the #52 epic's future work):
-  SSE/event streaming of cluster state and OpenTelemetry export.
+- **Auth:** `Read` on `Target::Cluster` (Viewer+), read-scoped (#49).
+- **Southbound resolution + credential discipline:** identical to the jobs
+  proxy (§5.6) — a registered cluster uses the registry's `api_base_url` +
+  static token; a lifecycle-managed cluster uses the provisioner-derived
+  head-service dashboard (`…-head-svc:8265`, no token). The request is built
+  from scratch (caller JWT never travels southbound); 5s connect / 30s read;
+  the body is capped at 4MiB; redirects are never followed. When no endpoint
+  can be named (gateway-only / demo) → **404 `metrics unavailable`**.
+- **Response 200:**
+
+```json
+{
+  "cluster_id": "team-b-scoring",
+  "cpu": { "used": 6.0, "total": 8.0 },
+  "gpu": { "used": 1.0, "total": 2.0 },
+  "memory": { "used": 10.0, "total": 32.0 },
+  "object_store_memory": { "used": 1.0, "total": 4.0 },
+  "active_nodes": 3,
+  "pending_nodes": 0,
+  "failed_nodes": 0
+}
+```
+
+CPU is cores, GPU is device count, memory is bytes. Each stat is omitted when
+the Ray report does not carry it (a cluster with no GPUs omits `gpu`), so the
+UI renders only the tiles present. The `loadMetricsReport.usage` map is read
+defensively across the shapes Ray has shipped.
+- **Errors:** 403; 404 (no reachable dashboard to name); **503** when the Ray
+  dashboard can't be reached, answers non-2xx, or returns a body that isn't
+  parseable — the UI's cluster-unreachable state, never a crash.
+- **Deferred:** raw Prometheus exposition (the old passthrough — reintroduce
+  behind a distinct path if a scrape target is needed), SSE/event streaming,
+  OpenTelemetry export, and Grafana deep-links.
 
 ### 5.14 Registry — `GET /api/v1/registry/clusters`
 
