@@ -306,7 +306,7 @@ async fn get_cluster(
 async fn create_cluster(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
-    Json(body): Json<CreateCluster>,
+    Json(mut body): Json<CreateCluster>,
 ) -> Response {
     // Scoped RBAC (#49): Write on Cluster granted globally (Operator/Admin)
     // or by an assignment covering the spec's project.
@@ -322,6 +322,14 @@ async fn create_cluster(
         return deny;
     }
     let id = ClusterId(body.id);
+
+    // Tier-2 owned session clusters: record the authenticated caller as the
+    // cluster owner, ALWAYS overriding any client-supplied `owner` (the body
+    // is untrusted — ownership is who asked, not what they claim). Flows into
+    // the store, the `mobula.dev/owner` label, and the per-owner Ray-client
+    // ingress NetworkPolicy. `None` only when the request is unauthenticated
+    // (auth-disabled deployments), which leaves the cluster ownerless.
+    body.spec.owner = ident(&identity).map(|i| i.owner().to_string());
 
     // Quota admission (Borg: quota is admission control). Only enforced for
     // projects with a configured limit; unconfigured projects are

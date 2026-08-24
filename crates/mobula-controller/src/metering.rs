@@ -319,6 +319,7 @@ mod tests {
                 replicas: 1,
             }],
             ttl_seconds: None,
+            owner: None,
         }
     }
 

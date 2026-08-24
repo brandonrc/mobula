@@ -159,12 +159,27 @@ pub fn scope_covers(scope: &str, project: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub subject: String,
+    /// The human username (`preferred_username` claim), when the token
+    /// carries one. Distinct from `subject`, which is the opaque `sub`
+    /// (a UUID on Keycloak). Used as the tier-2 cluster owner label so it
+    /// matches the JupyterHub username the hub stamps on notebook pods.
+    pub username: Option<String>,
     pub email: Option<String>,
     pub groups: Vec<String>,
     pub roles: Vec<Role>,
 }
 
 impl Identity {
+    /// The identity to attribute owned resources to (tier-2 owned session
+    /// clusters): the human `username` when present, else the `subject`. For
+    /// local auth `subject` already *is* the username, so the fallback is
+    /// correct there too. This is the value stamped as `mobula.dev/owner`
+    /// and matched by the per-owner NetworkPolicy, so it must equal the
+    /// JupyterHub username on the owner's notebook pod.
+    pub fn owner(&self) -> &str {
+        self.username.as_deref().unwrap_or(&self.subject)
+    }
+
     /// Whether any held role grants `action` on `target` (deny-by-default:
     /// an empty role set grants nothing).
     pub fn permits(&self, action: PermissionType, target: Target) -> bool {
@@ -502,6 +517,13 @@ impl Validator {
             // containing newlines/control chars could forge audit lines
             // (#34). Replace control chars with '?'.
             subject: sanitize_claim(claims.get("sub").and_then(|v| v.as_str()).unwrap_or("")),
+            // preferred_username reaches the audit log and a k8s label value;
+            // sanitize like `sub`. Absent (some IdPs omit it) → None, and
+            // `owner()` falls back to `subject`.
+            username: claims
+                .get("preferred_username")
+                .and_then(|v| v.as_str())
+                .map(sanitize_claim),
             email: claims
                 .get("email")
                 .and_then(|v| v.as_str())
@@ -626,6 +648,7 @@ mod tests {
         // lifecycle.
         let id = Identity {
             subject: "u".into(),
+            username: None,
             email: None,
             groups: vec![],
             roles: vec![Role::Developer, Role::Operator],
@@ -636,6 +659,7 @@ mod tests {
 
         let none = Identity {
             subject: "u".into(),
+            username: None,
             email: None,
             groups: vec![],
             roles: vec![],
@@ -711,6 +735,7 @@ mod tests {
         use Target::*;
         let dev = Identity {
             subject: "u".into(),
+            username: None,
             email: None,
             groups: vec![],
             roles: vec![Role::Developer],
@@ -720,6 +745,7 @@ mod tests {
         // Global roles cover everything, assignments irrelevant (fast path).
         let admin = Identity {
             subject: "root".into(),
+            username: None,
             email: None,
             groups: vec![],
             roles: vec![Role::Admin],
@@ -737,6 +763,7 @@ mod tests {
         // against a caller with no global roles so the assignment decides.
         let nobody = Identity {
             subject: "n".into(),
+            username: None,
             email: None,
             groups: vec![],
             roles: vec![],
@@ -758,6 +785,7 @@ mod tests {
         // viewer assignment cannot strip a global operator's write.
         let op = Identity {
             subject: "o".into(),
+            username: None,
             email: None,
             groups: vec![],
             roles: vec![Role::Operator],

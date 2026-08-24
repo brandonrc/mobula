@@ -241,6 +241,7 @@ mod tests {
                 replicas: min,
             }],
             ttl_seconds: None,
+            owner: None,
         }
     }
 
