@@ -508,43 +508,64 @@ ensures no posture.
 ### 5.3 Nodes — `GET /api/v1/clusters/{id}/nodes`
 
 Aggregated node/worker-group view for the nodes tab (ui-ux-spec §5.4).
-Observability only (D2): no per-node mutation exists or is planned. **New.**
+Observability only (D2): no per-node mutation exists or is planned.
+**Implemented** (Milestone C, `cluster_obs.rs`).
 
-- **Auth:** `Read` on `Target::Cluster`.
-- **Source:** the cluster's own Ray API (node summary / autoscaler status),
-  fetched southbound through the registry/observed `api_base_url` with the
-  credential swap — never a user-facing hostname.
+- **Auth:** `Read` on `Target::Cluster`, read-scoped (#49): a project-scoped
+  developer sees only their projects' clusters; a cluster outside scope is
+  404 (existence is not leaked), matching `GET /clusters/{id}`.
+- **Source (refinement of the draft):** **Kubernetes**, not the Ray API. The
+  breakdown is read from the RayCluster (`spec.workerGroupSpecs` for group
+  names + desired replicas) and the pods KubeRay owns for it
+  (`ray.io/cluster=<id>`), via the cluster provisioner. Kubernetes is the
+  authority for "what pods exist and where", and it answers even when the Ray
+  dashboard is unreachable — which is exactly when the nodes tab is most
+  needed. It follows that `NodeView` reports Kubernetes facts (pod
+  phase/readiness, scheduling, **requested** compute), not Ray runtime usage;
+  live per-node utilization stays a later Ray-API concern.
 - **Response 200:**
 
 ```json
 {
-  "cluster_id": "demo",
+  "cluster_id": "team-b-scoring",
   "head": { "…": "NodeView" },
   "worker_groups": [
     {
       "name": "gpu-a100",
-      "bounds": { "min_replicas": 2, "max_replicas": 8 },
+      "desired": 2,
+      "ready": 1,
       "nodes": [ { "…": "NodeView" } ]
     }
   ]
 }
 ```
 
+`head` is absent until KubeRay creates the head pod. `desired` is the
+group's `replicas`, or `minReplicas` when autoscaling leaves `replicas`
+unmanaged (ADR-0007); `ready` counts pods that are `Running` and `Ready`.
+
 ```json
-// NodeView
+// NodeView (Kubernetes-sourced; omitted keys carry no value)
 {
-  "node_id": "abc123",
+  "pod_name": "team-b-scoring-worker-cpu-abc12",
   "group": "gpu-a100",
   "is_head": false,
-  "status": "alive",
-  "cpu_total": 16.0, "cpu_used": 3.5,
-  "gpu_total": 4.0, "gpu_used": 1.0,
-  "memory_bytes_total": 68719476736, "memory_bytes_used": 1073741824
+  "phase": "Running",
+  "ready": true,
+  "node_ip": "10.42.1.7",
+  "host": "ip-10-0-3-21",
+  "cpu": 16.0,
+  "memory_bytes": 68719476736,
+  "gpu": 4.0
 }
 ```
 
-- **Errors:** 403, 404 (cluster unknown to Mobula), 502
-  `cluster_unreachable` (§2.6).
+- `group` is absent for the head. `cpu`/`memory_bytes`/`gpu` are the pod's
+  container **requests**, summed and parsed from K8s quantities (`500m` →
+  0.5, `2Gi` → 2147483648); absent when unset.
+- **Errors:** 403; 404 (cluster unknown to Mobula, or the backend exposes no
+  node breakdown — gateway-only / demo); 503 when the node source
+  (Kubernetes) can't be reached (a graceful degrade, never a panic).
 
 ### 5.4 Registry — `GET /api/v1/registry/clusters` (+ Phase-3 writes)
 
@@ -648,21 +669,38 @@ needs cluster hostnames (ADR-0002 scope discipline, §1).
 
 | Route | Proxied Ray call | Permission |
 |---|---|---|
-| `GET /api/v1/clusters/{id}/jobs` | `GET /api/jobs/` | `Read` on `Job` |
+| `GET /api/v1/clusters/{id}/jobs` | `GET /api/jobs/` | `Read` on `Job` — **implemented** (Milestone C, `cluster_obs.rs`) |
 | `POST /api/v1/clusters/{id}/jobs` | `POST /api/jobs/` | `Write` on `Job` |
 | `GET /api/v1/clusters/{id}/jobs/{job_id}` | `GET /api/jobs/{job_id}` | `Read` on `Job` |
 | `POST /api/v1/clusters/{id}/jobs/{job_id}/stop` | `POST /api/jobs/{job_id}/stop` | `Write` on `Job` |
 | `DELETE /api/v1/clusters/{id}/jobs/{job_id}` | `DELETE /api/jobs/{job_id}` | `Write` on `Job` (matches the gateway's method mapping — job deletion is a Developer action, `auth_layer.rs:36`) |
 | `GET /api/v1/clusters/{id}/jobs/{job_id}/logs` | `GET /api/jobs/{job_id}/logs` | `Read` on `Job` |
 
-- **Bodies:** opaque passthrough — Ray's job records live in GCS internal KV
-  and Mobula deliberately does not reimplement them (ADR-0002, PLAN.md S2).
-  These routes are documented in OpenAPI as `application/json` opaque objects
-  with a stability note ("shaped by the cluster's Ray version; two-minor
-  support window"), not as Mobula-owned schemas. Mobula-owned history is
-  §5.7.
-- **Statuses:** upstream status passes through untouched; southbound
-  transport failure is 502 `cluster_unreachable` (§2.6).
+- **Bodies:** opaque passthrough for the write/detail routes — Ray's job
+  records live in GCS internal KV and Mobula deliberately does not
+  reimplement them (ADR-0002, PLAN.md S2). Documented in OpenAPI as
+  `application/json` opaque objects with a stability note ("shaped by the
+  cluster's Ray version; two-minor support window"), not as Mobula-owned
+  schemas. Mobula-owned history is §5.7.
+  - **Refinement for `GET .../jobs` (the list, Milestone C):** the response
+    is **normalized** to a stable Mobula shape, a JSON array of `RayJobSummary`
+    (`{ job_id?, submission_id?, status?, entrypoint?, start_time?, end_time?,
+    message? }`), rather than opaque passthrough — the nodes/jobs tab codes
+    against one schema across Ray minors. `status` stays Ray's vocabulary
+    verbatim (`PENDING | RUNNING | SUCCEEDED | FAILED | STOPPED`, §5.7);
+    `start_time`/`end_time` are Ray's unix-millis. Read-scoped like §5.3.
+- **Southbound resolution:** a registered cluster uses the registry's
+  `api_base_url` + static token; a lifecycle-managed cluster uses the
+  provisioner-derived head-service dashboard (`…-head-svc:8265`, no token —
+  reached over the tenant network). The credential swap is the gateway's
+  (caller JWT terminates at Mobula; the cluster's Ray token, if any, travels
+  southbound), with the gateway's body/inflight caps.
+- **Statuses:** upstream status passes through untouched for the opaque
+  routes. For the normalized `GET .../jobs`, a non-2xx upstream still passes
+  through with its body; a southbound transport failure is **503
+  `cluster_unreachable`** — a deliberate refinement of §2.6's 502 for this
+  browser-consumable control-plane view, so the UI's "backend unreachable"
+  empty state is a graceful degrade, never a crash.
 - **404 disambiguation:** `{id}` unknown to Mobula → Mobula's 404 envelope;
   job unknown to Ray → Ray's 404 body, passed through. The UI distinguishes
   by content-type/envelope, which is why the control-plane envelope is

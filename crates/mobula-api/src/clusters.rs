@@ -152,7 +152,7 @@ fn store_err(e: mobula_controller::StoreError) -> Response {
 /// narrowed to the scoped projects — the presence of a scoped binding
 /// defines the projects they operate in, so reads follow it. Only a global
 /// Admin role is exempt and always sees every cluster.
-async fn read_scope(
+pub(crate) async fn read_scope(
     store: &Arc<dyn Store>,
     id: Option<&Identity>,
 ) -> (Vec<(Role, String)>, Option<Vec<String>>) {

@@ -10,6 +10,7 @@ pub mod auth;
 pub mod cluster;
 pub mod crypto;
 pub mod job;
+pub mod node;
 pub mod pool;
 pub mod registry;
 pub mod service;
@@ -20,6 +21,7 @@ pub use cluster::{
     ClusterId, ClusterSpec, ClusterState, DriftCondition, TransitionError, WorkerGroup,
 };
 pub use job::JobRecord;
+pub use node::{ClusterNodes, NodeView, WorkerGroupNodes};
 pub use pool::{
     AllocationSpec, AllocationSpecError, FlavorSpec, FlavorSpecError, GpuSharing, PoolSpec,
     PoolSpecError, TaintSpec, TaintSpecError,
