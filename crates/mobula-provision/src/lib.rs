@@ -86,7 +86,10 @@ pub trait Provisioner: Send + Sync {
     /// Ensure the namespace-level security posture for the namespace this
     /// backend provisions into (#56 tenant network isolation, #62 STIG
     /// pod-security defaults): a default-deny NetworkPolicy plus explicit
-    /// allows, and Pod Security Standards labels on the namespace. This is
+    /// allows — both scoped to the backend's own tenant pods, never
+    /// namespace-wide (#86: the namespace can be the control plane's own,
+    /// and a namespace-wide deny locks it out) — and Pod Security Standards
+    /// labels on the namespace. This is
     /// a per-namespace concern, not per-cluster — the reconcile engine calls
     /// it before/with each actuating `apply`. Idempotent (server-side
     /// apply), and must NOT overwrite a stricter existing posture
