@@ -97,6 +97,9 @@ pub struct ClusterView {
     /// normally. Distinct from `observed_state`.
     pub condition: Option<String>,
     pub project: String,
+    /// Which engine backs this cluster: "ray" | "dask" (multi-engine). Lets
+    /// GET /clusters surface a Ray and a Dask cluster side by side.
+    pub engine: String,
     pub ray_version: String,
     /// Estimated $/hr at min size, if a price sheet is configured.
     pub est_min_hourly: Option<f64>,
@@ -126,6 +129,7 @@ impl ClusterView {
                     .and_then(|v| v.as_str().map(String::from))
             }),
             project: c.spec.project.clone(),
+            engine: c.spec.engine.to_string(),
             ray_version: c.spec.ray_version.clone(),
             est_min_hourly: cost.map(|c| c.min_hourly),
             est_max_hourly: cost.map(|c| c.max_hourly),

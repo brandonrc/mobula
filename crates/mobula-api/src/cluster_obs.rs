@@ -303,6 +303,19 @@ async fn cluster_jobs(
         return deny;
     }
 
+    // Multi-engine: the batch job gateway is a Ray-only surface (there is no
+    // Ray-Jobs-REST equivalent on a Dask scheduler). Reject a job request
+    // against a Dask cluster with a clear 400 rather than a generic 404.
+    if let Ok(Some(c)) = st.store.get(&id).await {
+        if c.spec.engine == mobula_core::Engine::Dask {
+            return (
+                StatusCode::BAD_REQUEST,
+                "job submission is not supported for engine=dask (batch is a Ray-only surface)",
+            )
+                .into_response();
+        }
+    }
+
     // Resolve the southbound base URL + token: a registered cluster's from
     // the registry (explicit token), else a lifecycle-managed cluster's
     // head-service dashboard from the provisioner (no token — the in-cluster

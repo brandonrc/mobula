@@ -419,6 +419,7 @@ mod tests {
         StoredCluster {
             id: mobula_core::ClusterId(format!("c-{}", project.len())),
             spec: mobula_core::ClusterSpec {
+                engine: Default::default(),
                 name: "c".into(),
                 project: project.into(),
                 ray_version: "2.57.0".into(),

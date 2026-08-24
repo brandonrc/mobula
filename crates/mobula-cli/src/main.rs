@@ -481,24 +481,34 @@ async fn start_lifecycle<S: mobula_controller::Store + 'static>(
     std::sync::Arc<dyn mobula_provision::ServiceProvisioner>,
     std::sync::Arc<dyn mobula_provision::Provisioner>,
 )> {
-    let provisioner = std::sync::Arc::new(
+    // Multi-engine: one KubeRay backend and one Dask backend, fronted by the
+    // EngineRouter which dispatches each cluster to the right one by
+    // `spec.engine`. The router backs the reconcile loop (clusters) and the
+    // cluster obs/metrics/nodes passthrough (so those dispatch per engine);
+    // the Serve-service routes stay Ray-only (Dask has no serving surface).
+    let ray = std::sync::Arc::new(
         mobula_provision::KubeRayProvisioner::connect(ns.to_string(), false)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?,
     );
-    // The same provisioner backs the reconcile loop (clusters), the
-    // Serve-service routes, and the cluster metrics passthrough.
-    let service_provisioner: std::sync::Arc<dyn mobula_provision::ServiceProvisioner> =
-        provisioner.clone();
-    let cluster_provisioner: std::sync::Arc<dyn mobula_provision::Provisioner> =
-        provisioner.clone();
+    let dask = std::sync::Arc::new(
+        mobula_provision::DaskProvisioner::connect(ns.to_string())
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?,
+    );
+    let router = std::sync::Arc::new(mobula_provision::EngineRouter::from_parts(
+        ray.clone(),
+        dask,
+    ));
+    let service_provisioner: std::sync::Arc<dyn mobula_provision::ServiceProvisioner> = ray.clone();
+    let cluster_provisioner: std::sync::Arc<dyn mobula_provision::Provisioner> = router.clone();
     // Global actuation rate limit (#43): cap provider apply calls so a burst
     // of failing clusters can't hammer the Kubernetes API. Generous enough
     // for normal ops (per-cluster exponential backoff is the primary
     // throttle); this is defense-in-depth.
     let reconciler = mobula_controller::Reconciler::with_limits(
         concrete.clone(),
-        provisioner,
+        router,
         mobula_controller::RateLimits {
             capacity: 20.0,
             refill_per_sec: 5.0,

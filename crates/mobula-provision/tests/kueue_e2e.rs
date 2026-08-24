@@ -54,6 +54,7 @@ fn alloc(project: &str, namespace: &str) -> AllocationSpec {
 
 fn cluster_spec(name: &str, project: &str) -> ClusterSpec {
     ClusterSpec {
+        engine: Default::default(),
         name: name.into(),
         project: project.into(),
         ray_version: "2.57.0".into(),

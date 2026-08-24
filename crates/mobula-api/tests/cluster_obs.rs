@@ -192,6 +192,7 @@ fn sample_nodes(cluster_id: &str) -> ClusterNodes {
 
 fn cluster_spec(project: &str) -> ClusterSpec {
     ClusterSpec {
+        engine: Default::default(),
         name: "c".into(),
         project: project.into(),
         ray_version: "2.57.0".into(),

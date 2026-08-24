@@ -19,7 +19,7 @@ pub mod service;
 pub use audit::{AuditDecision, AuditEvent, AuditFilter, AuditRequired};
 pub use auth::{ApiTokenRecord, ApiTokenView, LocalRole, LocalUserRecord, LocalUserView};
 pub use cluster::{
-    ClusterId, ClusterSpec, ClusterState, DriftCondition, TransitionError, WorkerGroup,
+    ClusterId, ClusterSpec, ClusterState, DriftCondition, Engine, TransitionError, WorkerGroup,
 };
 pub use job::JobRecord;
 pub use node::{ClusterNodes, NodeView, WorkerGroupNodes};
