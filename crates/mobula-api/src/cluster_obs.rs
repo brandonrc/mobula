@@ -74,11 +74,6 @@ fn ident(ext: &Option<Extension<Identity>>) -> Option<&Identity> {
     ext.as_ref().map(|e| &e.0)
 }
 
-fn store_err(e: mobula_controller::StoreError) -> Response {
-    tracing::warn!(error = %e, "cluster obs store error");
-    (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
-}
-
 /// The visibility a caller has to a cluster for a read: either a store-backed
 /// cluster with a project (scoping applies) or a registry-only cluster (no
 /// project — only global reads see it).
@@ -92,17 +87,18 @@ enum ClusterScope {
 /// Resolve a cluster for a read, applying read-scoping (#49): a caller
 /// narrowed by project-scoped assignments gets 404 (not 403) for a cluster
 /// outside their projects — the list hides it, so a by-name read must not
-/// leak its existence. Returns the denial/`404` response in `Err`.
+/// leak its existence. The `Err` is a small `(status, message)` the caller
+/// turns into a response (kept small so the `Result` stays cheap to move).
 async fn scope_for_read(
     st: &ObsApiState,
     identity: &Option<Extension<Identity>>,
     id: &ClusterId,
-) -> Result<ClusterScope, Response> {
+) -> Result<ClusterScope, (StatusCode, &'static str)> {
     match st.store.get(id).await {
         Ok(Some(c)) => {
             let (_, narrowed) = read_scope(&st.store, ident(identity)).await;
             if narrowed.is_some_and(|projects| !projects.contains(&c.spec.project)) {
-                return Err((StatusCode::NOT_FOUND, "no such cluster").into_response());
+                return Err((StatusCode::NOT_FOUND, "no such cluster"));
             }
             Ok(ClusterScope::Project(c.spec.project.clone()))
         }
@@ -111,15 +107,18 @@ async fn scope_for_read(
             // read here. A project-narrowed caller can't see a cluster with
             // no project, so it 404s exactly as a hidden one would.
             if st.registry.by_id(id).is_none() {
-                return Err((StatusCode::NOT_FOUND, "no such cluster").into_response());
+                return Err((StatusCode::NOT_FOUND, "no such cluster"));
             }
             let (_, narrowed) = read_scope(&st.store, ident(identity)).await;
             if narrowed.is_some() {
-                return Err((StatusCode::NOT_FOUND, "no such cluster").into_response());
+                return Err((StatusCode::NOT_FOUND, "no such cluster"));
             }
             Ok(ClusterScope::Registered)
         }
-        Err(e) => Err(store_err(e)),
+        Err(e) => {
+            tracing::warn!(error = %e, "cluster obs store error");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "store error"))
+        }
     }
 }
 
@@ -146,7 +145,7 @@ async fn cluster_nodes(
     let id = ClusterId(id);
     let scope = match scope_for_read(&st, &identity, &id).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err((code, msg)) => return (code, msg).into_response(),
     };
     // Nodes read like cluster data: Read on Target::Cluster (Viewer+).
     let deny = match &scope {
@@ -267,7 +266,7 @@ async fn cluster_jobs(
     let id = ClusterId(id);
     let scope = match scope_for_read(&st, &identity, &id).await {
         Ok(s) => s,
-        Err(resp) => return resp,
+        Err((code, msg)) => return (code, msg).into_response(),
     };
     // Listing jobs is a Read on Target::Job (§5.6), scoped to the cluster's
     // project when it has one.
