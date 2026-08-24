@@ -1,0 +1,18 @@
+# Standalone Role granting the Mobula control-plane SA (mobula-pack) the
+# DaskCluster access the multi-engine spike needs. Applied out-of-band (NOT via
+# the mobula-pack chart): Helm's 3-way strategic merge no-ops additive rule
+# changes to a chart-owned Role, so new apiGroups/resources added to the chart's
+# Role would silently never take effect on an upgrade. A separate Role + binding
+# sidesteps that (same pattern as mobula-observability). Pods / networkpolicies
+# are already granted by mobula-pack-kuberay, so this adds only daskclusters.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mobula-dask
+  namespace: mobula
+  labels:
+    app.kubernetes.io/managed-by: mobula-spike-dask
+rules:
+  - apiGroups: ["kubernetes.dask.org"]
+    resources: ["daskclusters", "daskworkergroups"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

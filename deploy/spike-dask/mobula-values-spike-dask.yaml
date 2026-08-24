@@ -1,0 +1,9 @@
+# Spike overlay: pin the mobula-pack release to the locally-built multi-engine
+# image. Layered on top of ~/deploy/mobula-values.yaml (helm -f base -f overlay)
+# so the original values (auth/oidc/persistence/kuberay) are unchanged and the
+# rollback is just dropping this overlay. TEMPORARY — replaces the running
+# origin/main image with the spike so the Ray-OR-Dask behaviour can be seen.
+image:
+  repository: localhost:32000/mobula
+  tag: spike-dask
+  pullPolicy: Always
