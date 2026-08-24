@@ -31,6 +31,19 @@ pub struct ClusterSpec {
     pub worker_groups: Vec<WorkerGroup>,
     /// Idle TTL in seconds; `None` disables reaping.
     pub ttl_seconds: Option<u64>,
+    /// The authenticated owner of this cluster (tier-2 owned session
+    /// clusters): the human identity that requested it — a
+    /// `preferred_username` when the OIDC token carries one, else the `sub`.
+    /// Set control-plane-side from the request identity (never trusted from
+    /// the client body); `None` for clusters created without an owner (e.g.
+    /// admin/service paths). When set it is stamped as the
+    /// `mobula.dev/owner` label on the RayCluster and its pods, and drives
+    /// the per-owner Ray-client (`:10001`) ingress NetworkPolicy so only the
+    /// owner's notebook pod can reach the cluster. `#[serde(default)]` keeps
+    /// specs persisted before this field deserializable (they parse as
+    /// `None`).
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// A homogeneous group of Ray worker nodes.

@@ -188,7 +188,11 @@ impl KubeRayProvisioner {
     /// each other, and to nothing else — tenant clusters stay isolated from
     /// each other. Skipped (like the namespace posture) when an admin runs
     /// their own default-deny: Mobula never widens an admin posture.
-    async fn ensure_cluster_allow(&self, id: &str) -> Result<(), ProvisionError> {
+    async fn ensure_cluster_allow(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+    ) -> Result<(), ProvisionError> {
         if self.admin_managed_deny(&self.namespace).await? {
             tracing::info!(
                 target: "mobula::audit",
@@ -197,8 +201,11 @@ impl KubeRayProvisioner {
             );
             return Ok(());
         }
-        self.apply_network_policy(&self.namespace, kuberay::cluster_allow_network_policy(id))
-            .await?;
+        self.apply_network_policy(
+            &self.namespace,
+            kuberay::cluster_allow_network_policy(id, owner),
+        )
+        .await?;
         tracing::info!(
             target: "mobula::audit",
             namespace = %self.namespace, cluster = id, "per-cluster allow NetworkPolicy ensured"
@@ -336,8 +343,10 @@ impl Provisioner for KubeRayProvisioner {
     ) -> Result<ApplyResponse, ProvisionError> {
         // #86: the per-cluster intra-tenant allow goes in first, so the
         // cluster's pods are never up under the default-deny without their
-        // own allow (head↔worker traffic would stall the rollout).
-        self.ensure_cluster_allow(&id.0).await?;
+        // own allow (head↔worker traffic would stall the rollout). Tier-2:
+        // the same policy carries the per-owner Ray-client ingress pin.
+        self.ensure_cluster_allow(&id.0, spec.owner.as_deref())
+            .await?;
         let manifest = kuberay::to_raycluster(id, spec, self.autoscaling, generation, queue);
         // Wrap the manifest as a DynamicObject the dynamic Api can apply.
         let mut labels = std::collections::BTreeMap::from([
@@ -507,7 +516,9 @@ impl ServiceProvisioner for KubeRayProvisioner {
         // to_rayservice's pod templates), so they get the same per-cluster
         // allow — including across a RayService zero-downtime upgrade,
         // where old and new generated RayClusters coexist but share it.
-        self.ensure_cluster_allow(name).await?;
+        // Services carry no per-owner Ray-client pin (they are addressed
+        // through the Serve gateway, not a user's ray.init).
+        self.ensure_cluster_allow(name, None).await?;
         let manifest = kuberay::to_rayservice(name, spec);
         let mut obj = DynamicObject::new(name, &rayservice_resource());
         obj.metadata = ObjectMeta {

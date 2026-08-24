@@ -173,6 +173,7 @@ fn to_role(role: LocalRole) -> Role {
 fn identity_of(user: &LocalUserRecord) -> Identity {
     Identity {
         subject: user.username.clone(),
+        username: Some(user.username.clone()),
         email: user.email.clone(),
         groups: vec![],
         roles: vec![to_role(user.role)],

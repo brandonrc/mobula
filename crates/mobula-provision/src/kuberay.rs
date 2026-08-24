@@ -39,6 +39,18 @@ pub const KIND: &str = "RayCluster";
 pub const FIELD_MANAGER: &str = "mobula";
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 pub const CLUSTER_ID_LABEL: &str = "mobula.dev/cluster-id";
+/// Label stamped on the RayCluster and its head/worker pods recording the
+/// cluster's authenticated owner (tier-2 owned session clusters). Its value
+/// is [`ClusterSpec::owner`]. The hub sets the *same* label on the owner's
+/// singleuser notebook pod, so the per-owner ingress NetworkPolicy
+/// ([`cluster_allow_network_policy`]) can admit only that pod to the Ray
+/// client port.
+pub const OWNER_LABEL: &str = "mobula.dev/owner";
+/// The namespace the interactive notebooks (JupyterHub singleuser pods) run
+/// in — the only namespace the per-owner Ray-client ingress rule admits
+/// from. Matched via the API-server-managed `kubernetes.io/metadata.name`
+/// namespace label, so no admin labeling is needed.
+pub const NOTEBOOK_NAMESPACE: &str = "jupyter";
 /// Annotation carrying the Mobula spec generation this resource reflects
 /// (ADR-0006, #40). Stamped on the RayCluster metadata (so `observe` can
 /// read back the generation the cluster actually carries) *and* on the pod
@@ -69,13 +81,28 @@ pub fn to_raycluster(
     let worker_specs: Vec<Value> = spec
         .worker_groups
         .iter()
-        .map(|g| worker_group_spec(&id.0, g, &spec.image, autoscaling, Some(generation)))
+        .map(|g| {
+            worker_group_spec(
+                &id.0,
+                g,
+                &spec.image,
+                autoscaling,
+                Some(generation),
+                spec.owner.as_deref(),
+            )
+        })
         .collect();
 
     let mut labels = json!({
         MANAGED_BY_LABEL: FIELD_MANAGER,
         CLUSTER_ID_LABEL: id.0,
     });
+    // Stamp the owner (tier-2 owned session clusters) for attribution and so
+    // the per-owner ingress policy has a label to key on. Only when set —
+    // ownerless clusters (admin/service paths) carry no owner label.
+    if let Some(owner) = spec.owner.as_deref() {
+        labels[OWNER_LABEL] = json!(owner);
+    }
     let mut annotations = json!({
         GENERATION_ANNOTATION: generation.to_string(),
     });
@@ -225,6 +252,7 @@ fn head_group_spec(id: &str, spec: &ClusterSpec, generation: Option<u64>) -> Val
             &spec.head_memory,
             None,
             generation,
+            spec.owner.as_deref(),
         ),
     })
 }
@@ -235,6 +263,7 @@ fn worker_group_spec(
     image: &str,
     autoscaling: bool,
     generation: Option<u64>,
+    owner: Option<&str>,
 ) -> Value {
     // Workers run the cluster image (Kubernetes requires an image on every
     // container; KubeRay does NOT copy the head image onto worker groups,
@@ -244,7 +273,7 @@ fn worker_group_spec(
         "minReplicas": g.min_replicas,
         "maxReplicas": g.max_replicas,
         "rayStartParams": {},
-        "template": pod_template(id, "ray-worker", image, &g.cpu, &g.memory, g.gpu.as_deref(), generation),
+        "template": pod_template(id, "ray-worker", image, &g.cpu, &g.memory, g.gpu.as_deref(), generation, owner),
     });
     // ADR-0007: only set `replicas` when we own it (autoscaling off). With
     // the in-tree autoscaler on, the sidecar owns replicas + scaleStrategy;
@@ -255,6 +284,9 @@ fn worker_group_spec(
     ws
 }
 
+// A pod template is inherently wide; bundling these args into a struct would
+// add ceremony without clarity.
+#[allow(clippy::too_many_arguments)]
 fn pod_template(
     cluster_id: &str,
     container_name: &str,
@@ -263,6 +295,7 @@ fn pod_template(
     memory: &str,
     gpu: Option<&str>,
     generation: Option<u64>,
+    owner: Option<&str>,
 ) -> Value {
     let mut limits = json!({ "cpu": cpu, "memory": memory });
     let mut requests = json!({ "cpu": cpu, "memory": memory });
@@ -284,9 +317,16 @@ fn pod_template(
     // matches pods with the label at all, and the per-cluster allow matches
     // this exact value, keeping tenant clusters isolated from each other.
     // KubeRay merges its own ray.io/* labels alongside it.
+    let mut pod_labels = json!({ CLUSTER_ID_LABEL: cluster_id });
+    // Stamp the owner onto every pod (tier-2 attribution). The per-owner
+    // ingress policy keys on the notebook pod's owner label, not this one —
+    // this label makes the cluster's pods self-describe who owns them.
+    if let Some(owner) = owner {
+        pod_labels[OWNER_LABEL] = json!(owner);
+    }
     let mut template = json!({
         "metadata": {
-            "labels": { CLUSTER_ID_LABEL: cluster_id },
+            "labels": pod_labels,
         },
         "spec": { "containers": [container] },
     });
@@ -483,10 +523,43 @@ pub fn tenant_allow_network_policy() -> Value {
 /// Pods of a different cluster carry a different label value, match
 /// neither the subject nor the peer selector, and stay unreachable.
 /// Applied with the cluster's RayCluster/RayService and deleted with it.
-pub fn cluster_allow_network_policy(id: &str) -> Value {
+///
+/// Tier-2 per-owner Ray-client pin: when `owner` is `Some`, a second ingress
+/// rule admits the owner's notebook — pods in the [`NOTEBOOK_NAMESPACE`]
+/// carrying `mobula.dev/owner=<owner>` (the label the hub stamps on that
+/// user's singleuser pod) — to the Ray client (`:10001`) and dashboard
+/// (`:8265`) ports, and to nothing else. A different user's notebook carries
+/// a different owner value, matches neither peer selector, and is left to
+/// the default-deny — so alice cannot reach bob's session cluster. When
+/// `owner` is `None` (ownerless clusters) only the intra-cluster allow is
+/// emitted, unchanged from before.
+pub fn cluster_allow_network_policy(id: &str, owner: Option<&str>) -> Value {
     let same_cluster = json!({
         "matchLabels": { CLUSTER_ID_LABEL: id },
     });
+    let mut ingress = vec![json!({ "from": [ { "podSelector": &same_cluster } ] })];
+    if let Some(owner) = owner {
+        // The owner's notebook pod → Ray client + dashboard only. Scoped to
+        // the notebook namespace AND the owner pod-label together (a peer
+        // block ANDs its selectors), so only that user's notebook in that
+        // namespace matches.
+        ingress.push(json!({
+            "from": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": { "kubernetes.io/metadata.name": NOTEBOOK_NAMESPACE },
+                    },
+                    "podSelector": {
+                        "matchLabels": { OWNER_LABEL: owner },
+                    },
+                },
+            ],
+            "ports": [
+                { "protocol": "TCP", "port": 10001 },
+                { "protocol": "TCP", "port": 8265 },
+            ],
+        }));
+    }
     json!({
         "apiVersion": NETWORK_POLICY_API_VERSION,
         "kind": NETWORK_POLICY_KIND,
@@ -500,9 +573,7 @@ pub fn cluster_allow_network_policy(id: &str) -> Value {
         "spec": {
             "podSelector": &same_cluster,
             "policyTypes": ["Ingress", "Egress"],
-            "ingress": [
-                { "from": [ { "podSelector": &same_cluster } ] },
-            ],
+            "ingress": ingress,
             "egress": [
                 { "to": [ { "podSelector": &same_cluster } ] },
             ],
@@ -601,11 +672,11 @@ pub fn to_rayservice(name: &str, spec: &ServiceSpec) -> Value {
                 "rayVersion": spec.ray_version,
                 "headGroupSpec": {
                     "rayStartParams": { "dashboard-host": "0.0.0.0" },
-                    "template": pod_template(name, "ray-head", &spec.image, &spec.head_cpu, &spec.head_memory, None, None),
+                    "template": pod_template(name, "ray-head", &spec.image, &spec.head_cpu, &spec.head_memory, None, None, None),
                 },
                 // Serve worker replicas are fixed here; Serve autoscaling is
                 // Ray Serve's own concern (deployment num_replicas).
-                "workerGroupSpecs": [worker_group_spec(name, &worker, &spec.image, false, None)],
+                "workerGroupSpecs": [worker_group_spec(name, &worker, &spec.image, false, None, None)],
             },
         },
     })
@@ -1095,6 +1166,7 @@ mod tests {
                 })
                 .collect(),
             ttl_seconds: None,
+            owner: None,
         }
     }
 
@@ -1435,7 +1507,7 @@ mod tests {
         // #86: intra-cluster traffic is allowed per cluster — the subject
         // and every peer match the exact cluster-id label value, all ports
         // (GCS 6379, dashboard 8265, client 10001, raylet dynamic ports).
-        let p = cluster_allow_network_policy("tenant-a");
+        let p = cluster_allow_network_policy("tenant-a", None);
         assert_eq!(p["apiVersion"], "networking.k8s.io/v1");
         assert_eq!(p["kind"], "NetworkPolicy");
         assert_eq!(p["metadata"]["name"], "mobula-cluster-tenant-a");
@@ -1457,12 +1529,60 @@ mod tests {
     }
 
     #[test]
+    fn per_owner_rule_pins_ray_client_to_owner_notebook() {
+        // Tier-2: with an owner, a SECOND ingress rule admits only the
+        // owner's notebook (ns=jupyter AND owner-label=bob) to :10001/:8265;
+        // the intra-cluster rule is unchanged and no other peer is added.
+        let p = cluster_allow_network_policy("sess-bob", Some("bob"));
+        let ingress = p["spec"]["ingress"].as_array().unwrap();
+        assert_eq!(ingress.len(), 2, "intra-cluster + per-owner");
+        // Rule 0 stays the intra-cluster allow (all ports, own pods only).
+        assert_eq!(
+            ingress[0]["from"],
+            json!([{ "podSelector": { "matchLabels": { CLUSTER_ID_LABEL: "sess-bob" } } }])
+        );
+        assert!(ingress[0].get("ports").is_none());
+        // Rule 1 is the owner pin: ns AND owner-label ANDed in one peer.
+        let owner_rule = &ingress[1];
+        assert_eq!(
+            owner_rule["ports"],
+            json!([
+                { "protocol": "TCP", "port": 10001 },
+                { "protocol": "TCP", "port": 8265 },
+            ])
+        );
+        let peers = owner_rule["from"].as_array().unwrap();
+        assert_eq!(peers.len(), 1, "one ANDed peer, not two ORed ones");
+        assert_eq!(
+            peers[0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            NOTEBOOK_NAMESPACE
+        );
+        assert_eq!(peers[0]["podSelector"]["matchLabels"][OWNER_LABEL], "bob");
+    }
+
+    #[test]
+    fn non_owner_notebook_is_not_a_peer() {
+        // alice's notebook (owner-label=alice) matches neither peer of bob's
+        // cluster policy, so the default-deny leaves it blocked.
+        let p = cluster_allow_network_policy("sess-bob", Some("bob"));
+        for rule in p["spec"]["ingress"].as_array().unwrap() {
+            for peer in rule["from"].as_array().unwrap() {
+                let owner = &peer["podSelector"]["matchLabels"][OWNER_LABEL];
+                assert_ne!(owner, "alice", "alice must never be an allowed peer");
+            }
+        }
+        // Ownerless clusters get no owner rule at all (back-compat).
+        let none = cluster_allow_network_policy("sess-x", None);
+        assert_eq!(none["spec"]["ingress"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
     fn tenant_clusters_stay_isolated_from_each_other() {
         // #56 intent under the #86 rescope: a pod of tenant-b (labels
         // cluster-id=tenant-b) matches neither the subject nor any allow
         // peer of tenant-a's policy — and the namespace-level tenant-allow
         // has no pod-to-pod rule at all — so B cannot reach A.
-        let a = cluster_allow_network_policy("tenant-a");
+        let a = cluster_allow_network_policy("tenant-a", None);
         let b_labels = json!({ CLUSTER_ID_LABEL: "tenant-b" });
         for rule in a["spec"]["ingress"].as_array().unwrap() {
             for peer in rule["from"].as_array().unwrap() {
@@ -1497,7 +1617,7 @@ mod tests {
         for p in [
             default_deny_network_policy(),
             tenant_allow_network_policy(),
-            cluster_allow_network_policy("demo"),
+            cluster_allow_network_policy("demo", None),
         ] {
             let sel = &p["spec"]["podSelector"];
             assert_ne!(
