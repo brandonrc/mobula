@@ -1,0 +1,16 @@
+# Binds the mobula-dask Role to the mobula-pack control-plane SA.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mobula-dask
+  namespace: mobula
+  labels:
+    app.kubernetes.io/managed-by: mobula-spike-dask
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mobula-dask
+subjects:
+  - kind: ServiceAccount
+    name: mobula-pack
+    namespace: mobula

@@ -1,0 +1,35 @@
+# Gated Dask scheduler-dashboard, multi-engine spike. Identical gating
+# mechanism as the Ray dashboard NebariApp (mobula/team-b-scoring): Envoy
+# public gateway + Keycloak group filter (auth.groups=[team-b]) →
+# enforceAtGateway. Only the upstream differs: the DaskCluster scheduler
+# ClusterIP service on :8787 (Dask Bokeh dashboard, the analog of Ray :8265).
+apiVersion: reconcilers.nebari.dev/v1
+kind: NebariApp
+metadata:
+  name: bobdask1-dashboard
+  namespace: mobula
+  labels: { app.kubernetes.io/managed-by: mobula-spike-dask }
+spec:
+  auth:
+    enabled: true
+    enforceAtGateway: true
+    groups: [team-b]
+    provider: keycloak
+    provisionClient: true
+    redirectURI: /oauth2/callback
+    scopes: [openid, profile, email]
+  gateway: public
+  hostname: bobdask.100-89-230-107.sslip.io
+  landingPage:
+    category: Data Science
+    description: Dask scheduler dashboard for bob's governed Dask cluster (spike)
+    displayName: Bob Dask Dashboard
+    enabled: true
+    priority: 31
+  routing:
+    routes:
+    - pathPrefix: /
+      pathType: PathPrefix
+  service:
+    name: bobdask1-scheduler
+    port: 8787
