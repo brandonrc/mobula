@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS clusters (
     condition             TEXT,
     failure_count         BIGINT NOT NULL DEFAULT 0,
     next_attempt_at       BIGINT NOT NULL DEFAULT 0,
-    created_at            BIGINT NOT NULL DEFAULT 0
+    created_at            BIGINT NOT NULL DEFAULT 0,
+    terminated_at         BIGINT
 );
 CREATE TABLE IF NOT EXISTS intents (
     intent_key         TEXT PRIMARY KEY,
@@ -202,6 +203,12 @@ impl PostgresStore {
         )
         .execute(pool)
         .await?;
+        // Truthful Console: additive tombstone-retention anchor for
+        // deployments created before it existed (the CREATE above is a no-op
+        // for them).
+        sqlx::query("ALTER TABLE clusters ADD COLUMN IF NOT EXISTS terminated_at BIGINT")
+            .execute(pool)
+            .await?;
         backfill_audit_chain(pool).await?;
         Ok(())
     }
@@ -336,6 +343,9 @@ fn row_to_cluster(row: PgRow) -> Result<StoredCluster, StoreError> {
         failure_count: row.try_get::<i64, _>("failure_count")? as u32,
         next_attempt_at: row.try_get::<i64, _>("next_attempt_at")? as u64,
         created_at: row.try_get::<i64, _>("created_at")? as u64,
+        terminated_at: row
+            .try_get::<Option<i64>, _>("terminated_at")?
+            .map(|t| t as u64),
     })
 }
 
@@ -471,16 +481,34 @@ impl Store for PostgresStore {
     }
 
     async fn set_desired(&self, id: &ClusterId, desired: DesiredState) -> Result<(), StoreError> {
-        let affected = sqlx::query("UPDATE clusters SET desired = $1 WHERE id = $2")
-            .bind(desired_to_str(desired))
-            .bind(&id.0)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+        // Anchor (or clear) the tombstone-retention clock alongside the flip
+        // (Truthful Console); see the SQLite store for the rationale.
+        let is_terminated = matches!(desired, DesiredState::Terminated);
+        let affected = sqlx::query(
+            "UPDATE clusters SET desired = $1, \
+             terminated_at = CASE WHEN $2 THEN COALESCE(terminated_at, $3) ELSE NULL END \
+             WHERE id = $4",
+        )
+        .bind(desired_to_str(desired))
+        .bind(is_terminated)
+        .bind(now_unix() as i64)
+        .bind(&id.0)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         if affected == 0 {
             return Err(StoreError::Backend(format!("no such cluster {id}")));
         }
         Ok(())
+    }
+
+    async fn remove_cluster(&self, id: &ClusterId) -> Result<bool, StoreError> {
+        let affected = sqlx::query("DELETE FROM clusters WHERE id = $1")
+            .bind(&id.0)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(affected > 0)
     }
 
     async fn record_observation(

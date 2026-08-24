@@ -123,37 +123,50 @@ impl GatewayState {
         store: Option<Arc<dyn Store>>,
         limits: GatewayLimits,
     ) -> std::io::Result<Self> {
-        // Reverse-proxy client posture (security issues #3/#5):
-        // never follow redirects southbound (SSRF amplifier — 3xx
-        // passes through to the caller untouched), and bound how long
-        // a hung head can pin a connection. read_timeout is per read,
-        // so long log streams stay alive as long as bytes flow.
-        let mut client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(std::time::Duration::from_secs(120));
-        if let Some(bundle) = &limits.southbound_ca_bundle {
-            // Trust self-signed cluster endpoints by pinning their CA —
-            // verification stays ON; nothing here weakens TLS (#2).
-            let pem = std::fs::read(bundle)?;
-            let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("southbound CA bundle {}: {e}", bundle.display()),
-                )
-            })?;
-            for cert in certs {
-                client = client.add_root_certificate(cert);
-            }
-        }
+        let client = build_southbound_client(limits.southbound_ca_bundle.as_deref())?;
         Ok(Self {
             registry,
             store,
             inflight: Arc::new(tokio::sync::Semaphore::new(limits.max_inflight)),
-            client: client.build().expect("static client config"),
+            client,
             limits,
         })
     }
+
+    /// A clone of the southbound HTTP client, for background southbound
+    /// callers (e.g. the job-history refresher) that share the gateway's
+    /// reverse-proxy posture and pinned CA roots.
+    pub fn southbound_client(&self) -> reqwest::Client {
+        self.client.clone()
+    }
+}
+
+/// Build the shared southbound HTTP client (reverse-proxy posture, security
+/// issues #2/#3/#5): never follow redirects (a 3xx is an SSRF amplifier and is
+/// passed through untouched), bound connect/read timeouts so a hung head can't
+/// pin a connection, and pin the operator's extra CA bundle when given so
+/// self-signed cluster TLS verifies instead of being disabled. Fails when the
+/// CA bundle can't be read or parsed (#2).
+pub(crate) fn build_southbound_client(
+    ca_bundle: Option<&std::path::Path>,
+) -> std::io::Result<reqwest::Client> {
+    let mut client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(120));
+    if let Some(bundle) = ca_bundle {
+        let pem = std::fs::read(bundle)?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("southbound CA bundle {}: {e}", bundle.display()),
+            )
+        })?;
+        for cert in certs {
+            client = client.add_root_certificate(cert);
+        }
+    }
+    Ok(client.build().expect("static client config"))
 }
 
 /// Middleware: route by Host header, proxying registered cluster hosts.
@@ -272,17 +285,45 @@ async fn proxy(
         gw.store.as_ref(),
         AuditEvent {
             ts: now_unix(),
-            subject,
+            subject: subject.clone(),
             decision: AuditDecision::Allow,
             cluster: Some(cluster.id.to_string()),
             method: Some(method.to_string()),
-            path: Some(path),
+            path: Some(path.clone()),
             status: Some(status.as_u16()),
             latency_ms: Some(started.elapsed().as_millis() as u64),
             ..Default::default()
         },
     )
     .await;
+
+    // Truthful Console (#89): a successful Ray job submission is recorded into
+    // the store so it appears in GET /api/v1/jobs attributed to the caller.
+    // The submit reply is a tiny JSON `{"submission_id": ...}`, so buffer it
+    // (bounded) instead of streaming; every other response streams unchanged.
+    // Ray-only by construction: only `POST /api/jobs/` is matched, and Dask
+    // clusters expose no such endpoint.
+    if crate::job_history::is_ray_job_submit(&method, &path) && status.is_success() {
+        let bytes = axum::body::to_bytes(
+            Body::from_stream(upstream.bytes_stream()),
+            crate::job_history::MAX_SUBMIT_BODY_BYTES,
+        )
+        .await
+        .map_err(|_| GatewayError::BodyTooLarge)?;
+        crate::job_history::record_submission(
+            gw.store.as_ref(),
+            &cluster.id,
+            subject.as_deref(),
+            &bytes,
+        )
+        .await;
+        let mut response = Response::builder()
+            .status(status)
+            .body(Body::from(bytes))
+            .expect("valid response");
+        *response.headers_mut() = response_headers;
+        return Ok(response);
+    }
 
     let mut response = Response::builder()
         .status(status)

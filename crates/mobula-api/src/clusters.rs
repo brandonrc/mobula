@@ -8,13 +8,13 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use mobula_auth::{Identity, PermissionType, Role, Target};
-use mobula_controller::{now_unix, DesiredState, Store};
+use mobula_controller::{now_unix, observed_gone, DesiredState, Store};
 use mobula_core::{AuditDecision, AuditEvent, ClusterId, ClusterSpec};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -521,24 +521,39 @@ async fn create_cluster(
     }
 }
 
+/// Query for `DELETE /api/v1/clusters/{id}`. `?purge=true` hard-deletes the
+/// store row (Truthful Console tombstone purge) instead of the default
+/// terminate-and-reconcile; only permitted once the cluster is already
+/// terminated and observed gone.
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteQuery {
+    #[serde(default)]
+    pub purge: bool,
+}
+
 #[utoipa::path(
     delete, path = "/api/v1/clusters/{id}", tag = "clusters",
-    params(("id" = String, Path, description = "Cluster id")),
+    params(("id" = String, Path, description = "Cluster id"),
+           ("purge" = Option<bool>, Query, description = "Hard-delete the store row \
+            (tombstone purge); only when already terminated and observed gone")),
     responses((status = 202, description = "Marked for termination; reconciler tears it down"),
+              (status = 200, description = "Tombstone purged (purge=true): store row removed"),
               (status = 401, description = "No/invalid token"),
               (status = 403, description = "Missing Write on cluster (Operator/Admin only)"),
-              (status = 404, description = "No such cluster")),
+              (status = 404, description = "No such cluster"),
+              (status = 409, description = "Purge refused: cluster is not a terminated/gone tombstone")),
     security(("bearer" = []))
 )]
 async fn delete_cluster(
     State(st): State<ClusterApiState>,
     identity: Option<Extension<Identity>>,
     Path(id): Path<String>,
+    Query(q): Query<DeleteQuery>,
 ) -> Response {
     let id = ClusterId(id);
     // Scoped RBAC (#49): fetch first — the check needs the cluster's
     // project — then require Write on Cluster scoped to that project.
-    match st.store.get(&id).await {
+    let stored = match st.store.get(&id).await {
         Ok(Some(c)) => {
             if let Some(deny) = authorize_scoped(
                 Some(&st.store),
@@ -551,11 +566,18 @@ async fn delete_cluster(
             {
                 return deny;
             }
+            c
         }
         Ok(None) => return (StatusCode::NOT_FOUND, "no such cluster").into_response(),
         Err(e) => return store_err(e),
+    };
+
+    if q.purge {
+        return purge_cluster(&st, &identity, &id, &stored).await;
     }
-    // Desired = Terminated; the reconciler tears down the backing resources.
+
+    // Default: desired = Terminated; the reconciler tears down the backing
+    // resources.
     match st.store.set_desired(&id, DesiredState::Terminated).await {
         Ok(()) => {
             emit(
@@ -579,6 +601,49 @@ async fn delete_cluster(
         Err(mobula_controller::StoreError::Backend(m)) if m.contains("no such cluster") => {
             (StatusCode::NOT_FOUND, "no such cluster").into_response()
         }
+        Err(e) => store_err(e),
+    }
+}
+
+/// Hard-delete a terminated cluster's tombstone row (Truthful Console). Refuses
+/// a cluster that is not yet a dead tombstone — it must be desired=Terminated
+/// AND observed gone (never observed, or observed Terminated). A still-live or
+/// still-terminating cluster gets 409 so purge can never race a teardown. The
+/// caller is already authorized (Write on Cluster, scoped) by `delete_cluster`.
+async fn purge_cluster(
+    st: &ClusterApiState,
+    identity: &Option<Extension<Identity>>,
+    id: &ClusterId,
+    stored: &mobula_controller::StoredCluster,
+) -> Response {
+    let is_tombstone =
+        matches!(stored.desired, DesiredState::Terminated) && observed_gone(stored.observed_state);
+    if !is_tombstone {
+        return (
+            StatusCode::CONFLICT,
+            "cannot purge a live cluster: it must be terminated and observed gone first",
+        )
+            .into_response();
+    }
+    match st.store.remove_cluster(id).await {
+        Ok(true) => {
+            emit(
+                Some(&st.store),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Allow,
+                    action: Some("purge_cluster".into()),
+                    cluster: Some(id.to_string()),
+                    status: Some(StatusCode::OK.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            (StatusCode::OK, "cluster tombstone purged").into_response()
+        }
+        // Removed between the fetch and here (concurrent purge/sweep).
+        Ok(false) => (StatusCode::NOT_FOUND, "no such cluster").into_response(),
         Err(e) => store_err(e),
     }
 }

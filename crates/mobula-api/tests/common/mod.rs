@@ -284,6 +284,13 @@ impl mobula_controller::Store for FailingStore {
         self.check("set_desired")?;
         self.inner.set_desired(id, desired).await
     }
+    async fn remove_cluster(
+        &self,
+        id: &mobula_core::ClusterId,
+    ) -> Result<bool, mobula_controller::StoreError> {
+        self.check("remove_cluster")?;
+        self.inner.remove_cluster(id).await
+    }
     async fn record_observation(
         &self,
         id: &mobula_core::ClusterId,

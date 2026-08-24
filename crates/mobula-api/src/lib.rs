@@ -10,6 +10,7 @@ pub mod auth_layer;
 pub mod cluster_obs;
 pub mod clusters;
 pub mod gateway;
+pub mod job_history;
 pub mod local_auth;
 pub mod pools;
 pub mod registry;
@@ -19,6 +20,10 @@ pub mod usage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+/// How often the job-history refresher re-reads non-terminal jobs from their
+/// clusters' Ray Job API (Truthful Console, #89).
+const JOB_REFRESH_INTERVAL_SECS: u64 = 30;
 
 use axum::extract::{ConnectInfo, Request};
 use axum::http::StatusCode;
@@ -661,6 +666,32 @@ pub async fn serve_with_shutdown_and_limits(
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "mobula-api listening");
+
+    // Truthful Console (#89): a background refresher advances non-terminal
+    // job records toward their terminal state from each cluster's Ray Job
+    // API, so history converges even when no client polls. Needs a store to
+    // read/write history and a registry to reach clusters; Ray-only by
+    // construction (the registry holds Ray clusters). Clone what it needs
+    // before the registry/store move into the router builder.
+    if let Some(store) = opts.store.clone() {
+        let registry = Arc::new(opts.registry.clone());
+        let client =
+            gateway::build_southbound_client(limits.gateway.southbound_ca_bundle.as_deref())?;
+        let refresher = job_history::JobRefresher::new(
+            store,
+            registry,
+            client,
+            std::time::Duration::from_secs(JOB_REFRESH_INTERVAL_SECS),
+        );
+        tokio::spawn(async move {
+            refresher
+                .run(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await;
+        });
+    }
+
     // ConnectInfo must be populated for the router-level fail-closed guard
     // (#45) to distinguish loopback from remote peers.
     let app = build_app_full_svc_inner(
