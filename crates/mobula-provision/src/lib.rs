@@ -134,6 +134,33 @@ pub trait Provisioner: Send + Sync {
         let _ = id;
         None
     }
+
+    /// Base URL of the cluster's native Ray dashboard / Job Submission API
+    /// (`http://<head-svc>:8265`), reachable from the control plane — the
+    /// southbound target for the path-based jobs proxy
+    /// (`GET /api/v1/clusters/{id}/jobs`, api-v1.md §5.6). Synchronous and
+    /// pure: it derives a service DNS name, it never I/Os, so it inherits the
+    /// registry's SSRF posture rather than adding a new attack surface.
+    /// `None` (the default) when the backend can't name one.
+    fn dashboard_api_base(&self, id: &ClusterId) -> Option<String> {
+        let _ = id;
+        None
+    }
+
+    /// Kubernetes-sourced head + worker-group node breakdown for `id`
+    /// (`GET /api/v1/clusters/{id}/nodes`, api-v1.md §5.3). Reads the
+    /// RayCluster and the pods the backend owns (`ray.io/cluster=<id>`) —
+    /// never the Ray dashboard — so it works even when the dashboard is
+    /// unreachable. `Ok(None)` (the default) when the backend cannot produce
+    /// one (the route then answers a clean 404 `nodes unavailable`);
+    /// `Err(NotFound)` when the cluster is unknown to the backend.
+    async fn cluster_nodes(
+        &self,
+        id: &ClusterId,
+    ) -> Result<Option<mobula_core::ClusterNodes>, ProvisionError> {
+        let _ = id;
+        Ok(None)
+    }
 }
 
 /// Observed state of a Serve service.

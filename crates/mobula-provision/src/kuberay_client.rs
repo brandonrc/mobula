@@ -69,6 +69,14 @@ fn namespace_resource() -> ApiResource {
     })
 }
 
+fn pod_resource() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind {
+        group: "".into(),
+        version: "v1".into(),
+        kind: "Pod".into(),
+    })
+}
+
 impl KubeRayProvisioner {
     /// Connect using the ambient kubeconfig / in-cluster service account.
     pub async fn connect(
@@ -452,6 +460,43 @@ impl Provisioner for KubeRayProvisioner {
         // derivation as `api_base_url`); the Ray head serves its Prometheus
         // exposition at /metrics on the dashboard port 8265.
         Some(format!("{}/metrics", self.api_base_url(&id.0)))
+    }
+
+    fn dashboard_api_base(&self, id: &ClusterId) -> Option<String> {
+        // Same head-service derivation as `api_base_url`: the Ray dashboard /
+        // Job Submission API lives at port 8265. The jobs proxy appends
+        // `/api/jobs/` to this (api-v1.md §5.6).
+        Some(self.api_base_url(&id.0))
+    }
+
+    async fn cluster_nodes(
+        &self,
+        id: &ClusterId,
+    ) -> Result<Option<mobula_core::ClusterNodes>, ProvisionError> {
+        // Kubernetes is the source (api-v1.md §5.3): read the RayCluster for
+        // the worker-group spec (names + desired replicas), then list the
+        // pods KubeRay owns for it. Works even when the Ray dashboard is
+        // unreachable. 404 on the RayCluster is a genuine NotFound.
+        let cr = self
+            .api()
+            .get_opt(&id.0)
+            .await?
+            .ok_or_else(|| ProvisionError::NotFound(id.clone()))?;
+        // DynamicObject serializes metadata + flattened spec/status.
+        let cr_value =
+            serde_json::to_value(&cr).map_err(|e| ProvisionError::Backend(e.to_string()))?;
+
+        let pods: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &pod_resource());
+        let params =
+            ListParams::default().labels(&format!("{}={}", kuberay::RAY_CLUSTER_LABEL, id.0));
+        let pod_list = pods.list(&params).await?;
+        let pod_values: Vec<serde_json::Value> = pod_list
+            .into_iter()
+            .filter_map(|p| serde_json::to_value(&p).ok())
+            .collect();
+
+        Ok(Some(kuberay::node_breakdown(&id.0, &cr_value, &pod_values)))
     }
 }
 

@@ -10,7 +10,8 @@
 //! top of these functions.
 
 use mobula_core::{
-    ClusterId, ClusterSpec, ClusterState, ServiceSpec, UpgradeStrategy, WorkerGroup,
+    ClusterId, ClusterNodes, ClusterSpec, ClusterState, NodeView, ServiceSpec, UpgradeStrategy,
+    WorkerGroup, WorkerGroupNodes,
 };
 use serde_json::{json, Value};
 
@@ -636,10 +637,387 @@ pub fn status_to_state(status: &Value) -> ClusterState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Node breakdown (api-v1.md §5.3, `GET /api/v1/clusters/{id}/nodes`).
+//
+// Pure mapping from a RayCluster object + the pods KubeRay owns to the
+// head/worker-group [`ClusterNodes`] view. Kept here (no Kubernetes client)
+// so the mapping is exhaustively unit-testable against mock JSON; the live
+// client (`kuberay_client`) does the I/O (get RayCluster, list pods) and
+// hands the results to this function. Kubernetes is the source, never the
+// Ray dashboard, so this answers even when the dashboard is unreachable.
+// ---------------------------------------------------------------------------
+
+/// KubeRay pod label carrying the owning RayCluster name (the selector the
+/// live client lists by: `ray.io/cluster=<name>`).
+pub const RAY_CLUSTER_LABEL: &str = "ray.io/cluster";
+/// KubeRay pod label carrying the worker-group name; head pods carry the
+/// head group's name and are distinguished by [`RAY_NODE_TYPE_LABEL`].
+pub const RAY_GROUP_LABEL: &str = "ray.io/group";
+/// KubeRay pod label carrying the node type: `head` or `worker`.
+pub const RAY_NODE_TYPE_LABEL: &str = "ray.io/node-type";
+
+/// Read a pod (or any object) label by key.
+fn pod_label<'a>(pod: &'a Value, key: &str) -> Option<&'a str> {
+    pod.get("metadata")?
+        .get("labels")?
+        .get(key)
+        .and_then(|v| v.as_str())
+}
+
+/// Parse a Kubernetes CPU quantity to cores: `"500m"` → 0.5, `"2"` → 2.0.
+fn parse_cpu(q: &str) -> Option<f64> {
+    let q = q.trim();
+    match q.strip_suffix('m') {
+        Some(milli) => milli.trim().parse::<f64>().ok().map(|v| v / 1000.0),
+        None => q.parse::<f64>().ok(),
+    }
+}
+
+/// Parse a Kubernetes GPU quantity (`nvidia.com/gpu`) to a count.
+fn parse_gpu(q: &str) -> Option<f64> {
+    q.trim().parse::<f64>().ok()
+}
+
+/// Parse a Kubernetes memory quantity to bytes, honoring both binary
+/// (`Ki`/`Mi`/`Gi`/…) and decimal (`k`/`M`/`G`/…) SI suffixes, and a bare
+/// byte count. Binary suffixes are checked first so `Gi` never matches the
+/// decimal `G` branch.
+fn parse_memory(q: &str) -> Option<u64> {
+    let q = q.trim();
+    const BINARY: [(&str, f64); 6] = [
+        ("Ki", 1024.0),
+        ("Mi", 1_048_576.0),
+        ("Gi", 1_073_741_824.0),
+        ("Ti", 1_099_511_627_776.0),
+        ("Pi", 1_125_899_906_842_624.0),
+        ("Ei", 1_152_921_504_606_846_976.0),
+    ];
+    const DECIMAL: [(&str, f64); 6] = [
+        ("k", 1e3),
+        ("M", 1e6),
+        ("G", 1e9),
+        ("T", 1e12),
+        ("P", 1e15),
+        ("E", 1e18),
+    ];
+    for (suffix, mult) in BINARY {
+        if let Some(n) = q.strip_suffix(suffix) {
+            return n.trim().parse::<f64>().ok().map(|v| (v * mult) as u64);
+        }
+    }
+    for (suffix, mult) in DECIMAL {
+        if let Some(n) = q.strip_suffix(suffix) {
+            return n.trim().parse::<f64>().ok().map(|v| (v * mult) as u64);
+        }
+    }
+    q.parse::<u64>()
+        .ok()
+        .or_else(|| q.parse::<f64>().ok().map(|v| v as u64))
+}
+
+/// Sum a resource request across every container in a pod, returning `None`
+/// when no container declares it. `parse` maps a quantity string to the
+/// accumulator type; `add` folds two together.
+fn sum_requests<T: Copy>(
+    pod: &Value,
+    resource: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    add: impl Fn(T, T) -> T,
+) -> Option<T> {
+    let containers = pod
+        .get("spec")
+        .and_then(|s| s.get("containers"))
+        .and_then(|c| c.as_array())?;
+    let mut acc: Option<T> = None;
+    for c in containers {
+        if let Some(q) = c
+            .get("resources")
+            .and_then(|r| r.get("requests"))
+            .and_then(|req| req.get(resource))
+            .and_then(|v| v.as_str())
+            .and_then(&parse)
+        {
+            acc = Some(match acc {
+                Some(existing) => add(existing, q),
+                None => q,
+            });
+        }
+    }
+    acc
+}
+
+/// Map one pod object to a [`NodeView`].
+fn pod_to_node_view(pod: &Value, is_head: bool) -> NodeView {
+    let ready = pod
+        .get("status")
+        .and_then(|s| s.get("conditions"))
+        .and_then(|c| c.as_array())
+        .is_some_and(|conds| {
+            conds.iter().any(|c| {
+                c.get("type").and_then(|v| v.as_str()) == Some("Ready")
+                    && c.get("status").and_then(|v| v.as_str()) == Some("True")
+            })
+        });
+    NodeView {
+        pod_name: pod
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        group: if is_head {
+            None
+        } else {
+            pod_label(pod, RAY_GROUP_LABEL).map(String::from)
+        },
+        is_head,
+        phase: pod
+            .get("status")
+            .and_then(|s| s.get("phase"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown")
+            .to_string(),
+        ready,
+        node_ip: pod
+            .get("status")
+            .and_then(|s| s.get("podIP"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        host: pod
+            .get("spec")
+            .and_then(|s| s.get("nodeName"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        cpu: sum_requests(pod, "cpu", parse_cpu, |a, b| a + b),
+        memory_bytes: sum_requests(pod, "memory", parse_memory, |a, b| a + b),
+        gpu: sum_requests(pod, "nvidia.com/gpu", parse_gpu, |a, b| a + b),
+    }
+}
+
+/// Build the head + per-worker-group node breakdown (api-v1.md §5.3) from a
+/// RayCluster object and the pods KubeRay owns for it (already filtered by
+/// `ray.io/cluster=<id>`). Worker groups follow the RayCluster spec's order;
+/// a group seen only on pods (e.g. mid-rename) is appended so nothing a pod
+/// belongs to is silently dropped. `desired` comes from the spec (`replicas`,
+/// else `minReplicas`) since per-group desired counts are not in the status;
+/// `ready` is counted from the pods (`Running` + `Ready`).
+pub fn node_breakdown(cluster_id: &str, raycluster: &Value, pods: &[Value]) -> ClusterNodes {
+    let head = pods
+        .iter()
+        .find(|p| pod_label(p, RAY_NODE_TYPE_LABEL) == Some("head"))
+        .map(|p| pod_to_node_view(p, true));
+
+    let is_worker = |p: &&Value| pod_label(p, RAY_NODE_TYPE_LABEL) != Some("head");
+
+    let mut worker_groups: Vec<WorkerGroupNodes> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    let spec_groups = raycluster
+        .get("spec")
+        .and_then(|s| s.get("workerGroupSpecs"))
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for g in &spec_groups {
+        let name = g.get("groupName").and_then(|v| v.as_str()).unwrap_or("");
+        let desired = g
+            .get("replicas")
+            .and_then(|v| v.as_u64())
+            .or_else(|| g.get("minReplicas").and_then(|v| v.as_u64()))
+            .unwrap_or(0) as u32;
+        let nodes: Vec<NodeView> = pods
+            .iter()
+            .filter(is_worker)
+            .filter(|p| pod_label(p, RAY_GROUP_LABEL) == Some(name))
+            .map(|p| pod_to_node_view(p, false))
+            .collect();
+        let ready = nodes
+            .iter()
+            .filter(|n| n.phase == "Running" && n.ready)
+            .count() as u32;
+        seen.push(name.to_string());
+        worker_groups.push(WorkerGroupNodes {
+            name: name.to_string(),
+            desired,
+            ready,
+            nodes,
+        });
+    }
+
+    // Groups present on pods but absent from the spec (mid-rename / scaled by
+    // something else): append them so their nodes are still reported. Desired
+    // is unknown here, so it falls back to the observed pod count.
+    for p in pods.iter().filter(is_worker) {
+        let Some(name) = pod_label(p, RAY_GROUP_LABEL) else {
+            continue;
+        };
+        if seen.iter().any(|s| s == name) {
+            continue;
+        }
+        let nodes: Vec<NodeView> = pods
+            .iter()
+            .filter(is_worker)
+            .filter(|q| pod_label(q, RAY_GROUP_LABEL) == Some(name))
+            .map(|q| pod_to_node_view(q, false))
+            .collect();
+        let ready = nodes
+            .iter()
+            .filter(|n| n.phase == "Running" && n.ready)
+            .count() as u32;
+        seen.push(name.to_string());
+        worker_groups.push(WorkerGroupNodes {
+            name: name.to_string(),
+            desired: nodes.len() as u32,
+            ready,
+            nodes,
+        });
+    }
+
+    ClusterNodes {
+        cluster_id: cluster_id.to_string(),
+        head,
+        worker_groups,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mobula_core::{ServiceSpec, UpgradeStrategy, WorkerGroup};
+
+    // -----------------------------------------------------------------
+    // Node breakdown (§5.3)
+    // -----------------------------------------------------------------
+
+    fn pod(name: &str, node_type: &str, group: &str, phase: &str, ready: bool) -> Value {
+        json!({
+            "metadata": {
+                "name": name,
+                "labels": {
+                    RAY_CLUSTER_LABEL: "demo",
+                    RAY_NODE_TYPE_LABEL: node_type,
+                    RAY_GROUP_LABEL: group,
+                },
+            },
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{
+                    "name": "ray",
+                    "resources": { "requests": {
+                        "cpu": "2", "memory": "4Gi", "nvidia.com/gpu": "1"
+                    } },
+                }],
+            },
+            "status": {
+                "phase": phase,
+                "podIP": "10.1.2.3",
+                "conditions": [{
+                    "type": "Ready",
+                    "status": if ready { "True" } else { "False" },
+                }],
+            },
+        })
+    }
+
+    fn raycluster_with_groups(groups: &[(&str, u64, u64)]) -> Value {
+        let specs: Vec<Value> = groups
+            .iter()
+            .map(|(name, replicas, min)| {
+                json!({ "groupName": name, "replicas": replicas, "minReplicas": min })
+            })
+            .collect();
+        json!({ "spec": { "workerGroupSpecs": specs } })
+    }
+
+    #[test]
+    fn parse_quantities() {
+        assert_eq!(parse_cpu("2"), Some(2.0));
+        assert_eq!(parse_cpu("500m"), Some(0.5));
+        assert_eq!(parse_cpu("1500m"), Some(1.5));
+        assert_eq!(parse_memory("4Gi"), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory("512Mi"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_memory("1G"), Some(1_000_000_000));
+        assert_eq!(parse_memory("2048"), Some(2048));
+        assert_eq!(parse_gpu("4"), Some(4.0));
+        assert_eq!(parse_cpu("garbage"), None);
+        assert_eq!(parse_memory("nope"), None);
+    }
+
+    #[test]
+    fn node_breakdown_maps_head_and_groups() {
+        // Head, two ready CPU workers, one pending GPU worker.
+        let pods = vec![
+            pod("demo-head", "head", "headgroup", "Running", true),
+            pod("demo-cpu-1", "worker", "cpu", "Running", true),
+            pod("demo-cpu-2", "worker", "cpu", "Running", true),
+            pod("demo-gpu-1", "worker", "gpu", "Pending", false),
+        ];
+        let cr = raycluster_with_groups(&[("cpu", 2, 0), ("gpu", 1, 1)]);
+        let nodes = node_breakdown("demo", &cr, &pods);
+
+        assert_eq!(nodes.cluster_id, "demo");
+        let head = nodes.head.expect("head present");
+        assert!(head.is_head);
+        assert_eq!(head.group, None);
+        assert_eq!(head.pod_name, "demo-head");
+        // 2 cores, 4Gi, 1 gpu summed from the single container.
+        assert_eq!(head.cpu, Some(2.0));
+        assert_eq!(head.memory_bytes, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(head.gpu, Some(1.0));
+
+        assert_eq!(nodes.worker_groups.len(), 2);
+        let cpu = &nodes.worker_groups[0];
+        assert_eq!(cpu.name, "cpu");
+        assert_eq!(cpu.desired, 2);
+        assert_eq!(cpu.ready, 2);
+        assert_eq!(cpu.nodes.len(), 2);
+        assert!(cpu.nodes.iter().all(|n| !n.is_head));
+
+        let gpu = &nodes.worker_groups[1];
+        assert_eq!(gpu.name, "gpu");
+        assert_eq!(gpu.desired, 1);
+        // Pending + not-Ready → not counted ready.
+        assert_eq!(gpu.ready, 0);
+        assert_eq!(gpu.nodes[0].phase, "Pending");
+        assert!(!gpu.nodes[0].ready);
+    }
+
+    #[test]
+    fn node_breakdown_uses_min_replicas_when_autoscaling() {
+        // Autoscaled group: `replicas` absent, desired falls back to min.
+        let cr = json!({ "spec": { "workerGroupSpecs": [
+            { "groupName": "cpu", "minReplicas": 3 }
+        ] } });
+        let nodes = node_breakdown("demo", &cr, &[]);
+        assert_eq!(nodes.worker_groups[0].desired, 3);
+        assert_eq!(nodes.worker_groups[0].ready, 0);
+    }
+
+    #[test]
+    fn node_breakdown_reports_pod_only_groups() {
+        // A pod whose group is not in the spec must still be reported.
+        let pods = vec![pod("demo-x-1", "worker", "ghost", "Running", true)];
+        let cr = raycluster_with_groups(&[]);
+        let nodes = node_breakdown("demo", &cr, &pods);
+        assert_eq!(nodes.head, None);
+        assert_eq!(nodes.worker_groups.len(), 1);
+        assert_eq!(nodes.worker_groups[0].name, "ghost");
+        assert_eq!(nodes.worker_groups[0].desired, 1);
+        assert_eq!(nodes.worker_groups[0].ready, 1);
+    }
+
+    #[test]
+    fn node_breakdown_empty_when_no_pods() {
+        let cr = raycluster_with_groups(&[("cpu", 2, 0)]);
+        let nodes = node_breakdown("demo", &cr, &[]);
+        assert_eq!(nodes.head, None);
+        assert_eq!(nodes.worker_groups.len(), 1);
+        assert_eq!(nodes.worker_groups[0].desired, 2);
+        assert_eq!(nodes.worker_groups[0].ready, 0);
+        assert!(nodes.worker_groups[0].nodes.is_empty());
+    }
 
     fn service_spec(upgrade: UpgradeStrategy) -> ServiceSpec {
         ServiceSpec {

@@ -7,6 +7,7 @@
 pub mod access;
 pub mod audit;
 pub mod auth_layer;
+pub mod cluster_obs;
 pub mod clusters;
 pub mod gateway;
 pub mod local_auth;
@@ -48,6 +49,8 @@ use utoipa_swagger_ui::SwaggerUi;
         clusters::resume_cluster,
         clusters::list_jobs,
         metrics::cluster_metrics,
+        cluster_obs::cluster_nodes,
+        cluster_obs::cluster_jobs,
         pools::list_pools,
         pools::get_pool,
         pools::create_pool,
@@ -105,6 +108,10 @@ use utoipa_swagger_ui::SwaggerUi;
             clusters::CreateCluster,
             clusters::ClusterView,
             clusters::JobView,
+            cluster_obs::RayJobSummary,
+            mobula_core::NodeView,
+            mobula_core::WorkerGroupNodes,
+            mobula_core::ClusterNodes,
             pools::CreatePool,
             pools::PoolView,
             pools::PoolUsageView,
@@ -485,6 +492,11 @@ fn build_app_full_svc_inner(
             .merge(usage::router(store.clone(), policy.clone()))
             .merge(settings::router(store.clone(), policy))
             .merge(metrics::router(
+                store.clone(),
+                registry.clone(),
+                provisioner.clone(),
+            ))
+            .merge(cluster_obs::router(
                 store.clone(),
                 registry.clone(),
                 provisioner,
