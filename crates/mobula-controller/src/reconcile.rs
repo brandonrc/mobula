@@ -690,6 +690,7 @@ mod tests {
         ClusterSpec {
             name: "c".into(),
             project: "p".into(),
+            engine: Default::default(),
             ray_version: "2.57.0".into(),
             image: "img".into(),
             head_cpu: "1".into(),
