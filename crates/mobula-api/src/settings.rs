@@ -25,9 +25,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use mobula_auth::{Identity, PermissionType, Target};
-use mobula_controller::{now_unix, Store, StoredPolicy};
+use mobula_controller::{now_unix, Store, StoredBudget, StoredPolicy};
 use mobula_core::{AuditDecision, AuditEvent};
-use mobula_policy::{PriceSheet, ResourceMap};
+use mobula_policy::{Budget, PriceSheet, ResourceMap};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -56,7 +56,7 @@ fn store_err(e: mobula_controller::StoreError) -> Response {
 /// `None` when the seed is empty (no `--policy` given) — an empty seed
 /// never materializes a row, so `source` stays `"none"`.
 fn seed_from_config(cfg: &PolicyConfig) -> Option<StoredPolicy> {
-    if cfg.prices.is_none() && cfg.quotas.is_empty() {
+    if cfg.prices.is_none() && cfg.quotas.is_empty() && cfg.budgets.is_empty() {
         return None;
     }
     Some(StoredPolicy {
@@ -66,8 +66,29 @@ fn seed_from_config(cfg: &PolicyConfig) -> Option<StoredPolicy> {
             .iter()
             .map(|(k, v)| (k.clone(), v.0.clone()))
             .collect(),
+        budgets: cfg
+            .budgets
+            .iter()
+            .map(|(k, b)| (k.clone(), stored_budget(b)))
+            .collect(),
         from_file_seed: true,
     })
+}
+
+/// [`Budget`] → its store mirror [`StoredBudget`].
+fn stored_budget(b: &Budget) -> StoredBudget {
+    StoredBudget {
+        window_secs: b.window_secs,
+        limits: b.limits.clone(),
+    }
+}
+
+/// [`StoredBudget`] → the policy-engine [`Budget`].
+fn budget_from_stored(b: &StoredBudget) -> Budget {
+    Budget {
+        window_secs: b.window_secs,
+        limits: b.limits.clone(),
+    }
 }
 
 /// Convert a stored row back into the in-flight [`PolicyConfig`] shape the
@@ -81,6 +102,11 @@ pub(crate) fn config_from_stored(p: &StoredPolicy) -> PolicyConfig {
             .quotas
             .iter()
             .map(|(k, v)| (k.clone(), ResourceMap(v.clone())))
+            .collect(),
+        budgets: p
+            .budgets
+            .iter()
+            .map(|(k, b)| (k.clone(), budget_from_stored(b)))
             .collect(),
         gpu_default_sharing: Default::default(),
     }
@@ -125,6 +151,9 @@ pub struct PolicyView {
     pub prices: Option<BTreeMap<String, f64>>,
     /// project → (resource → limit). Empty when no quotas are configured.
     pub quotas: BTreeMap<String, BTreeMap<String, f64>>,
+    /// project → time-windowed compute budget (#77). Empty when none are
+    /// configured.
+    pub budgets: BTreeMap<String, BudgetView>,
     /// "file" (the untouched `--policy` boot seed) | "store" (edited via
     /// PUT) | "none" (no policy configured at all).
     #[schema(example = "file")]
@@ -133,11 +162,35 @@ pub struct PolicyView {
     pub editable: bool,
 }
 
+/// A configured budget as reported by the settings API.
+#[derive(Serialize, Deserialize, ToSchema, Clone)]
+pub struct BudgetView {
+    /// Trailing window length in seconds (e.g. 604800 = 7 days).
+    pub window_secs: u64,
+    /// resource → resource-hours allowed over the window (`cpu` = core-hours,
+    /// `memory` = GiB-hours, `nvidia.com/gpu` = GPU-hours).
+    #[serde(flatten)]
+    pub limits: BTreeMap<String, f64>,
+}
+
 impl PolicyView {
     fn of(p: StoredPolicy, source: &'static str) -> Self {
         PolicyView {
             prices: p.prices,
             quotas: p.quotas,
+            budgets: p
+                .budgets
+                .into_iter()
+                .map(|(k, b)| {
+                    (
+                        k,
+                        BudgetView {
+                            window_secs: b.window_secs,
+                            limits: b.limits,
+                        },
+                    )
+                })
+                .collect(),
             source,
             editable: true,
         }
@@ -155,6 +208,8 @@ pub struct UpdatePolicy {
     pub prices: Option<Option<BTreeMap<String, f64>>>,
     /// Present replaces the whole quota map (`{}` clears all quotas).
     pub quotas: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// Present replaces the whole budget map (`{}` clears all budgets) (#77).
+    pub budgets: Option<BTreeMap<String, BudgetView>>,
 }
 
 /// Distinguish an absent field from an explicit JSON `null`: serde's plain
@@ -262,6 +317,22 @@ async fn update_policy(
             }
         }
     }
+    if let Some(budgets) = &body.budgets {
+        for (project, b) in budgets {
+            if b.window_secs == 0 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid budget for project {project:?}: window_secs must be > 0"),
+                )
+                    .into_response();
+            }
+            if let Err(msg) =
+                validate_amounts(&b.limits, &format!("budget for project {project:?}"))
+            {
+                return (StatusCode::BAD_REQUEST, msg).into_response();
+            }
+        }
+    }
 
     let mut next = match effective_policy(&st.store, &st.policy_seed).await {
         Ok(p) => p.unwrap_or_default(),
@@ -272,6 +343,20 @@ async fn update_policy(
     }
     if let Some(quotas) = body.quotas {
         next.quotas = quotas;
+    }
+    if let Some(budgets) = body.budgets {
+        next.budgets = budgets
+            .into_iter()
+            .map(|(k, b)| {
+                (
+                    k,
+                    StoredBudget {
+                        window_secs: b.window_secs,
+                        limits: b.limits,
+                    },
+                )
+            })
+            .collect();
     }
     next.from_file_seed = false;
     if let Err(e) = st.store.set_policy(&next).await {
@@ -341,6 +426,7 @@ mod tests {
         let seeded = seed_from_config(&PolicyConfig {
             prices: Some(PriceSheet(BTreeMap::from([("cpu".into(), 0.04)]))),
             quotas: Default::default(),
+            budgets: Default::default(),
             gpu_default_sharing: Default::default(),
         })
         .unwrap();
@@ -358,6 +444,7 @@ mod tests {
                 "demo".to_string(),
                 ResourceMap(BTreeMap::from([("cpu".to_string(), 5.0)])),
             )]),
+            budgets: HashMap::new(),
             gpu_default_sharing: Default::default(),
         };
         // First read seeds from the file seed.

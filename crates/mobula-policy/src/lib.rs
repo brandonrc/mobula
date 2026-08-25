@@ -218,6 +218,87 @@ pub fn admit(
     }
 }
 
+/// A time-windowed compute **budget** (#77): a cap on *cumulative*
+/// consumption over a trailing window, distinct from the [`admit`] quota
+/// which caps *concurrent* live demand. `limits` is resource name →
+/// resource-hours allowed over the last `window_secs` seconds (`cpu` =
+/// core-hours, `memory` = GiB-hours, `nvidia.com/gpu` = GPU-hours, and any
+/// extended K8s resource name is equally valid — same key convention as
+/// [`ResourceMap`]).
+///
+/// The flattened deserialization mirrors the `[quotas]` config shape with an
+/// extra `window_secs` key:
+///
+/// ```toml
+/// [budgets.team-a]
+/// window_secs = 604800        # 7 days
+/// "nvidia.com/gpu" = 100      # 100 GPU-hours / 7 days
+/// cpu = 5000                  # 5000 core-hours / 7 days
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Budget {
+    /// Trailing window length in seconds (e.g. 604800 = 7 days).
+    pub window_secs: u64,
+    /// resource name → resource-hours allowed over the window. Every other
+    /// key on the section flattens in here.
+    #[serde(flatten)]
+    pub limits: BTreeMap<String, f64>,
+}
+
+impl Budget {
+    /// The cap map as a [`ResourceMap`].
+    pub fn limit_map(&self) -> ResourceMap {
+        ResourceMap(self.limits.clone())
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+#[error(
+    "project {project} budget exceeded: consumed {consumed:?} of {limit:?} \
+     resource-hours over the last {window_secs}s"
+)]
+pub struct BudgetExceeded {
+    pub project: String,
+    pub consumed: ResourceMap,
+    pub limit: ResourceMap,
+    pub window_secs: u64,
+}
+
+/// Time-windowed budget admission (#77). `consumed` is the project's
+/// cumulative resource-hours over the trailing `budget.window_secs`, derived
+/// from the metering `usage_samples` (see
+/// [`crate::usage::windowed_resource_hours`]).
+///
+/// **Enforcement model (v1, deliberately simple and documented):** admit iff
+/// the *already-consumed* windowed usage is strictly below the cap on every
+/// resource the budget lists. We do NOT project the new cluster's future
+/// consumption onto the window — a cluster's lifetime is unknown at admission
+/// (TTL is optional, autoscaling is Ray's), so any projection would be a
+/// guess. Blocking on `consumed >= cap` is the honest floor: once a project
+/// has burned its window allowance it can create nothing new until the window
+/// rolls forward and older usage ages out. A resource the budget does not
+/// list is unconstrained. A cap of 0 admits nothing for that resource.
+pub fn admit_budget(
+    project: &str,
+    budget: &Budget,
+    consumed: &ResourceMap,
+) -> Result<(), BudgetExceeded> {
+    let over = budget
+        .limits
+        .iter()
+        .any(|(resource, cap)| consumed.get(resource) >= *cap);
+    if over {
+        Err(BudgetExceeded {
+            project: project.to_string(),
+            consumed: consumed.clone(),
+            limit: budget.limit_map(),
+            window_secs: budget.window_secs,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +448,63 @@ mod tests {
         let mut s = spec(1, 1, None);
         s.head_cpu = "banana".into();
         assert!(matches!(cluster_demand(&s), Err(PolicyError::Quantity(_))));
+    }
+
+    #[test]
+    fn budget_deserializes_window_and_flattened_resource_hours() {
+        // window_secs is a named field; every other key flattens into limits.
+        // (TOML deserializes through the same serde path — covered by the CLI
+        // crate's parse_policy test; here we use serde_json, the store/PUT
+        // wire shape, to avoid a toml dev-dependency.)
+        let b: Budget =
+            serde_json::from_str(r#"{"window_secs":604800,"nvidia.com/gpu":100.0,"cpu":5000.0}"#)
+                .unwrap();
+        assert_eq!(b.window_secs, 604800);
+        assert_eq!(b.limits["nvidia.com/gpu"], 100.0);
+        assert_eq!(b.limits["cpu"], 5000.0);
+        assert_eq!(b.limit_map().gpu(), 100.0);
+        // The window field is not swept into the resource limits.
+        assert!(!b.limits.contains_key("window_secs"));
+    }
+
+    #[test]
+    fn budget_admits_under_and_denies_at_or_over_cap() {
+        let budget = Budget {
+            window_secs: 604800,
+            limits: BTreeMap::from([("nvidia.com/gpu".to_string(), 100.0)]),
+        };
+        // Under the cap admits.
+        assert!(admit_budget("team-a", &budget, &map(&[("nvidia.com/gpu", 99.9)])).is_ok());
+        // At the cap denies (consumed >= cap).
+        assert!(admit_budget("team-a", &budget, &map(&[("nvidia.com/gpu", 100.0)])).is_err());
+        // Over the cap denies, and the error carries the accounting.
+        let err = admit_budget("team-a", &budget, &map(&[("nvidia.com/gpu", 150.0)])).unwrap_err();
+        assert_eq!(err.project, "team-a");
+        assert_eq!(err.consumed.gpu(), 150.0);
+        assert_eq!(err.limit.gpu(), 100.0);
+        assert_eq!(err.window_secs, 604800);
+    }
+
+    #[test]
+    fn budget_only_constrains_listed_resources() {
+        // A budget on GPU-hours does not constrain CPU-hours at all.
+        let budget = Budget {
+            window_secs: 604800,
+            limits: BTreeMap::from([("nvidia.com/gpu".to_string(), 100.0)]),
+        };
+        // Huge CPU consumption, zero GPU consumption → admits.
+        assert!(admit_budget("team-a", &budget, &map(&[("cpu", 1_000_000.0)])).is_ok());
+        // Empty budget (no listed resources) never denies.
+        let empty = Budget {
+            window_secs: 604800,
+            limits: BTreeMap::new(),
+        };
+        assert!(admit_budget(
+            "team-a",
+            &empty,
+            &map(&[("cpu", 9e9), ("nvidia.com/gpu", 9e9)])
+        )
+        .is_ok());
     }
 
     #[test]

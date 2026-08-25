@@ -43,6 +43,11 @@ use crate::settings::{config_from_stored, effective_policy};
 pub struct PolicyConfig {
     pub prices: Option<PriceSheet>,
     pub quotas: HashMap<String, ResourceMap>,
+    /// project → time-windowed compute budget (#77). Empty = no budgets
+    /// enforced (unlimited cumulative consumption). Distinct from `quotas`,
+    /// which caps concurrent live demand; budgets cap consumption over a
+    /// trailing window.
+    pub budgets: HashMap<String, mobula_policy::Budget>,
     /// Platform default GPU sharing mode for pools without an explicit
     /// `gpu_sharing` (`[gpu] default_sharing` in the policy file;
     /// `whole-gpu` when unconfigured).
@@ -462,6 +467,41 @@ async fn create_cluster(
     } else {
         None
     };
+
+    // Time-windowed budget admission (#77). Distinct from the concurrent
+    // quota above: this caps CUMULATIVE consumption over a trailing window,
+    // derived from the metering `usage_samples`. Enforced independently — a
+    // project can have a budget without a quota and vice versa; when both
+    // apply, both must pass. No admit-lock is needed here: `consumed` is
+    // historical, persisted usage, immune to concurrent in-flight creates
+    // (the v1 model blocks on already-consumed >= cap, not on a projection of
+    // this cluster's future usage — see `mobula_policy::admit_budget`).
+    if let Some(budget) = policy.budgets.get(&project) {
+        let to = now_unix();
+        let from = to.saturating_sub(budget.window_secs);
+        let consumed = match crate::usage::windowed_consumption(&st.store, &project, from, to).await
+        {
+            Ok(c) => c,
+            Err(e) => return store_err(e),
+        };
+        if let Err(exceeded) = mobula_policy::admit_budget(&project, budget, &consumed) {
+            emit(
+                Some(&st.store),
+                AuditEvent {
+                    ts: now_unix(),
+                    subject: ident(&identity).map(|i| i.subject.clone()),
+                    decision: AuditDecision::Deny,
+                    reason: Some("budget_exceeded".into()),
+                    action: Some("create_cluster".into()),
+                    cluster: Some(id.to_string()),
+                    status: Some(StatusCode::CONFLICT.as_u16()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return (StatusCode::CONFLICT, exceeded.to_string()).into_response();
+        }
+    }
 
     match st.store.upsert_desired(&id, body.spec).await {
         Ok(generation) => {

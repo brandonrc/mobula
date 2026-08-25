@@ -253,8 +253,26 @@ pub struct StoredPolicy {
     /// project → resource → limit. Empty = no quotas enforced.
     #[serde(default)]
     pub quotas: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
+    /// project → time-windowed compute budget (#77). Empty = no budgets
+    /// enforced. Additive `#[serde(default)]` field: older policy rows (JSON
+    /// text in the singleton `control` table) that predate budgets
+    /// deserialize with an empty map — no store migration needed.
+    #[serde(default)]
+    pub budgets: std::collections::BTreeMap<String, StoredBudget>,
     /// True while the row is the untouched `--policy` boot seed.
     pub from_file_seed: bool,
+}
+
+/// A persisted time-windowed compute budget (#77): the store-side mirror of
+/// [`mobula_policy::Budget`] (the store stays free of the policy crate). A
+/// trailing `window_secs` window and a `limits` map of resource name →
+/// resource-hours allowed over it.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredBudget {
+    pub window_secs: u64,
+    /// resource → resource-hours over the window.
+    #[serde(default)]
+    pub limits: std::collections::BTreeMap<String, f64>,
 }
 
 /// A scoped role assignment (ADR-0009 addendum, #49): `principal` (the

@@ -1063,13 +1063,21 @@ async fn sqlite_store_assignment_conforms() {
 /// set round-trips the full record (prices, quotas, provenance flag);
 /// overwrite replaces the row; `seed_policy` is insert-if-absent.
 async fn policy_conformance(store: &dyn Store) {
-    use mobula_controller::StoredPolicy;
+    use mobula_controller::{StoredBudget, StoredPolicy};
 
     let policy = |cpu_price: f64, seed: bool| StoredPolicy {
         prices: Some(BTreeMap::from([("cpu".to_string(), cpu_price)])),
         quotas: BTreeMap::from([(
             "ml-team".to_string(),
             BTreeMap::from([("cpu".to_string(), 500.0)]),
+        )]),
+        // #77: budgets ride the same JSON policy row — round-trip them too.
+        budgets: BTreeMap::from([(
+            "ml-team".to_string(),
+            StoredBudget {
+                window_secs: 604_800,
+                limits: BTreeMap::from([("nvidia.com/gpu".to_string(), 100.0)]),
+            },
         )]),
         from_file_seed: seed,
     };
@@ -1102,6 +1110,7 @@ async fn policy_seed_conformance(store: &dyn Store) {
             "demo".to_string(),
             BTreeMap::from([("cpu".to_string(), 5.0)]),
         )]),
+        budgets: Default::default(),
         from_file_seed: true,
     };
     assert!(store.seed_policy(&seed).await.unwrap());

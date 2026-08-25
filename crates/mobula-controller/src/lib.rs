@@ -19,9 +19,9 @@ pub use reconcile::{observed_gone, Action, RateLimits, ReconcileError, Reconcile
 pub use store::{
     audit_chain_hash, memory::InMemoryStore, now_unix, queue_assignment_for_project,
     verify_audit_chain, AuditChainVerification, AuditChainWindow, ChainedAuditRow, DesiredState,
-    IntentOutcome, IntentRecord, IntentStatus, RoleAssignment, Store, StoreError, StoredCluster,
-    StoredPolicy, StoredPool, UsageSample, UsageSource, AUDIT_GENESIS_HASH, LOCKOUT_SECS,
-    LOGIN_LOCKOUT_THRESHOLD,
+    IntentOutcome, IntentRecord, IntentStatus, RoleAssignment, Store, StoreError, StoredBudget,
+    StoredCluster, StoredPolicy, StoredPool, UsageSample, UsageSource, AUDIT_GENESIS_HASH,
+    LOCKOUT_SECS, LOGIN_LOCKOUT_THRESHOLD,
 };
 #[cfg(feature = "postgres")]
 pub use store_postgres::PostgresStore;

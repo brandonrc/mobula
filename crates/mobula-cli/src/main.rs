@@ -231,6 +231,7 @@ async fn main() -> std::io::Result<()> {
                     tracing::info!(
                         prices = cfg.prices.as_ref().map(|p| p.0.len()).unwrap_or(0),
                         quotas = cfg.quotas.len(),
+                        budgets = cfg.budgets.len(),
                         "governance policy loaded"
                     );
                     cfg
@@ -751,12 +752,14 @@ fn parse_policy(raw: &str) -> Result<mobula_api::clusters::PolicyConfig, toml::d
     struct PolicyFile {
         prices: Option<mobula_policy::PriceSheet>,
         quotas: Option<std::collections::HashMap<String, mobula_policy::ResourceMap>>,
+        budgets: Option<std::collections::HashMap<String, mobula_policy::Budget>>,
         gpu: Option<GpuSection>,
     }
     let parsed: PolicyFile = toml::from_str(raw)?;
     Ok(mobula_api::clusters::PolicyConfig {
         prices: parsed.prices,
         quotas: parsed.quotas.unwrap_or_default(),
+        budgets: parsed.budgets.unwrap_or_default(),
         gpu_default_sharing: parsed.gpu.map(|g| g.default_sharing).unwrap_or_default(),
     })
 }
@@ -1367,12 +1370,21 @@ memory = 0.005
 
 [quotas]
 dev = { cpu = 200, memory = 400, "nvidia.com/gpu" = 8 }
+
+[budgets]
+team-a = { window_secs = 604800, "nvidia.com/gpu" = 100, cpu = 5000 }
 "#,
         )
         .unwrap();
         let prices = cfg.prices.expect("prices parsed");
         assert_eq!(prices.0["nvidia.com/gpu"], 2.50);
         assert_eq!(cfg.quotas["dev"].0["cpu"], 200.0);
+        // [budgets]: window_secs is a named field, resource-hours flatten in.
+        let budget = &cfg.budgets["team-a"];
+        assert_eq!(budget.window_secs, 604800);
+        assert_eq!(budget.limits["nvidia.com/gpu"], 100.0);
+        assert_eq!(budget.limits["cpu"], 5000.0);
+        assert!(!budget.limits.contains_key("window_secs"));
         // No [gpu] section → the safe platform default.
         assert_eq!(cfg.gpu_default_sharing, mobula_core::GpuSharing::WholeGpu);
         assert!(parse_policy("prices = 'nope'").is_err());

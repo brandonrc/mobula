@@ -55,6 +55,7 @@ fn seeded_policy() -> PolicyConfig {
                 ("memory".to_string(), 100.0),
             ])),
         )]),
+        budgets: HashMap::new(),
         gpu_default_sharing: Default::default(),
     }
 }
@@ -238,6 +239,129 @@ async fn put_quotas_replaces_file_quotas_for_admission() {
         StatusCode::CONFLICT,
         "store-edited quota must gate admission"
     );
+}
+
+#[tokio::test]
+async fn put_budgets_section_replace_gets_back_and_gates_admission() {
+    use mobula_controller::{now_unix, Store, UsageSample, UsageSource};
+
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    // team-a already burned 500 GPU-hours in the last hour.
+    store
+        .record_usage_samples(&[UsageSample {
+            ts: now_unix().saturating_sub(3600),
+            project: "team-a".into(),
+            pool: "gpu".into(),
+            resource: "nvidia.com/gpu".into(),
+            quantity: 500.0,
+            source: UsageSource::ObservedSpec,
+        }])
+        .await
+        .unwrap();
+    let app = authed_app_with_policy(&idp, store.clone(), PolicyConfig::default()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    // PUT a budget: team-a capped at 100 GPU-hours / 1h.
+    let res = app
+        .clone()
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({
+                "budgets": { "team-a": { "window_secs": 3600, "nvidia.com/gpu": 100 } }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    assert_eq!(body["source"], "store");
+    assert_eq!(body["budgets"]["team-a"]["window_secs"], 3600);
+    assert_eq!(
+        body["budgets"]["team-a"]["nvidia.com/gpu"]
+            .as_f64()
+            .unwrap(),
+        100.0
+    );
+
+    // GET reflects the stored budget.
+    let res = app
+        .clone()
+        .oneshot(get("/api/v1/settings/policy", HOST, Some(&admin)))
+        .await
+        .unwrap();
+    let body = body_json(res).await;
+    assert_eq!(body["budgets"]["team-a"]["window_secs"], 3600);
+
+    // The store-edited budget gates admission: 500 consumed > 100 cap → 409.
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            HOST,
+            &admin,
+            create_body_sized("c", "team-a", "1", 1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "store-edited budget must gate admission"
+    );
+
+    // Section-replace: PUT empty budgets clears it, so the same create admits.
+    let res = app
+        .clone()
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({ "budgets": {} }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            HOST,
+            &admin,
+            create_body_sized("c2", "team-a", "1", 1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::CREATED,
+        "cleared budget no longer gates admission"
+    );
+}
+
+#[tokio::test]
+async fn put_budget_zero_window_is_400() {
+    let idp = spawn_idp().await;
+    let app = authed_app_with_policy(
+        &idp,
+        Arc::new(InMemoryStore::new()),
+        PolicyConfig::default(),
+    )
+    .await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+    let res = app
+        .oneshot(put_json(
+            "/api/v1/settings/policy",
+            HOST,
+            &admin,
+            serde_json::json!({
+                "budgets": { "team-a": { "window_secs": 0, "cpu": 10 } }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
