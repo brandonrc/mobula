@@ -5,6 +5,9 @@
 //! idempotency key so an HA failover mid-provision cannot double-provision
 //! (PLAN.md, review finding A4).
 
+pub mod dask;
+#[cfg(feature = "kuberay")]
+pub mod dask_client;
 pub mod demo;
 pub mod kuberay;
 #[cfg(feature = "kuberay")]
@@ -12,12 +15,18 @@ pub mod kuberay_client;
 pub mod kueue;
 #[cfg(feature = "kuberay")]
 pub mod kueue_client;
+#[cfg(feature = "kuberay")]
+pub mod router;
+#[cfg(feature = "kuberay")]
+pub use dask_client::DaskProvisioner;
 pub use demo::DemoProvisioner;
 pub use kuberay::QueueAssignment;
 #[cfg(feature = "kuberay")]
 pub use kuberay_client::KubeRayProvisioner;
 #[cfg(feature = "kuberay")]
 pub use kueue_client::KueueClient;
+#[cfg(feature = "kuberay")]
+pub use router::EngineRouter;
 
 use mobula_core::{AllocationSpec, ClusterId, ClusterSpec, ClusterState, PoolSpec, ServiceSpec};
 

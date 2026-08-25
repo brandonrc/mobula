@@ -20,6 +20,7 @@ fn spec() -> ClusterSpec {
     ClusterSpec {
         name: "c".into(),
         project: "demo".into(),
+        engine: Default::default(),
         ray_version: "2.57.0".into(),
         image: "rayproject/ray:2.57.0".into(),
         head_cpu: "1".into(),

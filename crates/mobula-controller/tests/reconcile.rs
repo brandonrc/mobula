@@ -154,6 +154,7 @@ impl Provisioner for MockProvisioner {
 
 fn spec(name: &str, replicas: u32) -> ClusterSpec {
     ClusterSpec {
+        engine: Default::default(),
         name: name.into(),
         project: "demo".into(),
         ray_version: "2.57.0".into(),

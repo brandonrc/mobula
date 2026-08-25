@@ -1396,6 +1396,7 @@ mod tests {
 
     fn spec(name: &str) -> ClusterSpec {
         ClusterSpec {
+            engine: Default::default(),
             name: name.into(),
             project: "demo".into(),
             ray_version: "2.57.0".into(),

@@ -130,6 +130,7 @@ mod tests {
 
     fn cluster(gpu: Option<&str>) -> ClusterSpec {
         ClusterSpec {
+            engine: Default::default(),
             name: "c".into(),
             project: "p".into(),
             ray_version: "2.57.0".into(),

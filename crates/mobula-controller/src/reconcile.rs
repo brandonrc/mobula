@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mobula_core::{ClusterState, DriftCondition};
+use mobula_core::{ClusterState, DriftCondition, Engine};
 use mobula_provision::{ProvisionError, Provisioner};
 
 use crate::store::{
@@ -298,7 +298,13 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
                     // edit of a Mobula-owned field (#41). The observed
                     // fingerprint is recomputed from the live resource, so a
                     // divergence is real drift — alarm, don't silently NoOp.
-                    let desired_fp = mobula_provision::kuberay::owned_spec_fingerprint(&c.spec);
+                    // Engine-neutral drift check: each engine projects its own
+                    // owned-field fingerprint, symmetric with what its
+                    // provisioner reads back in `observe`.
+                    let desired_fp = match c.spec.engine {
+                        Engine::Ray => mobula_provision::kuberay::owned_spec_fingerprint(&c.spec),
+                        Engine::Dask => mobula_provision::dask::owned_spec_fingerprint(&c.spec),
+                    };
                     if observed_fp.as_deref().is_some_and(|fp| fp != desired_fp) {
                         new_condition = Some(DriftCondition::SpecDrift);
                         tracing::warn!(
@@ -600,6 +606,7 @@ mod tests {
         StoredCluster {
             id: ClusterId("c".into()),
             spec: ClusterSpec {
+                engine: Default::default(),
                 name: "c".into(),
                 project: "p".into(),
                 ray_version: "2.57.0".into(),
@@ -683,6 +690,7 @@ mod tests {
         ClusterSpec {
             name: "c".into(),
             project: "p".into(),
+            engine: Default::default(),
             ray_version: "2.57.0".into(),
             image: "img".into(),
             head_cpu: "1".into(),

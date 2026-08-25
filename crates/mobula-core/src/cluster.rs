@@ -16,14 +16,51 @@ impl std::fmt::Display for ClusterId {
     }
 }
 
-/// Declarative spec for a managed Ray cluster.
+/// The compute engine a cluster is provisioned on (multi-engine spike). The
+/// control plane is engine-neutral above the provisioner seam; this
+/// discriminator is what the reconciler and the provisioner router dispatch
+/// on. `Ray` is the default so specs persisted before multi-engine — and any
+/// client that omits the field — still deserialize as Ray clusters, exactly
+/// as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    /// KubeRay `RayCluster` — full control + interactive + batch (Ray Jobs) +
+    /// serving (Ray Serve).
+    #[default]
+    Ray,
+    /// dask-kubernetes-operator `DaskCluster` — control + interactive only.
+    /// Batch (no Ray-Jobs-REST equivalent) and serving (no Ray Serve
+    /// equivalent) are deliberately out of scope for Dask.
+    Dask,
+}
+
+impl std::fmt::Display for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Engine::Ray => "ray",
+            Engine::Dask => "dask",
+        })
+    }
+}
+
+/// Declarative spec for a managed cluster.
 ///
-/// v0 targets the KubeRay backend only; fields deliberately mirror what maps
-/// onto a RayCluster CR so the provisioner stays a thin translation.
+/// Historically Ray-only (fields mirror a RayCluster CR so the KubeRay
+/// provisioner stays a thin translation). Multi-engine adds [`Self::engine`];
+/// the head/scheduler + worker-group shape is generic to both engines. For
+/// `engine = dask`, `ray_version` is unused (Dask's version is carried by
+/// [`Self::image`]); it stays a required field only for back-compat with
+/// stored Ray specs and existing clients.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClusterSpec {
     pub name: String,
     pub project: String,
+    /// Which compute engine backs this cluster. `#[serde(default)]` = Ray, so
+    /// every pre-multi-engine spec and every Ray client keeps working
+    /// untouched.
+    #[serde(default)]
+    pub engine: Engine,
     pub ray_version: String,
     pub image: String,
     pub head_cpu: String,
