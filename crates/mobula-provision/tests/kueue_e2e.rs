@@ -76,6 +76,7 @@ fn cluster_spec(name: &str, project: &str) -> ClusterSpec {
             replicas: 1,
         }],
         ttl_seconds: None,
+        idle_timeout_secs: None,
         owner: None,
     }
 }

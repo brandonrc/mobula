@@ -66,8 +66,28 @@ pub struct ClusterSpec {
     pub head_cpu: String,
     pub head_memory: String,
     pub worker_groups: Vec<WorkerGroup>,
-    /// Idle TTL in seconds; `None` disables reaping.
+    /// **Absolute max-age cap** in seconds: the cluster is reaped this long
+    /// after creation regardless of activity. `None` disables the max-age
+    /// reaper. (Despite the historical name, this is a wall-clock age cap, not
+    /// an inactivity window — see [`Self::idle_timeout_secs`] for that.)
     pub ttl_seconds: Option<u64>,
+    /// **Inactivity reap window** in seconds (#100): the cluster is reaped once
+    /// it has been *idle* — no job activity — for this long, so a busy cluster
+    /// survives past it while a genuinely unused one is released. Distinct from
+    /// [`Self::ttl_seconds`], which still caps absolute age independently:
+    /// whichever fires first reaps the cluster.
+    ///
+    /// Activity is derived from the persisted job history (a running/recent
+    /// gateway job keeps the cluster alive). **Limitation:** interactive Ray
+    /// Client / Dask sessions submit no gateway jobs, so their activity is
+    /// invisible to this signal — an interactive-only cluster looks idle from
+    /// creation. For such sessions rely on [`Self::ttl_seconds`] or leave this
+    /// unset. See `reconcile.rs` module docs.
+    ///
+    /// `#[serde(default)]` so specs persisted before this field — and any
+    /// client that omits it — keep the prior max-age-only behavior.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
     /// The authenticated owner of this cluster (tier-2 owned session
     /// clusters): the human identity that requested it — a
     /// `preferred_username` when the OIDC token carries one, else the `sub`.
