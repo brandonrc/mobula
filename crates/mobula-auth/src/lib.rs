@@ -167,6 +167,13 @@ pub struct Identity {
     pub email: Option<String>,
     pub groups: Vec<String>,
     pub roles: Vec<Role>,
+    /// Group-derived project-scoped grants (#103): `(role, "project:<name>")`
+    /// pairs implied by group membership via `[project_roles]`, with NO manual
+    /// `role_assignments` row. Resolved once at token validation from the
+    /// caller's groups + the auth config, then combined with any stored
+    /// assignments at evaluation time (see `authorize_scoped`). Empty for
+    /// local auth and when `[project_roles]` is unset — deny-by-default holds.
+    pub project_roles: Vec<(Role, String)>,
 }
 
 impl Identity {
@@ -244,6 +251,105 @@ pub struct AuthConfig {
     pub groups_claim: String,
     #[serde(default)]
     pub roles: RoleMappings,
+    /// #103: group→project-role automation. Serde-defaulted (empty = off) so
+    /// existing auth.toml files without the key keep parsing and keep exactly
+    /// today's flat behavior.
+    #[serde(default)]
+    pub project_roles: ProjectRoleMappings,
+}
+
+/// Group→project-role mapping (#103): the self-service convention that lets a
+/// caller's IdP group membership imply a *scoped* role on the matching project
+/// with NO manual `PUT /access/assignments`. Same shape as [`RoleMappings`]
+/// (role → group patterns), but a matching group grants the role scoped to
+/// `project:<group>` (the group name after [`ProjectRoleMappings::strip_prefix`]),
+/// not globally. A `"*"` pattern means "every group the caller is in derives
+/// its own project role" — the plain `team-a ⇒ operator on project:team-a`
+/// rule. Empty lists = feature off, so deny-by-default is preserved.
+///
+/// `operator`/`developer` are the meaningful entries (cluster lifecycle / job
+/// code on your own project); the rest exist for uniformity with `[roles]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProjectRoleMappings {
+    #[serde(default)]
+    pub admin: Vec<String>,
+    #[serde(default)]
+    pub operator: Vec<String>,
+    #[serde(default)]
+    pub developer: Vec<String>,
+    #[serde(default)]
+    pub viewer: Vec<String>,
+    #[serde(default)]
+    pub auditor: Vec<String>,
+    /// Stripped from each matching group name to derive the project, e.g. `"/"`
+    /// for Keycloak's `/team-a` groups (→ `project:team-a`). Default `""`: the
+    /// group name is the project name verbatim.
+    #[serde(default)]
+    pub strip_prefix: String,
+}
+
+impl ProjectRoleMappings {
+    /// Whether any role has a group pattern configured (feature on).
+    pub fn is_empty(&self) -> bool {
+        self.admin.is_empty()
+            && self.operator.is_empty()
+            && self.developer.is_empty()
+            && self.viewer.is_empty()
+            && self.auditor.is_empty()
+    }
+
+    /// Whether any role maps a `"*"` wildcard — every group derives its own
+    /// project role. Narrower than a global wildcard (grants are per-project),
+    /// but still worth surfacing at boot.
+    pub fn has_wildcard(&self) -> bool {
+        [
+            &self.admin,
+            &self.operator,
+            &self.developer,
+            &self.viewer,
+            &self.auditor,
+        ]
+        .iter()
+        .any(|patterns| patterns.iter().any(|p| p == "*"))
+    }
+
+    /// Group-derived `(role, "project:<name>")` grants for `groups`. For each
+    /// role, a group matching its patterns (`"*"` matches any) yields that role
+    /// scoped to the project named by the group (after `strip_prefix`). Groups
+    /// that reduce to an empty or scope-grammar-invalid project name are
+    /// skipped. Duplicates are de-duplicated; order is stable.
+    pub fn resolve(&self, groups: &[String]) -> Vec<(Role, String)> {
+        let mut out: Vec<(Role, String)> = Vec::new();
+        for (patterns, role) in [
+            (&self.admin, Role::Admin),
+            (&self.operator, Role::Operator),
+            (&self.developer, Role::Developer),
+            (&self.viewer, Role::Viewer),
+            (&self.auditor, Role::Auditor),
+        ] {
+            if patterns.is_empty() {
+                continue;
+            }
+            for g in groups {
+                if !patterns.iter().any(|p| p == "*" || p == g) {
+                    continue;
+                }
+                let name = g.strip_prefix(&self.strip_prefix).unwrap_or(g.as_str());
+                if name.is_empty() {
+                    continue;
+                }
+                let scope = format!("project:{name}");
+                if !valid_scope(&scope) {
+                    continue;
+                }
+                let entry = (role, scope);
+                if !out.contains(&entry) {
+                    out.push(entry);
+                }
+            }
+        }
+        out
+    }
 }
 
 fn default_groups_claim() -> String {
@@ -405,6 +511,23 @@ impl Validator {
             );
         }
 
+        // #103: surface group→project-role automation at boot so operators know
+        // self-service scoped grants are active without a manual assignment.
+        if !config.project_roles.is_empty() {
+            if config.project_roles.has_wildcard() {
+                tracing::info!(
+                    "project_roles maps a \"*\" wildcard: every group a caller \
+                     belongs to grants the mapped role scoped to project:<group> \
+                     automatically (self-service, no manual assignment)"
+                );
+            } else {
+                tracing::info!(
+                    "project_roles is configured: matching groups grant scoped \
+                     roles on project:<group> automatically (#103)"
+                );
+            }
+        }
+
         let validator = Self {
             config,
             client,
@@ -512,6 +635,9 @@ impl Validator {
             _ => Vec::new(),
         };
         let roles = self.config.roles.resolve(&groups);
+        // #103: derive project-scoped grants from group membership (empty when
+        // [project_roles] is unset — deny-by-default preserved).
+        let project_roles = self.config.project_roles.resolve(&groups);
         Identity {
             // Sanitize: sub reaches the plain-text log layer, and a `sub`
             // containing newlines/control chars could forge audit lines
@@ -530,6 +656,7 @@ impl Validator {
                 .map(String::from),
             groups,
             roles,
+            project_roles,
         }
     }
 }
@@ -652,6 +779,7 @@ mod tests {
             email: None,
             groups: vec![],
             roles: vec![Role::Developer, Role::Operator],
+            project_roles: vec![],
         };
         assert!(id.permits(PermissionType::Write, Target::Job));
         assert!(id.permits(PermissionType::Write, Target::Cluster));
@@ -663,6 +791,7 @@ mod tests {
             email: None,
             groups: vec![],
             roles: vec![],
+            project_roles: vec![],
         };
         assert!(!none.is_authorized());
         assert!(!none.permits(PermissionType::Read, Target::Job));
@@ -739,6 +868,7 @@ mod tests {
             email: None,
             groups: vec![],
             roles: vec![Role::Developer],
+            project_roles: vec![],
         };
         let op_ml = vec![(Role::Operator, "project:ml-team".to_string())];
 
@@ -749,6 +879,7 @@ mod tests {
             email: None,
             groups: vec![],
             roles: vec![Role::Admin],
+            project_roles: vec![],
         };
         assert!(admin.permits_scoped(Delete, Cluster, &[], "anywhere"));
 
@@ -767,6 +898,7 @@ mod tests {
             email: None,
             groups: vec![],
             roles: vec![],
+            project_roles: vec![],
         };
         assert!(!nobody.permits_scoped(Write, Job, &op_ml, "ml-team"));
         // The non-scoped fast path is unchanged: no assignments consulted.
@@ -789,6 +921,7 @@ mod tests {
             email: None,
             groups: vec![],
             roles: vec![Role::Operator],
+            project_roles: vec![],
         };
         let scoped_viewer = vec![(Role::Viewer, "project:ml-team".to_string())];
         assert!(op.permits_scoped(Write, Cluster, &scoped_viewer, "ml-team"));
@@ -810,6 +943,77 @@ mod tests {
     }
 
     #[test]
+    fn project_roles_derive_scoped_grant_per_group() {
+        // #103: the plain convention — membership in group X grants operator
+        // on project:X, via a "*" pattern, with NO manual assignment.
+        let m = ProjectRoleMappings {
+            operator: vec!["*".into()],
+            ..ProjectRoleMappings::default()
+        };
+        let grants = m.resolve(&["team-a".into(), "team-b".into()]);
+        assert!(grants.contains(&(Role::Operator, "project:team-a".into())));
+        assert!(grants.contains(&(Role::Operator, "project:team-b".into())));
+        // No groups → no grants (deny-by-default preserved).
+        assert!(m.resolve(&[]).is_empty());
+    }
+
+    #[test]
+    fn project_roles_explicit_group_list_scopes_to_that_group() {
+        // Only listed groups participate, and each derives its OWN project.
+        let m = ProjectRoleMappings {
+            operator: vec!["team-a".into()],
+            developer: vec!["team-b".into()],
+            ..ProjectRoleMappings::default()
+        };
+        // Caller in team-a: operator on project:team-a, nothing for team-b.
+        let a = m.resolve(&["team-a".into()]);
+        assert_eq!(a, vec![(Role::Operator, "project:team-a".to_string())]);
+        // Caller in team-b: developer on project:team-b.
+        let b = m.resolve(&["team-b".into()]);
+        assert_eq!(b, vec![(Role::Developer, "project:team-b".to_string())]);
+        // Caller in an unmapped group: nothing.
+        assert!(m.resolve(&["team-c".into()]).is_empty());
+    }
+
+    #[test]
+    fn project_roles_strip_prefix_and_grammar() {
+        // Keycloak "/team-a" groups: strip the "/" to name the project.
+        let m = ProjectRoleMappings {
+            operator: vec!["*".into()],
+            strip_prefix: "/".into(),
+            ..ProjectRoleMappings::default()
+        };
+        let g = m.resolve(&["/team-a".into()]);
+        assert_eq!(g, vec![(Role::Operator, "project:team-a".to_string())]);
+        // A group that reduces to an empty/invalid project name is skipped,
+        // never a malformed scope.
+        assert!(m.resolve(&["/".into()]).is_empty());
+        let bad = ProjectRoleMappings {
+            operator: vec!["*".into()],
+            ..ProjectRoleMappings::default()
+        };
+        assert!(bad.resolve(&["has space".into()]).is_empty());
+    }
+
+    #[test]
+    fn project_roles_empty_and_wildcard_flags() {
+        assert!(ProjectRoleMappings::default().is_empty());
+        assert!(!ProjectRoleMappings::default().has_wildcard());
+        let m = ProjectRoleMappings {
+            operator: vec!["*".into()],
+            ..ProjectRoleMappings::default()
+        };
+        assert!(!m.is_empty());
+        assert!(m.has_wildcard());
+        let explicit = ProjectRoleMappings {
+            operator: vec!["team-a".into()],
+            ..ProjectRoleMappings::default()
+        };
+        assert!(!explicit.is_empty());
+        assert!(!explicit.has_wildcard());
+    }
+
+    #[test]
     fn auth_config_parses_with_defaults() {
         let cfg: AuthConfig = toml_from(
             r#"
@@ -821,6 +1025,26 @@ mod tests {
         );
         assert_eq!(cfg.groups_claim, "groups");
         assert!(cfg.roles.admin.is_empty());
+        // #103: absent [project_roles] parses to the empty (feature-off) map.
+        assert!(cfg.project_roles.is_empty());
+    }
+
+    #[test]
+    fn auth_config_parses_project_roles() {
+        // The [project_roles] table deserializes like [roles] plus strip_prefix.
+        let cfg: AuthConfig = serde_json::from_value(serde_json::json!({
+            "issuer": "https://kc.example.com/realms/nebari",
+            "audience": "mobula",
+            "roles": {"viewer": ["*"]},
+            "project_roles": {"operator": ["*"], "strip_prefix": "/"}
+        }))
+        .unwrap();
+        assert!(!cfg.project_roles.is_empty());
+        assert_eq!(cfg.project_roles.strip_prefix, "/");
+        assert_eq!(
+            cfg.project_roles.resolve(&["/team-a".into()]),
+            vec![(Role::Operator, "project:team-a".to_string())]
+        );
     }
 
     fn toml_from(s: &str) -> AuthConfig {

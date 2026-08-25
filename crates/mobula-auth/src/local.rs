@@ -177,6 +177,10 @@ fn identity_of(user: &LocalUserRecord) -> Identity {
         email: user.email.clone(),
         groups: vec![],
         roles: vec![to_role(user.role)],
+        // Local auth has no IdP groups, so no group→project-role automation
+        // (#103); scoped grants for local users come only from explicit
+        // role_assignments.
+        project_roles: vec![],
     }
 }
 

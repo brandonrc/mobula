@@ -29,6 +29,7 @@ async fn validator_for(idp: &Idp) -> Arc<Validator> {
         issuer: idp.issuer.clone(),
         audience: "mobula".into(),
         groups_claim: "groups".into(),
+        project_roles: Default::default(),
         roles: RoleMappings {
             admin: vec!["/platform-admins".into()],
             operator: vec!["/sre".into()],
