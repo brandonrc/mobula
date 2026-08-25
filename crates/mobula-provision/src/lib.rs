@@ -17,6 +17,8 @@ pub mod kueue;
 pub mod kueue_client;
 #[cfg(feature = "kuberay")]
 pub mod router;
+#[cfg(all(test, feature = "kuberay"))]
+mod test_support;
 #[cfg(feature = "kuberay")]
 pub use dask_client::DaskProvisioner;
 pub use demo::DemoProvisioner;

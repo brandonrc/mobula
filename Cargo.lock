@@ -1795,6 +1795,7 @@ name = "mobula-provision"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "http",
  "k8s-openapi",
  "kube",
  "mobula-core",
@@ -1804,6 +1805,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
 ]
 

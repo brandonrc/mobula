@@ -320,12 +320,67 @@ pub fn cluster_allow_network_policy(id: &str, owner: Option<&str>) -> Value {
 
 /// Map a DaskCluster `.status.phase` to a Mobula [`ClusterState`]
 /// (observation-first). The operator reports "Created"/"Pending"/"Running".
+///
+/// NOTE (#121): the dask-operator only *writes* `.status.phase` when the
+/// installed `daskclusters` CRD serves a `status` subresource. On a CRD
+/// without one, the phase patch silently fails and the CR is stuck at
+/// `Pending` forever — so this mapping alone never reports `Running`. The live
+/// client therefore prefers [`observed_state_from_pods`] and falls back to
+/// this only when no pods are visible.
 pub fn status_to_state(status: &Value) -> ClusterState {
     match status.get("phase").and_then(|s| s.as_str()) {
         Some("Running") => ClusterState::Running,
         Some("Failed") => ClusterState::Degraded,
         // Created / Pending / none → still coming up.
         _ => ClusterState::Provisioning,
+    }
+}
+
+/// Derive a Dask cluster's observed [`ClusterState`] from the operator-owned
+/// **pods** (scheduler + workers), independent of the DaskCluster's
+/// `.status.phase` (#121). This is the robust readiness signal: it works
+/// regardless of whether the installed CRD serves a `status` subresource,
+/// exactly as the nodes endpoint already derives per-pod readiness for both
+/// engines.
+///
+/// Rules (mirroring the KubeRay "ready" semantics):
+/// - scheduler pod `Running`+`Ready` **and** ≥1 worker `Running`+`Ready`
+///   ⇒ [`ClusterState::Running`];
+/// - scheduler pod present but `Failed` (or any pod `Failed` while not yet
+///   Running) ⇒ [`ClusterState::Degraded`];
+/// - otherwise (pods still scheduling / pulling / starting)
+///   ⇒ [`ClusterState::Provisioning`].
+///
+/// Returns `None` when there are no pods to judge from (the operator has not
+/// created any yet, or the pod list was unavailable), so the caller can fall
+/// back to the CR phase via [`status_to_state`].
+pub fn observed_state_from_pods(pods: &[Value]) -> Option<ClusterState> {
+    if pods.is_empty() {
+        return None;
+    }
+    let scheduler = pods
+        .iter()
+        .find(|p| pod_label(p, DASK_COMPONENT_LABEL) == Some("scheduler"));
+    let scheduler_ready = scheduler.is_some_and(pod_running_ready);
+    let workers_ready = pods
+        .iter()
+        .filter(|p| pod_label(p, DASK_COMPONENT_LABEL) == Some("worker"))
+        .filter(|p| pod_running_ready(p))
+        .count();
+    let any_failed = pods.iter().any(|p| pod_phase(p) == "Failed");
+
+    // A failed scheduler is unambiguously Degraded (nothing can come up
+    // without it). A ready scheduler + at least one ready worker is Running,
+    // even amid worker churn. Any other failure with no full readiness is
+    // Degraded; everything else is still coming up.
+    if scheduler.is_some_and(|p| pod_phase(p) == "Failed") {
+        Some(ClusterState::Degraded)
+    } else if scheduler_ready && workers_ready >= 1 {
+        Some(ClusterState::Running)
+    } else if any_failed {
+        Some(ClusterState::Degraded)
+    } else {
+        Some(ClusterState::Provisioning)
     }
 }
 
@@ -340,14 +395,18 @@ fn pod_label<'a>(pod: &'a Value, key: &str) -> Option<&'a str> {
         .and_then(|v| v.as_str())
 }
 
-fn pod_to_node_view(pod: &Value, is_head: bool) -> NodeView {
-    let status = pod.get("status");
-    let phase = status
+/// A pod's `.status.phase` (`"Unknown"` when absent).
+fn pod_phase(pod: &Value) -> &str {
+    pod.get("status")
         .and_then(|s| s.get("phase"))
         .and_then(|v| v.as_str())
         .unwrap_or("Unknown")
-        .to_string();
-    let ready = status
+}
+
+/// Whether the pod carries a `Ready=True` condition (the kubelet's readiness
+/// gate — the same signal the nodes endpoint reports per pod).
+fn pod_ready(pod: &Value) -> bool {
+    pod.get("status")
         .and_then(|s| s.get("conditions"))
         .and_then(|c| c.as_array())
         .is_some_and(|conds| {
@@ -355,7 +414,19 @@ fn pod_to_node_view(pod: &Value, is_head: bool) -> NodeView {
                 c.get("type").and_then(|v| v.as_str()) == Some("Ready")
                     && c.get("status").and_then(|v| v.as_str()) == Some("True")
             })
-        });
+        })
+}
+
+/// A pod is "up" when it is both `Running` and `Ready` — the readiness signal
+/// the pod-based observe ([`observed_state_from_pods`]) counts on.
+fn pod_running_ready(pod: &Value) -> bool {
+    pod_phase(pod) == "Running" && pod_ready(pod)
+}
+
+fn pod_to_node_view(pod: &Value, is_head: bool) -> NodeView {
+    let status = pod.get("status");
+    let phase = pod_phase(pod).to_string();
+    let ready = pod_ready(pod);
     NodeView {
         pod_name: pod
             .get("metadata")
@@ -638,6 +709,99 @@ mod tests {
         let peer = &p["spec"]["ingress"][1]["from"][0];
         assert_eq!(peer["podSelector"]["matchLabels"][OWNER_LABEL], "bob");
         assert_ne!(peer["podSelector"]["matchLabels"][OWNER_LABEL], "alice");
+    }
+
+    // --- #121: pod-based readiness (independent of CR .status.phase) ---
+
+    fn dpod(comp: &str, phase: &str, ready: bool) -> Value {
+        json!({
+            "metadata": { "name": format!("demo-{comp}"), "labels": {
+                DASK_CLUSTER_NAME_LABEL: "demo", DASK_COMPONENT_LABEL: comp,
+            } },
+            "status": { "phase": phase, "conditions": [
+                { "type": "Ready", "status": if ready { "True" } else { "False" } },
+            ] },
+        })
+    }
+
+    #[test]
+    fn pods_none_when_empty_so_caller_falls_back_to_cr_phase() {
+        assert_eq!(observed_state_from_pods(&[]), None);
+    }
+
+    #[test]
+    fn pods_running_when_scheduler_and_one_worker_ready() {
+        let pods = vec![
+            dpod("scheduler", "Running", true),
+            dpod("worker", "Running", true),
+            dpod("worker", "Pending", false),
+        ];
+        assert_eq!(
+            observed_state_from_pods(&pods),
+            Some(ClusterState::Running),
+            "scheduler + ≥1 worker ready ⇒ Running even while another worker starts"
+        );
+    }
+
+    #[test]
+    fn pods_provisioning_when_scheduler_ready_but_no_worker_ready() {
+        let pods = vec![
+            dpod("scheduler", "Running", true),
+            dpod("worker", "Pending", false),
+        ];
+        assert_eq!(
+            observed_state_from_pods(&pods),
+            Some(ClusterState::Provisioning)
+        );
+    }
+
+    #[test]
+    fn pods_provisioning_when_scheduler_not_yet_ready() {
+        // Scheduler Running but not Ready (probe not passing yet), worker up.
+        let pods = vec![
+            dpod("scheduler", "Running", false),
+            dpod("worker", "Running", true),
+        ];
+        assert_eq!(
+            observed_state_from_pods(&pods),
+            Some(ClusterState::Provisioning)
+        );
+    }
+
+    #[test]
+    fn pods_running_does_not_require_cr_status_phase() {
+        // The whole point of #121: no `.status` at all on the pods' owner, yet
+        // pod truth alone yields Running. (This function never sees the CR.)
+        let pods = vec![
+            dpod("scheduler", "Running", true),
+            dpod("worker", "Running", true),
+        ];
+        assert_eq!(observed_state_from_pods(&pods), Some(ClusterState::Running));
+    }
+
+    #[test]
+    fn pods_degraded_when_scheduler_failed() {
+        let pods = vec![
+            dpod("scheduler", "Failed", false),
+            dpod("worker", "Running", true),
+        ];
+        assert_eq!(
+            observed_state_from_pods(&pods),
+            Some(ClusterState::Degraded),
+            "a failed scheduler is Degraded regardless of workers"
+        );
+    }
+
+    #[test]
+    fn pods_degraded_when_a_worker_failed_and_not_ready_overall() {
+        let pods = vec![
+            dpod("scheduler", "Running", true),
+            dpod("worker", "Failed", false),
+        ];
+        assert_eq!(
+            observed_state_from_pods(&pods),
+            Some(ClusterState::Degraded)
+        );
     }
 
     #[test]
