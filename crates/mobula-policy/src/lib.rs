@@ -242,6 +242,7 @@ mod tests {
                 replicas: min,
             }],
             ttl_seconds: None,
+            idle_timeout_secs: None,
             owner: None,
         }
     }

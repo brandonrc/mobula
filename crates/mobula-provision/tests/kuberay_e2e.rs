@@ -41,6 +41,7 @@ fn tiny_spec() -> ClusterSpec {
             replicas: 1,
         }],
         ttl_seconds: None,
+        idle_timeout_secs: None,
         owner: None,
     }
 }

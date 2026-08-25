@@ -201,6 +201,7 @@ fn cluster_spec(project: &str) -> ClusterSpec {
         head_memory: "2Gi".into(),
         worker_groups: vec![],
         ttl_seconds: None,
+        idle_timeout_secs: None,
         owner: None,
     }
 }

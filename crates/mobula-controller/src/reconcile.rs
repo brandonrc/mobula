@@ -6,11 +6,39 @@
 //! It is safe to run on a fixed resync interval and safe to re-run after a
 //! crash — repeating an actuation with the same desired generation is a
 //! no-op at the provider.
+//!
+//! ## Lifecycle reaping (#100)
+//!
+//! [`Reconciler::reap_expired`] enforces two independent lifecycle bounds on a
+//! running cluster:
+//!
+//! * **max-age** (`ttl_seconds`) — reaped this long after creation regardless
+//!   of activity (the absolute cap); and
+//! * **activity-idle** (`idle_timeout_secs`) — reaped once it has been idle for
+//!   the window, so a *busy* cluster survives past it while an unused one is
+//!   released. This exists because a pure max-age TTL kills a cluster mid-use.
+//!
+//! **Activity signal.** Idleness is derived from the persisted job history
+//! (`Store::list_jobs`): a cluster with a running/pending job is busy now, and
+//! a finished job counts as activity through its end time; creation is the
+//! floor. This is the cheapest robust signal already in the store — the
+//! reconcile `observe` path carries no live resource usage, and polling each
+//! cluster's Ray dashboard/metrics every sweep would add provider load and
+//! break when the dashboard is down, so it was deliberately not used here.
+//!
+//! **Limitation — interactive sessions.** Interactive Ray Client / Dask
+//! sessions submit no *gateway* jobs, so job history is empty for them and
+//! their derived activity never advances past creation. An interactive-only
+//! cluster therefore looks idle from birth: `idle_timeout_secs` would reap it
+//! even while actively used. For such sessions leave `idle_timeout_secs` unset
+//! (max-age-only, the prior behavior) or rely on `ttl_seconds`. A robust
+//! interactive-idle signal (live utilization / active client connections from
+//! the engine) is future work.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mobula_core::{ClusterState, DriftCondition, Engine};
+use mobula_core::{ClusterState, DriftCondition, Engine, JobRecord};
 use mobula_provision::{ProvisionError, Provisioner};
 
 use crate::store::{
@@ -413,26 +441,69 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
 }
 
 impl<S: Store, P: Provisioner> Reconciler<S, P> {
-    /// TTL reaping: a running cluster with `ttl_seconds` set whose age
-    /// exceeds it is flipped to desired=Terminated; the next reconcile
-    /// pass tears it down. This is a **max-age** reaper, not idle-based —
-    /// idle detection needs job-activity tracking (deferred; documented in
-    /// REQUIREMENTS §3.1). Returns the ids reaped.
+    /// Lifecycle reaping (#100): a running cluster is flipped to
+    /// desired=Terminated — and torn down by the next reconcile pass — when
+    /// either lifecycle bound fires:
+    ///
+    /// * **max-age** — its age exceeds `ttl_seconds` (the absolute cap, reaped
+    ///   regardless of activity); or
+    /// * **activity-idle** — it has been idle (no job activity) for longer than
+    ///   `idle_timeout_secs`, so a busy cluster survives past the window while a
+    ///   genuinely unused one is released.
+    ///
+    /// Max-age is checked first, so a cluster that is *both* over its age cap
+    /// and idle is attributed to max-age. Each reap logs a `mobula::audit`
+    /// event whose `reason` field (`max_age` / `idle`) distinguishes the two.
+    /// Returns the ids reaped.
+    ///
+    /// The activity signal is the persisted job history (see the [module
+    /// docs](self)): the reap fetches it once per pass and buckets it by
+    /// cluster rather than querying per cluster.
     pub async fn reap_expired(&self, now: u64) -> Result<Vec<String>, ReconcileError> {
         let clusters = self.store.list().await?;
+        // Activity signal: bucket the job history by cluster id once per pass.
+        let jobs = self.store.list_jobs().await?;
+        let mut jobs_by_cluster: std::collections::HashMap<&str, Vec<&JobRecord>> =
+            std::collections::HashMap::new();
+        for j in &jobs {
+            jobs_by_cluster
+                .entry(j.cluster.as_str())
+                .or_default()
+                .push(j);
+        }
+        let no_jobs: Vec<&JobRecord> = Vec::new();
         let mut reaped = Vec::new();
-        for c in clusters {
-            if is_expired(&c, now) {
-                self.store
-                    .set_desired(&c.id, DesiredState::Terminated)
-                    .await?;
-                tracing::info!(
+        for c in &clusters {
+            let cjobs = jobs_by_cluster.get(c.id.0.as_str()).unwrap_or(&no_jobs);
+            let last_activity = last_activity_at(c.created_at, cjobs, now);
+            // Max-age is the absolute cap and takes precedence in attribution.
+            let reason = if is_expired(c, now) {
+                Some(ReapReason::MaxAge)
+            } else if is_idle_expired(c, last_activity, now) {
+                Some(ReapReason::Idle)
+            } else {
+                None
+            };
+            let Some(reason) = reason else { continue };
+            self.store
+                .set_desired(&c.id, DesiredState::Terminated)
+                .await?;
+            match reason {
+                ReapReason::MaxAge => tracing::info!(
                     target: "mobula::audit",
-                    cluster = %c.id, ttl = c.spec.ttl_seconds, age = now.saturating_sub(c.created_at),
+                    cluster = %c.id, reason = "max_age",
+                    ttl = c.spec.ttl_seconds, age = now.saturating_sub(c.created_at),
                     "cluster reaped (max-age TTL)"
-                );
-                reaped.push(c.id.0);
+                ),
+                ReapReason::Idle => tracing::info!(
+                    target: "mobula::audit",
+                    cluster = %c.id, reason = "idle",
+                    idle_timeout = c.spec.idle_timeout_secs,
+                    idle_for = now.saturating_sub(last_activity),
+                    "cluster reaped (activity-idle)"
+                ),
             }
+            reaped.push(c.id.0.clone());
         }
         Ok(reaped)
     }
@@ -555,13 +626,70 @@ fn is_purgeable_tombstone(c: &StoredCluster, now: u64, retention_secs: u64) -> b
             .is_some_and(|t| now.saturating_sub(t) >= retention_secs)
 }
 
-/// A running cluster is expired when it has a TTL and its age exceeds it.
+/// Why a cluster was reaped (#100), so the audit log distinguishes the two
+/// lifecycle bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapReason {
+    /// Absolute age exceeded `ttl_seconds`.
+    MaxAge,
+    /// Idle (no job activity) for longer than `idle_timeout_secs`.
+    Idle,
+}
+
+/// A running cluster is expired when it has a max-age TTL and its age exceeds
+/// it (the absolute cap — reaped regardless of activity).
 fn is_expired(c: &StoredCluster, now: u64) -> bool {
     matches!(c.desired, DesiredState::Running)
         && c.observed_state == Some(ClusterState::Running)
         && c.spec
             .ttl_seconds
             .is_some_and(|ttl| now.saturating_sub(c.created_at) >= ttl)
+}
+
+/// Ray job statuses that mean the job is finished. Compared case-insensitively
+/// and kept as a set here rather than in the wire type so a Ray status rename
+/// degrades to "treat as still-active" (fail-safe: an unknown status keeps the
+/// cluster alive) rather than mis-reaping.
+fn job_is_terminal(status: &str) -> bool {
+    matches!(
+        status.to_ascii_uppercase().as_str(),
+        "SUCCEEDED" | "FAILED" | "STOPPED"
+    )
+}
+
+/// The cluster's last-activity unix time, derived from its job history.
+///
+/// `created_at` is the floor: a freshly created cluster that has run no jobs is
+/// "active as of creation", so its idle window starts at birth (never epoch).
+/// A **non-terminal** (PENDING/RUNNING) job means the cluster is busy *right
+/// now*, so this returns `now` — such a cluster is never idle. Otherwise each
+/// finished job counts as activity through its end (`submitted_at +
+/// duration_secs`, falling back to `submitted_at` when the duration is
+/// unknown), and the latest such end wins.
+///
+/// `jobs` must already be filtered to this cluster's records.
+fn last_activity_at(created_at: u64, jobs: &[&JobRecord], now: u64) -> u64 {
+    let mut last = created_at;
+    for j in jobs {
+        if !job_is_terminal(&j.status) {
+            // Busy now — cannot be idle regardless of the other jobs' ages.
+            return now;
+        }
+        let end = j.submitted_at.saturating_add(j.duration_secs.unwrap_or(0));
+        last = last.max(end);
+    }
+    last
+}
+
+/// A running cluster is idle-expired when it has an `idle_timeout_secs` window
+/// and its time since last activity exceeds it (#100). Independent of the
+/// max-age cap; whichever bound fires first reaps the cluster.
+fn is_idle_expired(c: &StoredCluster, last_activity: u64, now: u64) -> bool {
+    matches!(c.desired, DesiredState::Running)
+        && c.observed_state == Some(ClusterState::Running)
+        && c.spec
+            .idle_timeout_secs
+            .is_some_and(|idle| now.saturating_sub(last_activity) >= idle)
 }
 
 /// Apply is needed when nothing is provisioned, when the backing cluster is
@@ -615,6 +743,7 @@ mod tests {
                 head_memory: "2Gi".into(),
                 worker_groups: vec![],
                 ttl_seconds: ttl,
+                idle_timeout_secs: None,
                 owner: None,
             },
             generation: 1,
@@ -627,6 +756,17 @@ mod tests {
             created_at,
             terminated_at: None,
         }
+    }
+
+    /// [`stored`] with an idle-reap window set (#100).
+    fn stored_idle(
+        idle: Option<u64>,
+        created_at: u64,
+        observed: Option<ClusterState>,
+    ) -> StoredCluster {
+        let mut c = stored(None, created_at, observed);
+        c.spec.idle_timeout_secs = idle;
+        c
     }
 
     #[test]
@@ -651,6 +791,174 @@ mod tests {
             &stored(Some(1), 0, Some(ClusterState::Provisioning)),
             999
         ));
+    }
+
+    fn job(cluster: &str, status: &str, submitted_at: u64, duration: Option<u64>) -> JobRecord {
+        JobRecord {
+            id: format!("{cluster}-{submitted_at}"),
+            cluster: cluster.into(),
+            submitter: "-".into(),
+            status: status.into(),
+            duration_secs: duration,
+            submitted_at,
+        }
+    }
+
+    #[test]
+    fn last_activity_derives_from_job_history() {
+        // No jobs → creation is the floor.
+        assert_eq!(last_activity_at(100, &[], 999), 100);
+        // A finished job's end (submitted + duration) beats creation.
+        let done = job("c", "SUCCEEDED", 200, Some(50));
+        assert_eq!(last_activity_at(100, &[&done], 999), 250);
+        // Terminal without a duration counts at submission time.
+        let done_nodur = job("c", "FAILED", 300, None);
+        assert_eq!(last_activity_at(100, &[&done_nodur], 999), 300);
+        // The latest finished job wins.
+        let older = job("c", "STOPPED", 150, Some(10));
+        assert_eq!(last_activity_at(100, &[&older, &done], 999), 250);
+        // A still-running job → busy *now*, regardless of other jobs' ages.
+        let running = job("c", "RUNNING", 120, None);
+        assert_eq!(last_activity_at(100, &[&older, &running], 999), 999);
+        // An unknown status is treated as still-active (fail-safe: keep alive).
+        let weird = job("c", "SOME_NEW_STATE", 120, None);
+        assert_eq!(last_activity_at(100, &[&weird], 999), 999);
+        // Status matching is case-insensitive.
+        assert!(job_is_terminal("succeeded") && job_is_terminal("Failed"));
+        assert!(!job_is_terminal("running"));
+    }
+
+    #[test]
+    fn is_idle_expired_matrix() {
+        // Idle window elapsed since last activity → idle-expired.
+        assert!(is_idle_expired(
+            &stored_idle(Some(60), 0, Some(ClusterState::Running)),
+            100, // last activity
+            200, // now: 100s idle >= 60
+        ));
+        // Within the idle window → not.
+        assert!(!is_idle_expired(
+            &stored_idle(Some(60), 0, Some(ClusterState::Running)),
+            100,
+            130, // 30s idle < 60
+        ));
+        // No idle window set → never (keeps old max-age-only behavior).
+        assert!(!is_idle_expired(
+            &stored_idle(None, 0, Some(ClusterState::Running)),
+            0,
+            999_999,
+        ));
+        // Not observed Running yet → don't idle-reap mid-provision.
+        assert!(!is_idle_expired(
+            &stored_idle(Some(1), 0, Some(ClusterState::Provisioning)),
+            0,
+            999,
+        ));
+    }
+
+    #[tokio::test]
+    async fn reap_idles_unused_but_spares_busy_clusters() {
+        use crate::store::memory::InMemoryStore;
+        let store = Arc::new(InMemoryStore::new());
+
+        // The store stamps `created_at` to wall-clock `now_unix()` on insert,
+        // so anchor the test's `now` far ahead of it (like reap_terminated's
+        // test) and set job times relative to that.
+        let base = now_unix();
+        let now = base + 10_000;
+
+        // Helper: insert a cluster observed Running with an idle window.
+        async fn insert_idle(store: &InMemoryStore, id: &str, idle: u64) {
+            let mut spec = stored(None, 0, None).spec;
+            spec.idle_timeout_secs = Some(idle);
+            let cid = ClusterId(id.into());
+            store.upsert_desired(&cid, spec).await.unwrap();
+            store
+                .record_observation(&cid, Some(ClusterState::Running), 1)
+                .await
+                .unwrap();
+        }
+
+        // `idle`: no jobs at all → idle since creation (~10_000s ago) → reaped.
+        insert_idle(&store, "idle", 60).await;
+        // `busy`: a currently-running job → active now → spared.
+        insert_idle(&store, "busy", 60).await;
+        store
+            .record_job(job("busy", "RUNNING", base, None))
+            .await
+            .unwrap();
+        // `recent`: a job that finished 10s ago → within the window → spared.
+        insert_idle(&store, "recent", 60).await;
+        store
+            .record_job(job("recent", "SUCCEEDED", now - 10, Some(0)))
+            .await
+            .unwrap();
+        // `stale`: a job that finished ~10_000s ago → past the window → reaped.
+        insert_idle(&store, "stale", 60).await;
+        store
+            .record_job(job("stale", "SUCCEEDED", base, Some(5)))
+            .await
+            .unwrap();
+
+        let rec = Reconciler::new(store.clone(), Arc::new(ErrProv));
+        let mut reaped = rec.reap_expired(now).await.unwrap();
+        reaped.sort();
+        assert_eq!(reaped, vec!["idle".to_string(), "stale".to_string()]);
+
+        // Reaped clusters were flipped to Terminated; spared ones stay Running.
+        for (id, want) in [
+            ("idle", DesiredState::Terminated),
+            ("stale", DesiredState::Terminated),
+            ("busy", DesiredState::Running),
+            ("recent", DesiredState::Running),
+        ] {
+            let c = store.get(&ClusterId(id.into())).await.unwrap().unwrap();
+            assert_eq!(c.desired, want, "cluster {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn max_age_caps_a_busy_cluster_and_idle_unset_keeps_old_behavior() {
+        use crate::store::memory::InMemoryStore;
+        let store = Arc::new(InMemoryStore::new());
+        let base = now_unix();
+        let now = base + 10_000;
+
+        // `capped`: over its max-age ttl AND actively running a job — max-age is
+        // the absolute cap, so it is reaped anyway. Its idle window (large) has
+        // NOT elapsed, proving the reap is attributed to max-age, not idle.
+        let mut capped_spec = stored(Some(60), 0, None).spec;
+        capped_spec.idle_timeout_secs = Some(1_000_000); // idle window not hit
+        let capped = ClusterId("capped".into());
+        store.upsert_desired(&capped, capped_spec).await.unwrap();
+        store
+            .record_observation(&capped, Some(ClusterState::Running), 1)
+            .await
+            .unwrap();
+        store
+            .record_job(job("capped", "RUNNING", base, None))
+            .await
+            .unwrap();
+
+        // `plain`: neither ttl nor idle set → never reaped (old behavior for a
+        // cluster with no lifecycle bounds).
+        let plain = ClusterId("plain".into());
+        store
+            .upsert_desired(&plain, stored(None, 0, None).spec)
+            .await
+            .unwrap();
+        store
+            .record_observation(&plain, Some(ClusterState::Running), 1)
+            .await
+            .unwrap();
+
+        let rec = Reconciler::new(store.clone(), Arc::new(ErrProv));
+        let reaped = rec.reap_expired(now).await.unwrap();
+        assert_eq!(reaped, vec!["capped".to_string()]);
+        assert_eq!(
+            store.get(&plain).await.unwrap().unwrap().desired,
+            DesiredState::Running,
+        );
     }
 
     #[test]
@@ -697,6 +1005,7 @@ mod tests {
             head_memory: "2Gi".into(),
             worker_groups: vec![],
             ttl_seconds: None,
+            idle_timeout_secs: None,
             owner: None,
         }
     }

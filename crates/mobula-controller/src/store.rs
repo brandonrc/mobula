@@ -106,6 +106,7 @@ pub(crate) fn spec_changed(a: &ClusterSpec, b: &ClusterSpec) -> bool {
         || a.head_cpu != b.head_cpu
         || a.head_memory != b.head_memory
         || a.ttl_seconds != b.ttl_seconds
+        || a.idle_timeout_secs != b.idle_timeout_secs
         || a.worker_groups.len() != b.worker_groups.len()
         || a.worker_groups.iter().zip(&b.worker_groups).any(|(x, y)| {
             x.name != y.name
