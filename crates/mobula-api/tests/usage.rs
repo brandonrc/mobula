@@ -45,6 +45,7 @@ fn priced_policy() -> mobula_api::clusters::PolicyConfig {
             ("memory".to_string(), 0.005),
         ]))),
         quotas: HashMap::new(),
+        budgets: HashMap::new(),
         gpu_default_sharing: Default::default(),
     }
 }
@@ -118,6 +119,104 @@ async fn usage_report_aggregates_step_changes_and_prices() {
         .expect("proj-b group");
     let b_cpu = b["resource_hours"]["cpu"].as_f64().unwrap();
     assert!((b_cpu - 2.0 * 2400.0 / 3600.0).abs() < 1e-9);
+}
+
+fn budget_policy(project: &str, cap_gpu: f64, window: u64) -> mobula_api::clusters::PolicyConfig {
+    use mobula_policy::Budget;
+    let mut budgets = HashMap::new();
+    budgets.insert(
+        project.to_string(),
+        Budget {
+            window_secs: window,
+            limits: BTreeMap::from([("nvidia.com/gpu".to_string(), cap_gpu)]),
+        },
+    );
+    mobula_api::clusters::PolicyConfig {
+        prices: None,
+        quotas: HashMap::new(),
+        budgets,
+        gpu_default_sharing: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn usage_report_surfaces_budget_consumed_and_remaining() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    // proj-a holds 2 GPUs from t=0; over the budget window [0,3600] that is
+    // 2 GPU-hours consumed. Cap 10 → remaining 8, not exhausted.
+    store
+        .record_usage_samples(&[sample(0, "proj-a", "gpu", "nvidia.com/gpu", 2.0)])
+        .await
+        .unwrap();
+    let app = authed_app_with_policy(&idp, store, budget_policy("proj-a", 10.0, 3600)).await;
+    let viewer = idp_token(&idp, &["/observers"]);
+
+    // to=3600 sets the budget window to [0,3600].
+    let res = app
+        .oneshot(get(
+            "/api/v1/usage?from=1&to=3600",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    let budgets = body["budgets"].as_array().expect("budgets array");
+    assert_eq!(budgets.len(), 1);
+    let b = &budgets[0];
+    assert_eq!(b["project"], "proj-a");
+    assert_eq!(b["window_secs"], 3600);
+    assert_eq!(b["limit"]["nvidia.com/gpu"].as_f64().unwrap(), 10.0);
+    assert!((b["consumed"]["nvidia.com/gpu"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+    assert!((b["remaining"]["nvidia.com/gpu"].as_f64().unwrap() - 8.0).abs() < 1e-9);
+    assert_eq!(b["exhausted"], false);
+}
+
+#[tokio::test]
+async fn usage_report_marks_exhausted_budget() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    // 2 GPU-hours consumed against a 1 GPU-hour cap → exhausted, remaining 0.
+    store
+        .record_usage_samples(&[sample(0, "proj-a", "gpu", "nvidia.com/gpu", 2.0)])
+        .await
+        .unwrap();
+    let app = authed_app_with_policy(&idp, store, budget_policy("proj-a", 1.0, 3600)).await;
+    let viewer = idp_token(&idp, &["/observers"]);
+
+    let res = app
+        .oneshot(get(
+            "/api/v1/usage?from=1&to=3600",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(res).await;
+    let b = &body["budgets"].as_array().unwrap()[0];
+    assert_eq!(b["exhausted"], true);
+    assert!((b["remaining"]["nvidia.com/gpu"].as_f64().unwrap() - 0.0).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn usage_report_has_no_budgets_when_none_configured() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    seed_samples(&store).await;
+    let app = authed_app_with_policy(&idp, store, priced_policy()).await;
+    let viewer = idp_token(&idp, &["/observers"]);
+    let res = app
+        .oneshot(get(
+            "/api/v1/usage?from=1200&to=3600",
+            "mobula.example.com",
+            Some(&viewer),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(res).await;
+    assert!(body["budgets"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

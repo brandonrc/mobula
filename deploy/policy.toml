@@ -7,11 +7,26 @@ cpu = 0.048               # $/core-hour
 memory = 0.006            # $/GiB-hour
 "nvidia.com/gpu" = 2.80   # $/GPU-hour (A100-ish)
 
+# CONCURRENT caps: the sum of a project's live clusters' max-demand may not
+# exceed these at any instant (admission returns 409).
 [quotas]
 dev = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
 ml-team = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
 genai = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
 research = { cpu = 500, memory = 1000, "nvidia.com/gpu" = 16 }
+
+# CUMULATIVE compute budgets (#77): resource-hours a project may consume over
+# a trailing window, distinct from the concurrent [quotas] above. Consumption
+# is integrated from the metering usage_samples; when a project's windowed
+# consumption has already reached a cap, new cluster creates 409. `window_secs`
+# is the trailing window (604800 = 7 days); every other key is resource-hours
+# (`cpu` = core-hours, `memory` = GiB-hours, `nvidia.com/gpu` = GPU-hours).
+# Section-replace via PUT /api/v1/settings/policy, like [quotas]/[prices].
+# Omit a project to leave it unbudgeted (unlimited cumulative consumption).
+# Remaining budget is surfaced on GET /api/v1/usage (`budgets[]`).
+[budgets]
+ml-team = { window_secs = 604800, "nvidia.com/gpu" = 500, cpu = 20000 }
+genai = { window_secs = 604800, "nvidia.com/gpu" = 300 }
 
 # GPU sharing isolation (docs/security-gpu-sharing.md). default_sharing is
 # the platform-wide fallback for pool specs that leave `gpu_sharing` unset:

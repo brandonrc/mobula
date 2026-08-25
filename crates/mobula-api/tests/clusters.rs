@@ -340,6 +340,7 @@ async fn quota_admission_rejects_over_limit_with_409() {
     let policy = PolicyConfig {
         prices: None,
         quotas,
+        budgets: Default::default(),
         gpu_default_sharing: Default::default(),
     };
     let app = authed_app_with_policy(&idp, store, policy).await;
@@ -395,6 +396,7 @@ async fn concurrent_creates_cannot_over_admit_quota() {
     let policy = PolicyConfig {
         prices: None,
         quotas,
+        budgets: Default::default(),
         gpu_default_sharing: Default::default(),
     };
     let app = authed_app_with_policy(&idp, store, policy).await;
@@ -438,6 +440,185 @@ async fn concurrent_creates_cannot_over_admit_quota() {
         running, 1,
         "quota over-admission left extra clusters running"
     );
+}
+
+/// A time-windowed budget (#77): `demo` capped at 100 GPU-hours over the
+/// trailing hour. Seeds usage samples so the caller can drive consumption
+/// above or below the cap.
+fn gpu_budget_policy(cap_gpu_hours: f64, window_secs: u64) -> mobula_api::clusters::PolicyConfig {
+    use mobula_api::clusters::PolicyConfig;
+    use mobula_policy::Budget;
+    let mut budgets = std::collections::HashMap::new();
+    budgets.insert(
+        "demo".to_string(),
+        Budget {
+            window_secs,
+            limits: std::collections::BTreeMap::from([(
+                "nvidia.com/gpu".to_string(),
+                cap_gpu_hours,
+            )]),
+        },
+    );
+    PolicyConfig {
+        prices: None,
+        quotas: Default::default(),
+        budgets,
+        gpu_default_sharing: Default::default(),
+    }
+}
+
+/// Seed one GPU usage sample for project `demo` at the window's start so it
+/// holds (carry-in) across the whole trailing window: `gpu` GPU-hours over a
+/// `window`-second window.
+async fn seed_gpu_hours(store: &InMemoryStore, gpu: f64, window: u64) {
+    use mobula_controller::{now_unix, UsageSample, UsageSource};
+    store
+        .record_usage_samples(&[UsageSample {
+            ts: now_unix().saturating_sub(window),
+            project: "demo".into(),
+            pool: "gpu".into(),
+            resource: "nvidia.com/gpu".into(),
+            quantity: gpu,
+            source: UsageSource::ObservedSpec,
+        }])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn budget_admission_rejects_when_window_consumption_over_cap() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    // 100 GPU-hour / 1h budget; seed 200 GPU-hours consumed → over cap.
+    seed_gpu_hours(&store, 200.0, 3600).await;
+    let app = authed_app_with_policy(&idp, store.clone(), gpu_budget_policy(100.0, 3600)).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_sized("a", "1", 1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "over-budget create must 409"
+    );
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("budget exceeded"),
+        "409 body should explain the budget: {text}"
+    );
+}
+
+#[tokio::test]
+async fn budget_admission_admits_when_window_consumption_under_cap() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    // 100 GPU-hour / 1h budget; only 10 GPU-hours consumed → under cap.
+    seed_gpu_hours(&store, 10.0, 3600).await;
+    let app = authed_app_with_policy(&idp, store.clone(), gpu_budget_policy(100.0, 3600)).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_sized("a", "1", 1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::CREATED,
+        "under-budget create must succeed"
+    );
+}
+
+#[tokio::test]
+async fn no_budget_configured_is_back_compat_unlimited() {
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    // Heavy historical consumption, but NO budget configured for demo.
+    seed_gpu_hours(&store, 10_000.0, 3600).await;
+    use mobula_api::clusters::PolicyConfig;
+    let app = authed_app_with_policy(&idp, store.clone(), PolicyConfig::default()).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_sized("a", "1", 1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::CREATED,
+        "no budget = unlimited, unchanged from before #77"
+    );
+}
+
+#[tokio::test]
+async fn quota_and_budget_both_enforced_budget_denies_when_quota_fits() {
+    use mobula_api::clusters::PolicyConfig;
+    use mobula_policy::{Budget, ResourceMap};
+
+    let idp = spawn_idp().await;
+    let store = Arc::new(InMemoryStore::new());
+    // Generous CPU quota (100) that the tiny cluster easily fits, but a GPU
+    // budget already exhausted → budget must still 409.
+    seed_gpu_hours(&store, 500.0, 3600).await;
+    let mut quotas = std::collections::HashMap::new();
+    quotas.insert(
+        "demo".to_string(),
+        ResourceMap::from_iter([("cpu".to_string(), 100.0), ("memory".to_string(), 1000.0)]),
+    );
+    let mut budgets = std::collections::HashMap::new();
+    budgets.insert(
+        "demo".to_string(),
+        Budget {
+            window_secs: 3600,
+            limits: std::collections::BTreeMap::from([("nvidia.com/gpu".to_string(), 100.0)]),
+        },
+    );
+    let policy = PolicyConfig {
+        prices: None,
+        quotas,
+        budgets,
+        gpu_default_sharing: Default::default(),
+    };
+    let app = authed_app_with_policy(&idp, store.clone(), policy).await;
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    let res = app
+        .oneshot(post_json(
+            "/api/v1/clusters",
+            "mobula.example.com",
+            &admin,
+            create_body_sized("a", "1", 1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "quota fits but budget is exhausted → 409"
+    );
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("budget exceeded"));
 }
 
 #[tokio::test]

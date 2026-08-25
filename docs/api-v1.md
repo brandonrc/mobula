@@ -1124,8 +1124,8 @@ Consumption **reporting**, so the permission is `Read` on `Target::Cluster`
 
 - **Query:** `project`, `pool` (filters), `from`, `to` (unix seconds;
   defaults: `to` = now, `from` = `to − 86400`). `from < to` required → 400.
-- **Response 200:** `UsageReport` — `{ from, to, groups: [UsageGroup] }`,
-  one group per (project, pool):
+- **Response 200:** `UsageReport` — `{ from, to, groups: [UsageGroup],
+  budgets: [BudgetStatus] }`, one group per (project, pool):
 
 ```json
 {
@@ -1135,6 +1135,15 @@ Consumption **reporting**, so the permission is `Read` on `Target::Cluster`
       "project": "proj-a", "pool": "gpu-pool",
       "resource_hours": { "cpu": 4.667, "memory": 21.33 },
       "cost_usd": 0.2933
+    }
+  ],
+  "budgets": [
+    {
+      "project": "proj-a", "window_secs": 604800,
+      "limit": { "nvidia.com/gpu": 100 },
+      "consumed": { "nvidia.com/gpu": 42.5 },
+      "remaining": { "nvidia.com/gpu": 57.5 },
+      "exhausted": false
     }
   ]
 }
@@ -1148,6 +1157,13 @@ Consumption **reporting**, so the permission is `Read` on `Target::Cluster`
 - `project: ""` marks the pool-level aggregate row (Kueue path only); it
   OVERLAPS the per-project rows — never sum across project boundaries.
   `pool: ""` means the project has no allocation.
+- `budgets` (#77): one entry per configured `[budgets]` project (filtered to
+  `project` when the query sets it; empty when none configured). `consumed`
+  is windowed resource-hours over the budget's **own** trailing
+  `window_secs` ending at the report's `to` (independent of `from`);
+  `remaining` = `limit − consumed` floored at 0; `exhausted` is true once
+  consumption has reached the cap on any capped resource — a create for that
+  project would then 409.
 
 #### `GET /api/v1/metrics`
 
@@ -1317,21 +1333,40 @@ immediately, with no restart.
   {
     "prices": { "cpu": 0.048, "memory": 0.005, "nvidia.com/gpu": 2.50 } ,
     "quotas": { "ml-team": { "cpu": 500, "memory": 1000 } },
+    "budgets": { "ml-team": { "window_secs": 604800, "nvidia.com/gpu": 500 } },
     "source": "file",
     "editable": true
   }
   ```
   `prices` is `null` when no price sheet is configured; `quotas` is `{}`
-  when no project has a limit. `source` is `"file"` (the untouched
-  `--policy` boot seed), `"store"` (edited via PUT), or `"none"` (no policy
-  configured at all — `prices: null`, `quotas: {}`).
-- `PUT /api/v1/settings/policy` `{ prices?, quotas? }` → 200 with the
-  policy after the update (`source` is now `"store"`). **Section-replace**
+  when no project has a limit; `budgets` is `{}` when no project has a
+  time-windowed budget. `source` is `"file"` (the untouched `--policy` boot
+  seed), `"store"` (edited via PUT), or `"none"` (no policy configured at
+  all — `prices: null`, `quotas: {}`, `budgets: {}`).
+- `PUT /api/v1/settings/policy` `{ prices?, quotas?, budgets? }` → 200 with
+  the policy after the update (`source` is now `"store"`). **Section-replace**
   semantics: a present key replaces that whole section — `prices: null`
-  clears the price sheet, `quotas: {}` clears all quotas; an absent key
-  leaves that section untouched. Prices and quota values must be
-  non-negative finite numbers → 400 with a message naming the key. Every
-  accepted edit emits an `update_policy` audit event (§5.9).
+  clears the price sheet, `quotas: {}` clears all quotas, `budgets: {}`
+  clears all budgets; an absent key leaves that section untouched. Prices,
+  quota, and budget resource-hour values must be non-negative finite numbers
+  and each budget's `window_secs` must be `> 0` → 400 with a message naming
+  the key/project. Every accepted edit emits an `update_policy` audit event
+  (§5.9).
+
+**`[budgets]` — time-windowed compute budgets (#77).** Distinct from
+`[quotas]`, which cap **concurrent** live demand: a budget caps **cumulative**
+consumption over a trailing window. Each budget is `{ window_secs, <resource>:
+<resource-hours>… }` — `window_secs` is the trailing window (e.g. 604800 = 7
+days) and every other key is resource-hours allowed over it (`cpu` =
+core-hours, `memory` = GiB-hours, `nvidia.com/gpu` = GPU-hours; any extended
+K8s resource name is valid). Consumption is derived on demand from the
+metering `usage_samples` (no ledger, no migration). **Enforcement model
+(v1):** `POST /api/v1/clusters` denies with 409 when the project's
+*already-consumed* windowed usage has reached the cap on any capped resource;
+it does **not** project the new cluster's future consumption (a cluster's
+lifetime is unknown at admission). Both checks compose — when a project has
+both a quota and a budget, a create must pass both. Remaining budget is
+surfaced on `GET /api/v1/usage` (`budgets[]`).
 
 Concurrent PUTs are last-writer-wins (v1; multi-replica compare-and-swap is
 a follow-up, same tracking as the quota-admission transaction note in

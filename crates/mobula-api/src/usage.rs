@@ -50,6 +50,37 @@ fn store_err(e: mobula_controller::StoreError) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
 }
 
+/// A project's cumulative windowed consumption in resource-hours (#77),
+/// computed from the metering `usage_samples` the [`mobula_controller::Metering`]
+/// loop persists. Samples are read from `0` (not `from`) so a reading before
+/// the window sets the level entering it (carry-in — see
+/// [`mobula_policy::usage::resource_hours`]), then grouped by `(pool,
+/// resource)` and integrated over `[from, to]`.
+///
+/// Shared by budget admission (`clusters.rs`) and the usage report so the two
+/// never drift. Pool-aggregate rows (`project = ""`) are excluded by the
+/// `Some(project)` filter, so there is no double counting.
+pub(crate) async fn windowed_consumption(
+    store: &Arc<dyn Store>,
+    project: &str,
+    from: u64,
+    to: u64,
+) -> Result<ResourceMap, mobula_controller::StoreError> {
+    let samples = store.usage_samples(Some(project), None, 0, to).await?;
+    let mut by_pool_resource: BTreeMap<(String, String), Vec<(u64, f64)>> = BTreeMap::new();
+    for s in samples {
+        by_pool_resource
+            .entry((s.pool, s.resource))
+            .or_default()
+            .push((s.ts, s.quantity));
+    }
+    Ok(mobula_policy::usage::windowed_resource_hours(
+        &by_pool_resource,
+        from,
+        to,
+    ))
+}
+
 /// Query for `GET /api/v1/usage`. `to` defaults to now, `from` to
 /// `to - 86400` (last 24h).
 #[derive(Deserialize, IntoParams)]
@@ -77,12 +108,37 @@ pub struct UsageGroup {
     pub cost_usd: Option<f64>,
 }
 
+/// A configured project's time-windowed budget status (#77): the cap, what
+/// has been consumed over the trailing window (ending at the report's `to`),
+/// and what remains. Distinct from `UsageGroup` — this reflects the
+/// `[budgets]` policy, not the raw sample roll-up.
+#[derive(Serialize, ToSchema)]
+pub struct BudgetStatus {
+    pub project: String,
+    /// Trailing window length in seconds.
+    pub window_secs: u64,
+    /// resource → resource-hours allowed over the window.
+    pub limit: BTreeMap<String, f64>,
+    /// resource → resource-hours consumed over the trailing window.
+    pub consumed: BTreeMap<String, f64>,
+    /// resource → resource-hours remaining (`limit − consumed`, floored at 0)
+    /// for each capped resource.
+    pub remaining: BTreeMap<String, f64>,
+    /// True once consumption has reached or passed the cap on any capped
+    /// resource — a create for this project would be 409'd.
+    pub exhausted: bool,
+}
+
 /// Response of `GET /api/v1/usage`.
 #[derive(Serialize, ToSchema)]
 pub struct UsageReport {
     pub from: u64,
     pub to: u64,
     pub groups: Vec<UsageGroup>,
+    /// Time-windowed budget status per configured project (#77). Empty when
+    /// no `[budgets]` are configured. When the report is filtered to one
+    /// `project`, only that project's budget appears.
+    pub budgets: Vec<BudgetStatus>,
 }
 
 #[utoipa::path(
@@ -167,7 +223,51 @@ async fn usage_report(
         })
         .collect();
 
-    Json(UsageReport { from, to, groups }).into_response()
+    // Budget status (#77): for each configured project (filtered to
+    // `q.project` when set), compute consumption over the budget's OWN
+    // trailing window ending at `to` — independent of the report's from/to,
+    // which the client controls freely.
+    let mut budgets = Vec::new();
+    let mut budget_projects: Vec<_> = policy.budgets.keys().cloned().collect();
+    budget_projects.sort();
+    for bp in budget_projects {
+        if let Some(filter) = q.project.as_deref() {
+            if filter != bp {
+                continue;
+            }
+        }
+        let budget = &policy.budgets[&bp];
+        let b_from = to.saturating_sub(budget.window_secs);
+        let consumed = match windowed_consumption(&st.store, &bp, b_from, to).await {
+            Ok(c) => c,
+            Err(e) => return store_err(e),
+        };
+        let remaining: BTreeMap<String, f64> = budget
+            .limits
+            .iter()
+            .map(|(r, cap)| {
+                let used = consumed.0.get(r).copied().unwrap_or(0.0);
+                (r.clone(), (cap - used).max(0.0))
+            })
+            .collect();
+        let exhausted = mobula_policy::admit_budget(&bp, budget, &consumed).is_err();
+        budgets.push(BudgetStatus {
+            project: bp,
+            window_secs: budget.window_secs,
+            limit: budget.limits.clone(),
+            consumed: consumed.0,
+            remaining,
+            exhausted,
+        });
+    }
+
+    Json(UsageReport {
+        from,
+        to,
+        groups,
+        budgets,
+    })
+    .into_response()
 }
 
 /// Escape a Prometheus label value (`\`, `"`, newline).
