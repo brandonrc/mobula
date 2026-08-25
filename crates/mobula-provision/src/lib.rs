@@ -108,8 +108,32 @@ pub trait Provisioner: Send + Sync {
         Ok(())
     }
 
-    /// Begin teardown. Idempotent; succeeds if already gone.
+    /// Begin teardown. Idempotent; succeeds if already gone. This also
+    /// removes the cluster's per-cluster NetworkPolicy (see
+    /// [`Provisioner::reap_network_policies`]) so the happy path leaves no
+    /// orphan behind.
     async fn terminate(&self, id: &ClusterId) -> Result<(), ProvisionError>;
+
+    /// Delete the per-cluster NetworkPolicy(ies) for `id` (#122): the
+    /// per-owner intra-cluster allow policy the backend created on `apply`
+    /// (`mobula-cluster-<id>`, see
+    /// [`kuberay::cluster_allow_network_policy`] and its Dask twin — one
+    /// policy per cluster that carries both the intra-cluster allow and the
+    /// tier-2 per-owner client pin). Idempotent: already-gone is success, so
+    /// a teardown that races the CR's disappearance — or retries after a
+    /// transient failure — still converges to no orphaned netpol.
+    /// Engine-agnostic: the policy name is identical for every engine.
+    ///
+    /// [`Provisioner::terminate`] already calls this on the happy path; the
+    /// reconciler also calls it when it purges a terminated tombstone
+    /// (`reap_terminated`), so a netpol that outlived its CR — the CR vanished
+    /// before `terminate` fired, leaving the reconciler nothing to tear down —
+    /// is still reaped instead of accumulating (#122). Default no-op:
+    /// backends without a per-cluster netpol (demo) have nothing to reap.
+    async fn reap_network_policies(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        let _ = id;
+        Ok(())
+    }
 
     /// Suspend the cluster: release its compute while keeping spec and
     /// state (#51). Idempotent; succeeds if already suspended. Like

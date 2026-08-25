@@ -518,9 +518,27 @@ impl<S: Store, P: Provisioner> Reconciler<S, P> {
         let clusters = self.store.list().await?;
         let mut removed = Vec::new();
         for c in clusters {
-            if is_purgeable_tombstone(&c, now, self.terminated_retention_secs)
-                && self.store.remove_cluster(&c.id).await?
-            {
+            if !is_purgeable_tombstone(&c, now, self.terminated_retention_secs) {
+                continue;
+            }
+            // #122: reap any per-cluster NetworkPolicy that outlived the CR
+            // before dropping the row. `terminate` deletes it on the happy
+            // path (cluster still observed up when we tore it down); this is
+            // the backstop for a netpol whose CR vanished before `terminate`
+            // fired — the reconciler's Terminated arm then never actuated, so
+            // the policy would otherwise accumulate. Idempotent (already-gone
+            // = ok). If it errors, leave the row so the next pass retries
+            // rather than purging the last record that this netpol is owed a
+            // reap.
+            if let Err(e) = self.provisioner.reap_network_policies(&c.id).await {
+                tracing::warn!(
+                    target: "mobula::audit",
+                    cluster = %c.id, error = %e,
+                    "failed to reap per-cluster NetworkPolicy on tombstone purge; deferring row removal"
+                );
+                continue;
+            }
+            if self.store.remove_cluster(&c.id).await? {
                 tracing::info!(
                     target: "mobula::audit",
                     cluster = %c.id,

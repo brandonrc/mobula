@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use mobula_controller::{
     Action, DesiredState, InMemoryStore, RateLimits, ReconcileError, Reconciler, SqliteStore, Store,
 };
-use mobula_core::{ClusterId, ClusterSpec, ClusterState, WorkerGroup};
+use mobula_core::{ClusterId, ClusterSpec, ClusterState, Engine, WorkerGroup};
 use mobula_provision::{ApplyResponse, ObservedCluster, ProvisionError, Provisioner};
 
 #[derive(Default)]
@@ -36,6 +36,15 @@ struct MockProvisioner {
     terminate_calls: Mutex<Vec<String>>,
     /// Ids the engine asked to suspend (#51), in call order.
     suspend_calls: Mutex<Vec<String>>,
+    /// Per-cluster NetworkPolicies that currently "exist" in the backend
+    /// (#122). `apply` creates one; `terminate` and `reap_network_policies`
+    /// delete it. Tests assert accumulation is prevented.
+    netpols: Mutex<std::collections::HashSet<String>>,
+    /// Every id passed to `reap_network_policies`, in call order (#122).
+    netpol_reap_calls: Mutex<Vec<String>>,
+    /// If set to a cluster id, `reap_network_policies` for that id returns a
+    /// backend error — to exercise the reconciler's defer-on-failure path.
+    fail_netpol_reap: Mutex<Option<String>>,
 }
 
 impl MockProvisioner {
@@ -53,6 +62,20 @@ impl MockProvisioner {
     }
     fn apply_count(&self) -> usize {
         self.apply_keys.lock().unwrap().len()
+    }
+    /// Register a per-cluster netpol as existing (for reap tests that don't go
+    /// through `apply`, e.g. a pre-existing tombstone).
+    fn add_netpol(&self, id: &str) {
+        self.netpols.lock().unwrap().insert(id.into());
+    }
+    fn netpol_exists(&self, id: &str) -> bool {
+        self.netpols.lock().unwrap().contains(id)
+    }
+    fn netpol_reap_calls(&self) -> Vec<String> {
+        self.netpol_reap_calls.lock().unwrap().clone()
+    }
+    fn set_fail_netpol_reap(&self, id: Option<&str>) {
+        *self.fail_netpol_reap.lock().unwrap() = id.map(Into::into);
     }
     fn distinct_apply_keys(&self) -> usize {
         let v = self.apply_keys.lock().unwrap();
@@ -82,6 +105,8 @@ impl Provisioner for MockProvisioner {
             .unwrap_or(ClusterState::Running);
         self.state.lock().unwrap().insert(id.0.clone(), result);
         self.gen.lock().unwrap().insert(id.0.clone(), generation);
+        // An apply creates the cluster's per-cluster allow netpol (#122).
+        self.netpols.lock().unwrap().insert(id.0.clone());
         // A freshly-applied cluster reports the fingerprint of what we
         // applied, so it never looks drifted until something edits it.
         self.fp.lock().unwrap().insert(
@@ -100,6 +125,20 @@ impl Provisioner for MockProvisioner {
             .lock()
             .unwrap()
             .insert(id.0.clone(), ClusterState::Terminated);
+        // The happy path takes the per-cluster netpol with the cluster (#122).
+        self.netpols.lock().unwrap().remove(&id.0);
+        Ok(())
+    }
+
+    async fn reap_network_policies(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        self.netpol_reap_calls.lock().unwrap().push(id.0.clone());
+        if self.fail_netpol_reap.lock().unwrap().as_deref() == Some(id.0.as_str()) {
+            return Err(ProvisionError::Backend(
+                "injected netpol reap failure".into(),
+            ));
+        }
+        // Idempotent: deleting an absent netpol is success.
+        self.netpols.lock().unwrap().remove(&id.0);
         Ok(())
     }
 
@@ -390,6 +429,151 @@ async fn reaper_terminates_expired_cluster() {
     let r = rec.reconcile_all().await;
     assert_eq!(r[0].1.as_ref().unwrap(), &Action::Terminated);
     let _ = prov;
+}
+
+/// #122: on the happy teardown path — the cluster is still observed up when it
+/// is reaped — `terminate` takes the per-cluster NetworkPolicy with it, so the
+/// netpol never leaks. Exercises the max-age reap route; explicit DELETE and
+/// idle reap converge through the same Terminated arm.
+#[tokio::test]
+async fn terminate_reaps_per_cluster_netpol_on_teardown() {
+    let (store, prov, rec) = setup();
+    let id = ClusterId("demo".into());
+    let mut s = spec("demo", 1);
+    s.ttl_seconds = Some(0); // expires as soon as it is observed Running
+    store.upsert_desired(&id, s).await.unwrap();
+
+    // Provision → the cluster and its per-cluster netpol exist.
+    rec.reconcile_all().await;
+    assert!(
+        prov.netpol_exists("demo"),
+        "apply creates the per-cluster netpol"
+    );
+
+    // Reap (max-age) flips desired → Terminated; the next reconcile tears the
+    // cluster down and the netpol goes with it.
+    assert_eq!(rec.reap_expired(1).await.unwrap(), vec!["demo".to_string()]);
+    let r = rec.reconcile_all().await;
+    assert_eq!(r[0].1.as_ref().unwrap(), &Action::Terminated);
+    assert!(
+        !prov.netpol_exists("demo"),
+        "terminate must delete the per-cluster netpol"
+    );
+}
+
+/// #122 core fix: a netpol whose CR vanished before `terminate` could fire (so
+/// the reconciler's Terminated arm never actuated) would otherwise accumulate.
+/// The tombstone-purge sweep reaps it as a backstop — and leaves other
+/// clusters' netpols untouched.
+#[tokio::test]
+async fn reap_terminated_backstops_orphan_netpol_and_spares_others() {
+    let store = Arc::new(InMemoryStore::new());
+    let prov = Arc::new(MockProvisioner::default());
+    // Retention 0: a terminated + observed-gone row is immediately purgeable.
+    let rec = Reconciler::new(store.clone(), prov.clone()).with_terminated_retention(0);
+
+    // `orphan`: terminated, observed gone (never brought up), but its netpol
+    // still lingers — the exact leak #122 describes. Engine=Dask to show the
+    // backstop is engine-agnostic (the reconciler drives it identically for
+    // both engines; the per-cluster netpol name is shared).
+    let orphan = ClusterId("orphan".into());
+    let mut orphan_spec = spec("orphan", 1);
+    orphan_spec.engine = Engine::Dask;
+    store.upsert_desired(&orphan, orphan_spec).await.unwrap();
+    store
+        .set_desired(&orphan, DesiredState::Terminated)
+        .await
+        .unwrap();
+    prov.add_netpol("orphan");
+
+    // `live`: a healthy running cluster — its row and netpol must survive.
+    let live = ClusterId("live".into());
+    store.upsert_desired(&live, spec("live", 1)).await.unwrap();
+    prov.add_netpol("live");
+
+    let mut removed = rec.reap_terminated(u64::MAX / 2).await.unwrap();
+    removed.sort();
+    assert_eq!(removed, vec!["orphan".to_string()]);
+    assert!(
+        prov.netpol_reap_calls().contains(&"orphan".to_string()),
+        "the orphan's netpol must be reaped on purge"
+    );
+    assert!(!prov.netpol_exists("orphan"), "orphan netpol is gone");
+    assert!(
+        store.get(&orphan).await.unwrap().is_none(),
+        "orphan row purged"
+    );
+
+    // The live cluster is untouched: still present, netpol intact, never reaped.
+    assert!(
+        prov.netpol_exists("live"),
+        "other clusters' netpols untouched"
+    );
+    assert!(
+        store.get(&live).await.unwrap().is_some(),
+        "live row retained"
+    );
+    assert!(!prov.netpol_reap_calls().contains(&"live".to_string()));
+}
+
+/// #122: reaping a tombstone whose netpol is already gone is not an error
+/// (idempotent) — the row is still purged cleanly.
+#[tokio::test]
+async fn reap_terminated_missing_netpol_is_not_an_error() {
+    let store = Arc::new(InMemoryStore::new());
+    let prov = Arc::new(MockProvisioner::default());
+    let rec = Reconciler::new(store.clone(), prov.clone()).with_terminated_retention(0);
+
+    let id = ClusterId("gone".into());
+    store.upsert_desired(&id, spec("gone", 1)).await.unwrap();
+    store
+        .set_desired(&id, DesiredState::Terminated)
+        .await
+        .unwrap();
+    // No netpol registered — already gone.
+
+    let removed = rec.reap_terminated(u64::MAX / 2).await.unwrap();
+    assert_eq!(removed, vec!["gone".to_string()]);
+    assert!(prov.netpol_reap_calls().contains(&"gone".to_string()));
+    assert!(store.get(&id).await.unwrap().is_none());
+}
+
+/// #122: if reaping the netpol fails, the tombstone row is NOT purged — it is
+/// left so a later pass retries, rather than losing the last record that the
+/// netpol is owed a reap. A subsequent successful pass then reaps and purges.
+#[tokio::test]
+async fn reap_terminated_defers_row_removal_when_netpol_reap_fails() {
+    let store = Arc::new(InMemoryStore::new());
+    let prov = Arc::new(MockProvisioner::default());
+    let rec = Reconciler::new(store.clone(), prov.clone()).with_terminated_retention(0);
+
+    let id = ClusterId("stuck".into());
+    store.upsert_desired(&id, spec("stuck", 1)).await.unwrap();
+    store
+        .set_desired(&id, DesiredState::Terminated)
+        .await
+        .unwrap();
+    prov.add_netpol("stuck");
+    prov.set_fail_netpol_reap(Some("stuck"));
+
+    // Netpol reap fails → row deferred, netpol still present.
+    let removed = rec.reap_terminated(u64::MAX / 2).await.unwrap();
+    assert!(
+        removed.is_empty(),
+        "row must not be purged while its netpol reap fails"
+    );
+    assert!(
+        store.get(&id).await.unwrap().is_some(),
+        "row retained for retry"
+    );
+    assert!(prov.netpol_exists("stuck"));
+
+    // The failure clears → the next pass reaps the netpol and purges the row.
+    prov.set_fail_netpol_reap(None);
+    let removed = rec.reap_terminated(u64::MAX / 2).await.unwrap();
+    assert_eq!(removed, vec!["stuck".to_string()]);
+    assert!(!prov.netpol_exists("stuck"));
+    assert!(store.get(&id).await.unwrap().is_none());
 }
 
 #[tokio::test]

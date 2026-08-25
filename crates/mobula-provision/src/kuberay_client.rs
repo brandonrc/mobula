@@ -418,6 +418,13 @@ impl Provisioner for KubeRayProvisioner {
         self.delete_cluster_allow(&id.0).await
     }
 
+    async fn reap_network_policies(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        // #122: the per-cluster allow policy backstop — same idempotent delete
+        // `terminate` runs, exposed so the reconciler can reap a netpol whose
+        // RayCluster CR already vanished (terminate would then never fire).
+        self.delete_cluster_allow(&id.0).await
+    }
+
     async fn suspend(&self, id: &ClusterId) -> Result<(), ProvisionError> {
         self.set_suspend(id, true).await
     }

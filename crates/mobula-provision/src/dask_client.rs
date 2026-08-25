@@ -244,6 +244,14 @@ impl Provisioner for DaskProvisioner {
         self.delete_cluster_allow(&id.0).await
     }
 
+    async fn reap_network_policies(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        // #122: engine-agnostic backstop — the Dask per-cluster allow policy
+        // shares the `mobula-cluster-<id>` name with the Ray one, so this is
+        // the same idempotent delete `terminate` runs, callable when the
+        // DaskCluster CR is already gone.
+        self.delete_cluster_allow(&id.0).await
+    }
+
     async fn suspend(&self, id: &ClusterId) -> Result<(), ProvisionError> {
         // The DaskCluster CRD has no suspend field; the spike does not
         // suspend Dask clusters (documented gap). No-op so the reconciler
