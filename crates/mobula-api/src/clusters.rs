@@ -23,9 +23,8 @@ use mobula_policy::{admit, cluster_demand, PriceSheet, ResourceMap};
 use std::collections::HashMap;
 
 use crate::audit::emit;
-use crate::auth_layer::{authorize, authorize_scoped, StoreAssignments};
+use crate::auth_layer::{authorize, authorize_scoped, effective_assignments};
 use crate::settings::{config_from_stored, effective_policy};
-use mobula_auth::AssignmentSource;
 
 /// Governance config for the cluster API (Phase 4): an optional price
 /// sheet for cost estimates, and per-project quota limits for admission.
@@ -165,9 +164,11 @@ pub(crate) async fn read_scope(
         // Global admin always sees all, scoped assignments or not.
         Some(i) if i.roles.contains(&Role::Admin) => (Vec::new(), None),
         Some(i) => {
-            let assignments = StoreAssignments(store.as_ref())
-                .assignments_for(&i.subject)
-                .await;
+            // Effective assignments = group-derived project roles (#103) +
+            // stored grants matched by sub OR preferred_username (#88). A
+            // caller with only a group-derived project role is narrowed to
+            // (and can see) exactly that project's clusters.
+            let assignments = effective_assignments(Some(store), i).await;
             let projects: Vec<String> = assignments
                 .iter()
                 .filter_map(|(_, scope)| scope.strip_prefix("project:").map(String::from))

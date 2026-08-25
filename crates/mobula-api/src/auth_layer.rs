@@ -262,6 +262,53 @@ impl AssignmentSource for StoreAssignments<'_> {
     }
 }
 
+impl StoreAssignments<'_> {
+    /// Stored assignments matched against the identity's principals (#88).
+    ///
+    /// Assignments are keyed by the string an admin typed at `PUT
+    /// /access/assignments/{principal}`, which is commonly the human username,
+    /// NOT the opaque Keycloak `sub` UUID the token carries. Looking up by
+    /// `sub` alone silently never matched a username grant. Match against BOTH
+    /// the `sub` and the `preferred_username` so human-friendly grants take
+    /// effect. Does NOT include group-derived project roles (#103) — those
+    /// live on `Identity::project_roles` and are folded in by the callers.
+    pub async fn for_identity(&self, id: &Identity) -> Vec<(Role, String)> {
+        let mut out = self.assignments_for(&id.subject).await;
+        // The username is a distinct match key only when present and different
+        // from the subject (local auth has subject == username).
+        if let Some(username) = id.username.as_deref() {
+            if username != id.subject {
+                for a in self.assignments_for(username).await {
+                    if !out.contains(&a) {
+                        out.push(a);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The effective scoped assignments for an identity: stored grants matched by
+/// `sub` OR `preferred_username` (#88), combined with the group-derived project
+/// roles carried on the identity (#103). This is the single place both fixes
+/// meet — every scoped authorization and read-scoping check flows through it.
+/// Works with or without a store (group-derived grants apply either way).
+pub async fn effective_assignments(
+    store: Option<&Arc<dyn Store>>,
+    id: &Identity,
+) -> Vec<(Role, String)> {
+    let mut out = id.project_roles.clone();
+    if let Some(store) = store {
+        for a in StoreAssignments(store.as_ref()).for_identity(id).await {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
 /// Scoped variant of [`authorize`] (#49): grants when the identity's global
 /// roles suffice (fast path, no store read) OR when a stored assignment
 /// covers `project` (`"*"` or `"project:<project>"`). Additive-only —
@@ -278,15 +325,10 @@ pub async fn authorize_scoped(
         None => None,
         Some(id) if id.permits(action, target) => None,
         Some(id) => {
-            let assignments = match store {
-                Some(store) => {
-                    StoreAssignments(store.as_ref())
-                        .assignments_for(&id.subject)
-                        .await
-                }
-                // No store: nowhere to look up assignments — flat mapping only.
-                None => Vec::new(),
-            };
+            // Group-derived project roles (#103) + stored grants matched by
+            // sub OR preferred_username (#88); flat mapping only when neither
+            // applies.
+            let assignments = effective_assignments(store, id).await;
             if id.permits_scoped(action, target, &assignments, project) {
                 return None;
             }

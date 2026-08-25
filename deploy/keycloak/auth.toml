@@ -13,3 +13,15 @@ operator = ["/sre"]
 developer = ["/ml-eng"]
 viewer = ["/observers"]
 auditor = ["/compliance"]
+
+# #103: group->project-role automation (self-service). A caller in a matching
+# group automatically holds the mapped role scoped to project:<group> (after
+# strip_prefix), with NO manual `PUT /api/v1/access/assignments`. "*" => every
+# group the caller is in derives its own project role — the plain
+# `team-a member => operator on project:team-a` rule. Additive on top of
+# [roles]; omit the table to keep it off (deny-by-default). operator/developer
+# are the meaningful entries.
+#
+# [project_roles]
+# operator = ["*"]
+# strip_prefix = "/"   # Keycloak "/team-a" groups => project:team-a

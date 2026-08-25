@@ -40,6 +40,7 @@ async fn app(idp: &common::Idp, store: Arc<dyn Store>, head: SocketAddr) -> Rout
         issuer: idp.issuer.clone(),
         audience: "mobula".into(),
         groups_claim: "groups".into(),
+        project_roles: Default::default(),
         roles: mobula_auth::RoleMappings {
             admin: vec!["/platform-admins".into()],
             operator: vec!["/sre".into()],

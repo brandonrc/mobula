@@ -170,6 +170,7 @@ fn config(idp: &Idp, upstream: &str) -> ProxyConfig {
             issuer: idp.issuer.clone(),
             audience: "mobula".into(),
             groups_claim: "groups".into(),
+            project_roles: Default::default(),
             roles: RoleMappings {
                 developer: vec!["/ml-eng".into()],
                 viewer: vec!["/observers".into()],

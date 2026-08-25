@@ -10,7 +10,7 @@ use axum::http::{header, Request};
 use axum::response::IntoResponse;
 use axum::{Json, Router};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use mobula_auth::{AuthConfig, RoleMappings, Validator};
+use mobula_auth::{AuthConfig, ProjectRoleMappings, RoleMappings, Validator};
 use mobula_controller::Store;
 use mobula_core::ClusterRegistry;
 use rsa::pkcs1::EncodeRsaPrivateKey;
@@ -117,11 +117,67 @@ pub fn idp_token_sub(idp: &Idp, sub: &str, groups: &[&str]) -> String {
     encode(&header, &claims, &idp.encoding_key).unwrap()
 }
 
+/// Like [`idp_token_sub`] but also stamps `preferred_username` and lets the
+/// caller pick the groups — #88 (username-principal match key) and #103
+/// (group→project-role) tests need sub, username, and groups all controllable.
+pub fn idp_token_named(idp: &Idp, sub: &str, preferred_username: &str, groups: &[&str]) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let claims = serde_json::json!({
+        "sub": sub, "preferred_username": preferred_username,
+        "email": format!("{preferred_username}@example.com"),
+        "iss": idp.issuer, "aud": "mobula",
+        "exp": now + 300, "iat": now, "groups": groups,
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(KID.into());
+    encode(&header, &claims, &idp.encoding_key).unwrap()
+}
+
+/// Validator for the self-service tests (#103): global roles are admin-only
+/// (group `mobula-admins`, NO wildcard viewer), and `project_roles.operator =
+/// ["*"]` so membership in group `team-x` grants operator on `project:team-x`
+/// automatically — with no manual assignment. This is the exact shape the
+/// grace values render.
+async fn selfservice_validator(idp: &Idp) -> Arc<Validator> {
+    let config = AuthConfig {
+        issuer: idp.issuer.clone(),
+        audience: "mobula".into(),
+        groups_claim: "groups".into(),
+        roles: RoleMappings {
+            admin: vec!["mobula-admins".into()],
+            ..RoleMappings::default()
+        },
+        project_roles: ProjectRoleMappings {
+            operator: vec!["*".into()],
+            ..ProjectRoleMappings::default()
+        },
+    };
+    Arc::new(
+        Validator::discover(config, reqwest::Client::new(), true)
+            .await
+            .unwrap(),
+    )
+}
+
+/// Full app wired to [`selfservice_validator`] (#103) on `store`.
+pub async fn authed_app_selfservice(idp: &Idp, store: Arc<dyn Store>) -> Router {
+    mobula_api::build_app_full(
+        ClusterRegistry::default(),
+        Some(selfservice_validator(idp).await),
+        Some(store),
+        Default::default(),
+    )
+}
+
 async fn validator_for(idp: &Idp) -> Arc<Validator> {
     let config = AuthConfig {
         issuer: idp.issuer.clone(),
         audience: "mobula".into(),
         groups_claim: "groups".into(),
+        project_roles: Default::default(),
         roles: RoleMappings {
             admin: vec!["/platform-admins".into()],
             operator: vec!["/sre".into()],

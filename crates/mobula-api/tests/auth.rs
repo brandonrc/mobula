@@ -129,6 +129,7 @@ async fn validator_for(idp: &Idp) -> Arc<Validator> {
         issuer: idp.issuer.clone(),
         audience: "mobula".into(),
         groups_claim: "groups".into(),
+        project_roles: Default::default(),
         roles: RoleMappings {
             admin: vec!["/platform-admins".into()],
             operator: vec!["/sre".into()],
@@ -196,6 +197,7 @@ async fn http_issuer_is_refused_without_override() {
         issuer: idp.issuer.clone(),
         audience: "mobula".into(),
         groups_claim: "groups".into(),
+        project_roles: Default::default(),
         roles: RoleMappings::default(),
     };
     let err = match Validator::discover(config.clone(), reqwest::Client::new(), false).await {

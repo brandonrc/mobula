@@ -34,6 +34,7 @@ async fn app(idp: &common::Idp) -> axum::Router {
         issuer: idp.issuer.clone(),
         audience: "mobula".into(),
         groups_claim: "groups".into(),
+        project_roles: Default::default(),
         roles: mobula_auth::RoleMappings {
             admin: vec!["/platform-admins".into()],
             operator: vec!["/sre".into()],
@@ -124,6 +125,7 @@ async fn empty_registry_returns_an_empty_list() {
         issuer: idp.issuer.clone(),
         audience: "mobula".into(),
         groups_claim: "groups".into(),
+        project_roles: Default::default(),
         roles: mobula_auth::RoleMappings {
             admin: vec!["/platform-admins".into()],
             operator: vec![],

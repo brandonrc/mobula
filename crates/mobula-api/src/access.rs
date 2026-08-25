@@ -191,7 +191,9 @@ pub fn router(validator: Option<Arc<Validator>>, store: Option<Arc<dyn Store>>) 
 /// One assignment as the wire sees it.
 #[derive(Serialize, ToSchema)]
 pub struct AssignmentView {
-    /// The Identity `subject` the assignment applies to.
+    /// The principal the assignment applies to: a token `sub` (opaque
+    /// Keycloak UUID) or a `preferred_username` — evaluation matches BOTH, so
+    /// human-friendly username grants take effect (#88).
     pub principal: String,
     /// "viewer" | "developer" | "operator" | "admin".
     pub role: String,
@@ -231,6 +233,19 @@ pub struct DeleteAssignmentQuery {
 fn store_err(e: mobula_controller::StoreError) -> Response {
     tracing::warn!(error = %e, "access store error");
     (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+}
+
+/// Heuristic (#88): whether `principal` is shaped like a Keycloak `sub`
+/// (canonical UUID: `8-4-4-4-12` lowercase hex). Used only to decide whether
+/// to log a hint that a non-UUID principal must match a `preferred_username`.
+fn looks_like_sub_uuid(principal: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let parts: Vec<&str> = principal.split('-').collect();
+    parts.len() == groups.len()
+        && parts
+            .iter()
+            .zip(groups)
+            .all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// The store backing the assignments routes, or 503 in store-less
@@ -301,7 +316,7 @@ async fn list_assignments(
 /// are validated here — the store is dumb persistence.
 #[utoipa::path(
     put, path = "/api/v1/access/assignments/{principal}", tag = "access",
-    params(("principal" = String, Path, description = "The Identity subject to bind")),
+    params(("principal" = String, Path, description = "The principal to bind: a token `sub` (Keycloak UUID) or a `preferred_username` — both are matched at evaluation (#88)")),
     request_body = UpsertAssignment,
     responses(
         (status = 200, description = "Assignment stored", body = AssignmentView),
@@ -343,6 +358,18 @@ async fn upsert_assignment(
             ),
         )
             .into_response();
+    }
+    // #88: assignments are matched at evaluation time against BOTH the token
+    // `sub` (opaque Keycloak UUID) and `preferred_username`. A principal that
+    // is neither UUID-shaped nor obviously a username is likely a typo that
+    // will never match a caller — surface it (non-blocking; the grant is still
+    // stored, and a username principal is fully supported).
+    if !looks_like_sub_uuid(&principal) {
+        tracing::info!(
+            principal = %principal,
+            "assignment principal is not a Keycloak sub UUID: it will match a \
+             caller only if it equals their token preferred_username (#88)"
+        );
     }
     let store = require_store!(&st);
     if let Err(e) = store
@@ -431,5 +458,24 @@ async fn delete_assignment(
             (StatusCode::NOT_FOUND, "no such assignment").into_response()
         }
         Err(e) => store_err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_sub_uuid;
+
+    #[test]
+    fn uuid_heuristic_distinguishes_sub_from_username() {
+        // Canonical Keycloak sub UUIDs.
+        assert!(looks_like_sub_uuid("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(looks_like_sub_uuid("00000000-0000-0000-0000-000000000000"));
+        // Human-friendly principals that only match via preferred_username.
+        assert!(!looks_like_sub_uuid("alice"));
+        assert!(!looks_like_sub_uuid("alice@example.com"));
+        assert!(!looks_like_sub_uuid(""));
+        // Wrong shape / non-hex.
+        assert!(!looks_like_sub_uuid("123e4567e89b12d3a456426614174000"));
+        assert!(!looks_like_sub_uuid("123g4567-e89b-12d3-a456-426614174000"));
     }
 }
