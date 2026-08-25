@@ -113,6 +113,16 @@ impl Provisioner for EngineRouter {
         self.backend(engine).terminate(id).await
     }
 
+    async fn reap_network_policies(&self, id: &ClusterId) -> Result<(), ProvisionError> {
+        // #122: the per-cluster netpol name (`mobula-cluster-<id>`) is
+        // identical for both engines and lives in the one namespace, and by
+        // reap time the CR is typically gone so `engine_of` cannot resolve the
+        // owner. Reap on BOTH backends (idempotent — the second is a 404
+        // no-op) so the policy is gone regardless of which engine created it.
+        self.ray.reap_network_policies(id).await?;
+        self.dask.reap_network_policies(id).await
+    }
+
     async fn suspend(&self, id: &ClusterId) -> Result<(), ProvisionError> {
         let engine = self.engine_of(id).await;
         self.backend(engine).suspend(id).await
