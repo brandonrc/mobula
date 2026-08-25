@@ -227,6 +227,31 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "checkmaite-svc",
+      "name": "checkmaite api (on-behalf-of token exchange, #102)",
+      "description": "Trusted service that exchanges a user's token (RFC 8693) for a mobula-audience token carrying the human as subject, so Ray jobs submitted through Mobula attribute to the real user, not this service account. Closes checkmaite-frontend#25.",
+      "publicClient": false,
+      "secret": "checkmaite-svc-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "attributes": {
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "aud-mobula",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "mobula",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
     }
   ]
 }
