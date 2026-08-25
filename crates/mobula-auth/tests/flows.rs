@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::{Form, Json, Router};
-use mobula_auth::flows::{self, DevicePoll};
+use mobula_auth::flows::{self, DevicePoll, TokenExchange, GRANT_TYPE_TOKEN_EXCHANGE};
 
 #[derive(serde::Deserialize)]
 struct TokenForm {
@@ -17,14 +17,59 @@ struct TokenForm {
     client_id: Option<String>,
     #[serde(default)]
     client_secret: Option<String>,
+    #[serde(default)]
+    subject_token: Option<String>,
+    #[serde(default)]
+    subject_token_type: Option<String>,
+    #[serde(default)]
+    requested_token_type: Option<String>,
+    #[serde(default)]
+    audience: Option<String>,
 }
 
 /// Token endpoint: device grant is pending twice (second says slow_down),
-/// then succeeds; client_credentials checks the secret.
+/// then succeeds; client_credentials checks the secret; token-exchange
+/// (RFC 8693) checks the secret and swaps the subject_token for a
+/// user-scoped token addressed to the requested audience.
 async fn token(
     State(polls): State<Arc<AtomicUsize>>,
     Form(form): Form<TokenForm>,
 ) -> axum::response::Response {
+    if form.grant_type == GRANT_TYPE_TOKEN_EXCHANGE {
+        // A confidential client authenticates the exchange.
+        if form.client_secret.as_deref() != Some("s3cret") {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "invalid_client",
+                    "error_description": "bad secret"
+                })),
+            )
+                .into_response();
+        }
+        // The exchanged token's identity comes from the subject_token; a
+        // real IdP re-mints a JWT with the subject's `sub`. The mock echoes
+        // the subject token and the requested audience so the test can prove
+        // the swap happened and was addressed to Mobula.
+        assert_eq!(
+            form.requested_token_type.as_deref(),
+            Some("urn:ietf:params:oauth:token-type:access_token")
+        );
+        // new() defaults the subject token type to an access token.
+        assert_eq!(
+            form.subject_token_type.as_deref(),
+            Some("urn:ietf:params:oauth:token-type:access_token")
+        );
+        let subject_token = form.subject_token.clone().expect("subject_token required");
+        let audience = form.audience.clone().unwrap_or_default();
+        return Json(serde_json::json!({
+            "access_token": format!("exchanged:{subject_token}:aud={audience}"),
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "token_type": "Bearer",
+            "expires_in": 300,
+        }))
+        .into_response();
+    }
     match form.grant_type.as_str() {
         "urn:ietf:params:oauth:grant-type:device_code" => {
             assert_eq!(form.device_code.as_deref(), Some("dev-code-42"));
@@ -144,6 +189,31 @@ async fn client_credentials_success_and_bad_secret() {
     assert_eq!(token.access_token, "svc-token-for-ci-bot");
 
     let err = flows::client_credentials(&client, &format!("{base}/token"), "ci-bot", "wrong", None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid_client"), "{err}");
+}
+
+#[tokio::test]
+async fn token_exchange_swaps_subject_and_targets_audience() {
+    let base = spawn_idp().await;
+    let client = reqwest::Client::new();
+
+    // The service holds the user's gateway-verified token and exchanges it
+    // for a mobula-audience token that carries the USER as subject (#102).
+    let mut params = TokenExchange::new("checkmaite-svc", "s3cret", "users-live-token");
+    params.audience = Some("mobula");
+    let token = flows::exchange_token(&client, &format!("{base}/token"), &params)
+        .await
+        .unwrap();
+    // The exchanged token is derived from the user's subject token and was
+    // addressed to the Mobula audience — not a fresh service-account token.
+    assert_eq!(token.access_token, "exchanged:users-live-token:aud=mobula");
+    assert_eq!(token.expires_in, Some(300));
+
+    // A wrong client secret is rejected like any confidential grant.
+    let bad = TokenExchange::new("checkmaite-svc", "wrong", "users-live-token");
+    let err = flows::exchange_token(&client, &format!("{base}/token"), &bad)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("invalid_client"), "{err}");

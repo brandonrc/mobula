@@ -4,6 +4,10 @@
 //! a code, the user approves in a browser, the CLI polls for the token.
 //! Machines: Client Credentials Grant (RFC 6749 §4.4) — service accounts
 //! exchange id/secret for a token; Mobula never mints tokens itself.
+//! On-behalf-of: Token Exchange (RFC 8693) — a trusted service swaps its
+//! own credentials plus a user's token for a short-lived token that carries
+//! the USER as subject, so jobs submitted through the gateway attribute to
+//! the human, not the service account (#102, checkmaite-frontend#25).
 
 use serde::Deserialize;
 
@@ -192,9 +196,147 @@ pub async fn client_credentials(
         .map_err(|e| AuthError::Flow(e.without_url().to_string()))
 }
 
+/// RFC 8693 grant type for OAuth 2.0 Token Exchange.
+pub const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+/// RFC 8693 token-type URN for an OAuth 2.0 access token.
+pub const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
+/// RFC 8693 token-type URN for an OIDC ID token.
+pub const TOKEN_TYPE_ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
+
+/// Parameters for an RFC 8693 token exchange (see [`exchange_token`]).
+///
+/// Construct with [`TokenExchange::new`] (defaults `subject_token_type` to an
+/// access token) then set [`audience`](Self::audience)/[`scope`](Self::scope).
+#[derive(Clone)]
+pub struct TokenExchange<'a> {
+    /// The requesting (trusted) service's confidential client id — the
+    /// service that holds the user's gateway-verified token and is submitting
+    /// on their behalf (e.g. `checkmaite-svc`).
+    pub client_id: &'a str,
+    /// The requesting service's client secret.
+    pub client_secret: &'a str,
+    /// The subject token to exchange: the user's gateway-verified access
+    /// token (or id token), typically lifted from the gateway session
+    /// cookie. The exchanged token inherits THIS token's identity — its
+    /// `sub` becomes the exchanged token's subject, which is the whole point
+    /// (#102): the resulting token is the user's, not the service's.
+    pub subject_token: &'a str,
+    /// RFC 8693 type URN of `subject_token`: [`TOKEN_TYPE_ACCESS_TOKEN`]
+    /// (the [`TokenExchange::new`] default) or [`TOKEN_TYPE_ID_TOKEN`].
+    pub subject_token_type: &'a str,
+    /// Requested audience for the exchanged token (Keycloak's `audience`
+    /// form field). Set this to Mobula's audience/client id so the result
+    /// validates against the gateway with `aud=mobula`.
+    pub audience: Option<&'a str>,
+    /// Optional requested scope for the exchanged token.
+    pub scope: Option<&'a str>,
+}
+
+impl<'a> TokenExchange<'a> {
+    /// A token-exchange request for `subject_token` (typed as an access
+    /// token), authenticated by the given confidential client. Set
+    /// [`audience`](Self::audience) to the Mobula audience before exchanging.
+    pub fn new(client_id: &'a str, client_secret: &'a str, subject_token: &'a str) -> Self {
+        Self {
+            client_id,
+            client_secret,
+            subject_token,
+            subject_token_type: TOKEN_TYPE_ACCESS_TOKEN,
+            audience: None,
+            scope: None,
+        }
+    }
+}
+
+// Redacting Debug: client_secret and subject_token are bearer-equivalent
+// secrets (#33) — the subject_token is the user's live credential.
+impl std::fmt::Debug for TokenExchange<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenExchange")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("subject_token", &"[REDACTED]")
+            .field("subject_token_type", &self.subject_token_type)
+            .field("audience", &self.audience)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// RFC 8693 OAuth 2.0 Token Exchange. A trusted service swaps its own client
+/// credentials plus a user's `subject_token` for a NEW token whose subject is
+/// the USER, scoped to the requested `audience`.
+///
+/// Mobula uses this so a service submitting jobs on a human's behalf (e.g.
+/// checkmaite's api, #102 / checkmaite-frontend#25) obtains a short-lived,
+/// mobula-audience token that carries the human as `sub`. The service then
+/// submits that token through the gateway and Mobula attributes the job to
+/// the real user rather than the shared service account — closing the
+/// `created_by` spoof at its root. Mobula itself mints nothing: Keycloak
+/// performs the exchange and Mobula validates the result like any other
+/// bearer (aud/iss/exp + JWKS signature).
+///
+/// The `requested_token_type` is always an access token — that is what the
+/// `ray job submit` bearer path and the gateway consume.
+pub async fn exchange_token(
+    client: &reqwest::Client,
+    token_endpoint: &str,
+    params: &TokenExchange<'_>,
+) -> Result<TokenResponse, AuthError> {
+    let mut form = vec![
+        ("grant_type", GRANT_TYPE_TOKEN_EXCHANGE),
+        ("client_id", params.client_id),
+        ("client_secret", params.client_secret),
+        ("subject_token", params.subject_token),
+        ("subject_token_type", params.subject_token_type),
+        ("requested_token_type", TOKEN_TYPE_ACCESS_TOKEN),
+    ];
+    if let Some(audience) = params.audience {
+        form.push(("audience", audience));
+    }
+    if let Some(scope) = params.scope {
+        form.push(("scope", scope));
+    }
+    let res = client
+        .post(token_endpoint)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| AuthError::Flow(e.without_url().to_string()))?;
+    if !res.status().is_success() {
+        let err = res
+            .json::<TokenError>()
+            .await
+            .map_err(|e| AuthError::Flow(e.without_url().to_string()))?;
+        return Err(AuthError::Flow(format!(
+            "{}: {}",
+            err.error,
+            err.error_description.unwrap_or_default()
+        )));
+    }
+    res.json()
+        .await
+        .map_err(|e| AuthError::Flow(e.without_url().to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_exchange_debug_redacts_secrets() {
+        let mut x = TokenExchange::new("checkmaite-svc", "svc-secret", "user-subject-token");
+        x.audience = Some("mobula");
+        let s = format!("{x:?}");
+        assert!(!s.contains("svc-secret"), "{s}");
+        assert!(!s.contains("user-subject-token"), "{s}");
+        assert!(s.contains("[REDACTED]"));
+        // Non-secret fields stay visible for debugging.
+        assert!(s.contains("checkmaite-svc"), "{s}");
+        assert!(s.contains("mobula"), "{s}");
+        // Sensible defaults from the constructor.
+        assert_eq!(x.subject_token_type, TOKEN_TYPE_ACCESS_TOKEN);
+    }
 
     #[test]
     fn debug_redacts_secrets() {

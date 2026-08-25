@@ -7,7 +7,7 @@
 //! Only the southbound hop touches the network.
 
 mod common;
-use common::{idp_token, spawn_idp, Idp};
+use common::{idp_token, idp_token_sub, spawn_idp, Idp};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -138,6 +138,100 @@ async fn gateway_submission_is_recorded_and_listed_for_the_caller() {
     assert_eq!(jobs[0]["submitter"], "user-123");
     assert_eq!(jobs[0]["status"], "PENDING");
     assert!(jobs[0]["duration_secs"].is_null());
+}
+
+/// #102 / checkmaite-frontend#25: the architectural fix for the `created_by`
+/// spoof. A service (checkmaite api) submitting a job on a human's behalf uses
+/// RFC 8693 token exchange to obtain a token whose `sub` is the USER (audience
+/// mobula). Mobula validates it as any other bearer and the gateway records
+/// the token's subject as the submitter — so the job attributes to the human,
+/// NOT the service account. This test proves both directions: an exchanged
+/// user token records the user, while the service's own token would record the
+/// service. The exchange itself (service token + user token -> user token) is
+/// exercised in mobula-auth's `token_exchange_swaps_subject_and_targets_audience`;
+/// here we assert the attribution end-to-end on a token shaped like the
+/// exchange's output (sub = the real user, aud = mobula).
+#[tokio::test]
+async fn exchanged_user_token_attributes_job_to_the_user_not_the_service() {
+    let idp = spawn_idp().await;
+    let addr = spawn_ray_head(json!([])).await;
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let app = mobula_api::build_app_full(
+        registry_for(addr),
+        Some(validator_for(&idp).await),
+        Some(store.clone()),
+        Default::default(),
+    );
+    let admin = idp_token(&idp, &["/platform-admins"]);
+
+    // The output of token exchange: aud=mobula, sub = the real human. The
+    // service account never appears as the subject here.
+    let exchanged_user = idp_token_sub(&idp, "alice-human", &["/ml-eng"]);
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/")
+                .header(header::HOST, "demo.ray.test")
+                .header(header::AUTHORIZATION, format!("Bearer {exchanged_user}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"entrypoint":"python train.py"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Contrast: a job submitted under the service's OWN token (the pre-#102
+    // behaviour) records the service account, demonstrating exactly what the
+    // exchange changes. Distinct submission id so both records coexist.
+    let service = idp_token_sub(&idp, "checkmaite-svc", &["/ml-eng"]);
+    // The mock Ray head returns a fixed submission id, so records with the
+    // same id would collide; assert the service path against its own record by
+    // reading history after each submit instead.
+    let jobs = list_jobs(&app, &admin).await;
+    assert_eq!(jobs.as_array().unwrap().len(), 1);
+    assert_eq!(
+        jobs[0]["submitter"], "alice-human",
+        "exchanged token must attribute the job to the human, not the service"
+    );
+    assert_ne!(jobs[0]["submitter"], "checkmaite-svc");
+
+    // Prove the service token would record the service (same id overwrites the
+    // record's submitter to the service subject).
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/")
+                .header(header::HOST, "demo.ray.test")
+                .header(header::AUTHORIZATION, format!("Bearer {service}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"entrypoint":"python train.py"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let jobs = list_jobs(&app, &admin).await;
+    assert_eq!(
+        jobs[0]["submitter"], "checkmaite-svc",
+        "without exchange, the shared service account is recorded — the spoof #102 closes"
+    );
+}
+
+async fn list_jobs(app: &axum::Router, admin: &str) -> serde_json::Value {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/jobs")
+                .header(header::HOST, "mobula.example.com")
+                .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    body_json(res).await
 }
 
 #[tokio::test]

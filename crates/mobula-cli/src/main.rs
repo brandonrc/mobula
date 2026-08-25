@@ -147,6 +147,40 @@ enum Command {
         #[arg(long)]
         scope: Option<String>,
     },
+    /// Exchange a user's token for a Mobula-audience token that carries the
+    /// USER as subject (RFC 8693, #102). A trusted service uses this to submit
+    /// jobs on a human's behalf so the run attributes to the human, not the
+    /// service account. Prints the exchanged access token.
+    Exchange {
+        /// OIDC issuer URL (its token endpoint performs the exchange).
+        #[arg(long)]
+        issuer: String,
+        /// The trusted service's confidential client id (e.g. checkmaite-svc).
+        #[arg(long)]
+        client_id: String,
+        /// The service's client secret (or set MOBULA_CLIENT_SECRET to keep
+        /// it out of shell history).
+        #[arg(long, env = "MOBULA_CLIENT_SECRET", hide_env_values = true)]
+        client_secret: String,
+        /// The user's token to exchange (their gateway-verified access/id
+        /// token). Read from stdin with --subject-token-stdin instead to keep
+        /// it out of the process table.
+        #[arg(long, conflicts_with = "subject_token_stdin")]
+        subject_token: Option<String>,
+        /// Read the user's subject token from stdin (one line).
+        #[arg(long)]
+        subject_token_stdin: bool,
+        /// Treat the subject token as an OIDC id token rather than an access
+        /// token (RFC 8693 subject_token_type).
+        #[arg(long)]
+        id_token: bool,
+        /// Requested audience for the exchanged token (defaults to "mobula").
+        #[arg(long, default_value = "mobula")]
+        audience: String,
+        /// Optional requested scope.
+        #[arg(long)]
+        scope: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -398,6 +432,34 @@ async fn main() -> std::io::Result<()> {
                 }
             }
         },
+        Command::Exchange {
+            issuer,
+            client_id,
+            client_secret,
+            subject_token,
+            subject_token_stdin,
+            id_token,
+            audience,
+            scope,
+        } => {
+            let subject_token = if subject_token_stdin {
+                read_line_from_stdin()?
+            } else {
+                subject_token.ok_or_else(|| {
+                    std::io::Error::other("provide --subject-token or --subject-token-stdin")
+                })?
+            };
+            exchange_user_token(
+                &issuer,
+                &client_id,
+                &client_secret,
+                &subject_token,
+                id_token,
+                &audience,
+                scope.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -907,6 +969,49 @@ async fn service_token(
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     // Print only the token so it composes: $(mobula token --issuer ...)
+    println!("{}", token.access_token);
+    Ok(())
+}
+
+/// Read one trimmed, non-empty line from stdin (for piped secrets).
+fn read_line_from_stdin() -> std::io::Result<String> {
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)?;
+    let line = line.trim_end_matches(['\n', '\r']).to_string();
+    if line.is_empty() {
+        return Err(std::io::Error::other("empty input on stdin"));
+    }
+    Ok(line)
+}
+
+/// RFC 8693 token exchange (#102): swap the user's `subject_token` for a
+/// Mobula-audience token whose subject is the USER, so a service submitting on
+/// their behalf attributes runs to the human. Prints only the exchanged token.
+async fn exchange_user_token(
+    issuer: &str,
+    client_id: &str,
+    client_secret: &str,
+    subject_token: &str,
+    id_token: bool,
+    audience: &str,
+    scope: Option<&str>,
+) -> std::io::Result<()> {
+    let client = mobula_auth::idp_client();
+    let meta = mobula_auth::discover_metadata(&client, issuer)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let token_ep = meta
+        .token_endpoint
+        .ok_or_else(|| std::io::Error::other("issuer does not advertise a token_endpoint"))?;
+    let mut params = flows::TokenExchange::new(client_id, client_secret, subject_token);
+    if id_token {
+        params.subject_token_type = flows::TOKEN_TYPE_ID_TOKEN;
+    }
+    params.audience = Some(audience);
+    params.scope = scope;
+    let token = flows::exchange_token(&client, &token_ep, &params)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     println!("{}", token.access_token);
     Ok(())
 }
