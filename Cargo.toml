@@ -51,7 +51,7 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tower = { version = "0.5", features = ["util", "limit"] }
-tower-http = { version = "0.6", features = ["timeout", "limit"] }
+tower-http = { version = "0.7", features = ["timeout", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 utoipa = { version = "5", features = ["axum_extras"] }
