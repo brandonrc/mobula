@@ -113,6 +113,17 @@ impl KubeRayProvisioner {
         })
     }
 
+    /// Construct from an already-connected client (used by the router so both
+    /// engines share one `kube::Client`, and by tests that inject a mock
+    /// client). Mirrors [`DaskProvisioner::with_client`].
+    pub fn with_client(client: Client, namespace: impl Into<String>, autoscaling: bool) -> Self {
+        Self {
+            client,
+            namespace: namespace.into(),
+            autoscaling,
+        }
+    }
+
     fn api(&self) -> Api<DynamicObject> {
         Api::namespaced_with(self.client.clone(), &self.namespace, &raycluster_resource())
     }

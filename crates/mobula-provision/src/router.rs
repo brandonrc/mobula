@@ -210,3 +210,220 @@ impl Provisioner for EngineRouter {
         self.backend(engine).cluster_logs(id, pod, tail).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{dask_pod, daskcluster_cr, mock_client, Fixture, Recorder};
+    use mobula_core::{ClusterState, WorkerGroup};
+    use serde_json::json;
+
+    fn dask_spec() -> ClusterSpec {
+        ClusterSpec {
+            name: "d1".into(),
+            project: "p".into(),
+            engine: Engine::Dask,
+            ray_version: String::new(),
+            image: "ghcr.io/dask/dask:latest".into(),
+            head_cpu: "1".into(),
+            head_memory: "2Gi".into(),
+            worker_groups: vec![WorkerGroup {
+                name: "default".into(),
+                cpu: "2".into(),
+                memory: "4Gi".into(),
+                gpu: None,
+                min_replicas: 1,
+                max_replicas: 1,
+                replicas: 1,
+            }],
+            ttl_seconds: None,
+            idle_timeout_secs: None,
+            owner: None,
+        }
+    }
+
+    fn ray_spec() -> ClusterSpec {
+        ClusterSpec {
+            engine: Engine::Ray,
+            ray_version: "2.57.0".into(),
+            image: "rayproject/ray:2.57.0".into(),
+            ..dask_spec()
+        }
+    }
+
+    fn raycluster_cr(name: &str) -> serde_json::Value {
+        json!({
+            "apiVersion": "ray.io/v1",
+            "kind": "RayCluster",
+            "metadata": {
+                "name": name, "namespace": "test-ns",
+                "annotations": { "mobula.dev/generation": "1" },
+            },
+            "spec": {},
+            "status": { "state": "ready" },
+        })
+    }
+
+    /// Build a router whose Ray and Dask backends each speak to their own mock
+    /// client, returning both recorders so a test can prove which backend a
+    /// call was dispatched to.
+    fn router(ray_fx: Fixture, dask_fx: Fixture) -> (EngineRouter, Recorder, Recorder) {
+        let (ray_client, ray_rec) = mock_client(ray_fx);
+        let (dask_client, dask_rec) = mock_client(dask_fx);
+        let ray = Arc::new(KubeRayProvisioner::with_client(
+            ray_client, "test-ns", false,
+        ));
+        let dask = Arc::new(DaskProvisioner::with_client(dask_client, "test-ns"));
+        (EngineRouter::from_parts(ray, dask), ray_rec, dask_rec)
+    }
+
+    fn touched(rec: &Recorder, needle: &str) -> bool {
+        rec.lock().unwrap().iter().any(|(_, p)| p.contains(needle))
+    }
+
+    #[tokio::test]
+    async fn apply_routes_dask_spec_to_dask_backend() {
+        let (r, ray_rec, dask_rec) = router(Fixture::default(), Fixture::default());
+        r.apply(&ClusterId("d1".into()), &dask_spec(), 1, "k", None)
+            .await
+            .unwrap();
+        assert!(touched(&dask_rec, "/daskclusters/d1"));
+        assert!(!touched(&ray_rec, "/rayclusters"), "ray must be untouched");
+    }
+
+    #[tokio::test]
+    async fn apply_routes_ray_spec_to_ray_backend() {
+        let (r, ray_rec, dask_rec) = router(Fixture::default(), Fixture::default());
+        r.apply(&ClusterId("r1".into()), &ray_spec(), 1, "k", None)
+            .await
+            .unwrap();
+        assert!(touched(&ray_rec, "/rayclusters/r1"));
+        assert!(
+            !touched(&dask_rec, "/daskclusters"),
+            "dask must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_resolves_from_cache_after_apply() {
+        let dask_fx = Fixture {
+            daskcluster: Some(daskcluster_cr("d1", 1, Some("Pending"))),
+            pods: vec![
+                dask_pod("d1", "scheduler", "Running", true),
+                dask_pod("d1", "worker", "Running", true),
+            ],
+            ..Default::default()
+        };
+        let (r, ray_rec, _dask_rec) = router(Fixture::default(), dask_fx);
+        // apply warms the cache (d1 → Dask).
+        r.apply(&ClusterId("d1".into()), &dask_spec(), 1, "k", None)
+            .await
+            .unwrap();
+        let obs = r.observe(&ClusterId("d1".into())).await.unwrap();
+        // #121 pod-based readiness flows through the router unchanged.
+        assert_eq!(obs.state, ClusterState::Running);
+        assert!(
+            !touched(&ray_rec, "/rayclusters"),
+            "cached Dask id must never probe Ray"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_cold_miss_probes_dask_then_hits_it() {
+        // No prior apply: the router must probe Dask, find the CR, and serve it.
+        let dask_fx = Fixture {
+            daskcluster: Some(daskcluster_cr("d1", 2, Some("Pending"))),
+            pods: vec![
+                dask_pod("d1", "scheduler", "Running", true),
+                dask_pod("d1", "worker", "Running", true),
+            ],
+            ..Default::default()
+        };
+        let (r, ray_rec, dask_rec) = router(Fixture::default(), dask_fx);
+        let obs = r.observe(&ClusterId("d1".into())).await.unwrap();
+        assert_eq!(obs.state, ClusterState::Running);
+        assert!(touched(&dask_rec, "/daskclusters/d1"));
+        assert!(!touched(&ray_rec, "/rayclusters"));
+    }
+
+    #[tokio::test]
+    async fn observe_cold_miss_falls_back_to_ray_when_not_dask() {
+        // Dask probe 404s (no such DaskCluster) → the router serves Ray.
+        let ray_fx = Fixture {
+            raycluster: Some(raycluster_cr("r1")),
+            ..Default::default()
+        };
+        let (r, ray_rec, dask_rec) = router(ray_fx, Fixture::default());
+        let obs = r.observe(&ClusterId("r1".into())).await.unwrap();
+        assert_eq!(obs.state, ClusterState::Running);
+        assert!(touched(&dask_rec, "/daskclusters/r1"), "probed Dask first");
+        assert!(touched(&ray_rec, "/rayclusters/r1"), "then served from Ray");
+    }
+
+    #[tokio::test]
+    async fn terminate_resolves_engine_via_cold_probe() {
+        let dask_fx = Fixture {
+            daskcluster: Some(daskcluster_cr("d1", 1, Some("Pending"))),
+            pods: vec![dask_pod("d1", "scheduler", "Running", true)],
+            ..Default::default()
+        };
+        let (r, ray_rec, dask_rec) = router(Fixture::default(), dask_fx);
+        r.terminate(&ClusterId("d1".into())).await.unwrap();
+        assert!(touched(&dask_rec, "/daskclusters/d1"));
+        assert!(!touched(&ray_rec, "/rayclusters"));
+    }
+
+    #[tokio::test]
+    async fn nodes_resolve_via_engine_of() {
+        let dask_fx = Fixture {
+            daskcluster: Some(daskcluster_cr("d1", 1, None)),
+            pods: vec![
+                dask_pod("d1", "scheduler", "Running", true),
+                dask_pod("d1", "worker", "Running", true),
+            ],
+            ..Default::default()
+        };
+        let (r, _ray_rec, dask_rec) = router(Fixture::default(), dask_fx);
+        let nodes = r
+            .cluster_nodes(&ClusterId("d1".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(nodes.head.is_some());
+        assert!(touched(&dask_rec, "/pods"));
+    }
+
+    #[tokio::test]
+    async fn list_fans_out_to_both_backends_and_warms_cache() {
+        let ray_fx = Fixture {
+            ray_list: vec![raycluster_cr("r1")],
+            ..Default::default()
+        };
+        let dask_fx = Fixture {
+            dask_list: vec![daskcluster_cr("d1", 1, Some("Running"))],
+            ..Default::default()
+        };
+        let (r, _ray_rec, _dask_rec) = router(ray_fx, dask_fx);
+        let all = r.list().await.unwrap();
+        let ids: Vec<&str> = all.iter().map(|o| o.id.0.as_str()).collect();
+        assert!(ids.contains(&"r1"), "ray cluster listed");
+        assert!(ids.contains(&"d1"), "dask cluster listed");
+        // Cache warmed by list ⇒ metrics_endpoint routes by engine without I/O.
+        assert!(r.metrics_endpoint(&ClusterId("d1".into())).is_none());
+        assert!(r.metrics_endpoint(&ClusterId("r1".into())).is_some());
+        assert!(r.dashboard_api_base(&ClusterId("d1".into())).is_none());
+        assert!(r.dashboard_api_base(&ClusterId("r1".into())).is_some());
+    }
+
+    #[tokio::test]
+    async fn suspend_resume_route_to_engine() {
+        // Dask suspend/resume are no-ops but must dispatch without error.
+        let dask_fx = Fixture {
+            daskcluster: Some(daskcluster_cr("d1", 1, Some("Pending"))),
+            ..Default::default()
+        };
+        let (r, _ray_rec, _dask_rec) = router(Fixture::default(), dask_fx);
+        r.suspend(&ClusterId("d1".into())).await.unwrap();
+        r.resume(&ClusterId("d1".into())).await.unwrap();
+    }
+}

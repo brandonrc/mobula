@@ -164,6 +164,23 @@ impl DaskProvisioner {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// List the pods the dask-operator owns for cluster `id` (selector
+    /// `dask.org/cluster-name=<id>`), as raw JSON values for the pure mappers
+    /// in [`super::dask`]. Shared by `observe` (pod-based readiness, #121) and
+    /// `cluster_nodes` (the node breakdown).
+    async fn list_cluster_pods(&self, id: &str) -> Result<Vec<serde_json::Value>, ProvisionError> {
+        let pods: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &pod_resource());
+        let params =
+            ListParams::default().labels(&format!("{}={}", dask::DASK_CLUSTER_NAME_LABEL, id));
+        Ok(pods
+            .list(&params)
+            .await?
+            .into_iter()
+            .filter_map(|p| serde_json::to_value(&p).ok())
+            .collect())
+    }
 }
 
 fn observed_generation(obj: &DynamicObject) -> Option<u64> {
@@ -273,9 +290,30 @@ impl Provisioner for DaskProvisioner {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         let spec_fingerprint = obj.data.get("spec").and_then(dask::fingerprint_from_cr);
+
+        // #121: derive observed state from the POD state, not the DaskCluster
+        // `.status.phase`. The operator can only write that phase when the
+        // installed CRD serves a `status` subresource; without one it never
+        // leaves `Pending`, so a pod-based signal is what actually reports
+        // Running. Fall back to the CR phase only when no pods are visible
+        // (none created yet, or the pod list failed) — never let a transient
+        // pod-list error regress a cluster's observed state.
+        let state = match self.list_cluster_pods(&id.0).await {
+            Ok(pods) => dask::observed_state_from_pods(&pods)
+                .unwrap_or_else(|| dask::status_to_state(&status)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "mobula::audit",
+                    cluster = %id, error = %e,
+                    "dask pod list failed during observe; falling back to CR phase"
+                );
+                dask::status_to_state(&status)
+            }
+        };
+
         Ok(ObservedCluster {
             id: id.clone(),
-            state: dask::status_to_state(&status),
+            state,
             observed_generation: observed_generation(&obj),
             spec_fingerprint,
             api_base_url: None,
@@ -321,16 +359,186 @@ impl Provisioner for DaskProvisioner {
             .await
             .map_err(|e| map_absent(id, e))?
             .ok_or_else(|| ProvisionError::NotFound(id.clone()))?;
-        let pods: Api<DynamicObject> =
-            Api::namespaced_with(self.client.clone(), &self.namespace, &pod_resource());
-        let params =
-            ListParams::default().labels(&format!("{}={}", dask::DASK_CLUSTER_NAME_LABEL, id.0));
-        let pod_values: Vec<serde_json::Value> = pods
-            .list(&params)
-            .await?
-            .into_iter()
-            .filter_map(|p| serde_json::to_value(&p).ok())
-            .collect();
+        let pod_values = self.list_cluster_pods(&id.0).await?;
         Ok(Some(dask::node_breakdown(&id.0, &pod_values)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{dask_pod, daskcluster_cr, mock_client, Fixture};
+    use mobula_core::{ClusterState, Engine, WorkerGroup};
+
+    fn spec() -> ClusterSpec {
+        ClusterSpec {
+            name: "c1".into(),
+            project: "p".into(),
+            engine: Engine::Dask,
+            ray_version: String::new(),
+            image: "ghcr.io/dask/dask:latest".into(),
+            head_cpu: "1".into(),
+            head_memory: "2Gi".into(),
+            worker_groups: vec![WorkerGroup {
+                name: "default".into(),
+                cpu: "2".into(),
+                memory: "4Gi".into(),
+                gpu: None,
+                min_replicas: 1,
+                max_replicas: 1,
+                replicas: 1,
+            }],
+            ttl_seconds: None,
+            idle_timeout_secs: None,
+            owner: Some("bob".into()),
+        }
+    }
+
+    fn prov(fx: Fixture) -> (DaskProvisioner, crate::test_support::Recorder) {
+        let (client, rec) = mock_client(fx);
+        (DaskProvisioner::with_client(client, "test-ns"), rec)
+    }
+
+    #[tokio::test]
+    async fn observe_reports_running_from_pods_even_when_cr_phase_pending() {
+        // #121: the CR is stuck at phase=Pending (its CRD has no status
+        // subresource) but the pods are up — pod truth must win.
+        let (prov, _rec) = prov(Fixture {
+            daskcluster: Some(daskcluster_cr("c1", 3, Some("Pending"))),
+            pods: vec![
+                dask_pod("c1", "scheduler", "Running", true),
+                dask_pod("c1", "worker", "Running", true),
+            ],
+            ..Default::default()
+        });
+        let obs = prov.observe(&ClusterId("c1".into())).await.unwrap();
+        assert_eq!(obs.state, ClusterState::Running);
+        assert_eq!(obs.observed_generation, Some(3));
+        assert!(obs.spec_fingerprint.is_some());
+        assert!(obs.api_base_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn observe_falls_back_to_cr_phase_when_no_pods() {
+        // No pods visible yet → fall back to the CR phase rather than
+        // reporting a bogus Provisioning.
+        let (prov, _rec) = prov(Fixture {
+            daskcluster: Some(daskcluster_cr("c1", 1, Some("Running"))),
+            pods: vec![],
+            ..Default::default()
+        });
+        let obs = prov.observe(&ClusterId("c1".into())).await.unwrap();
+        assert_eq!(obs.state, ClusterState::Running);
+    }
+
+    #[tokio::test]
+    async fn observe_provisioning_from_pods_while_worker_pending() {
+        let (prov, _rec) = prov(Fixture {
+            daskcluster: Some(daskcluster_cr("c1", 1, Some("Pending"))),
+            pods: vec![
+                dask_pod("c1", "scheduler", "Running", true),
+                dask_pod("c1", "worker", "Pending", false),
+            ],
+            ..Default::default()
+        });
+        let obs = prov.observe(&ClusterId("c1".into())).await.unwrap();
+        assert_eq!(obs.state, ClusterState::Provisioning);
+    }
+
+    #[tokio::test]
+    async fn observe_absent_cr_is_not_found() {
+        let (prov, _rec) = prov(Fixture::default());
+        let err = prov.observe(&ClusterId("nope".into())).await.unwrap_err();
+        assert!(matches!(err, ProvisionError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn apply_ensures_allow_then_patches_cluster() {
+        let (prov, rec) = prov(Fixture::default());
+        let resp = prov
+            .apply(&ClusterId("c1".into()), &spec(), 5, "key", None)
+            .await
+            .unwrap();
+        assert_eq!(resp.generation, 5);
+        assert!(
+            resp.api_base_url.is_none(),
+            "dask has no job/dashboard base"
+        );
+        let calls = rec.lock().unwrap().clone();
+        // Admin-deny probe + per-owner allow apply precede the CR patch.
+        assert!(calls
+            .iter()
+            .any(|(m, p)| m == "GET" && p.contains("/networkpolicies")));
+        assert!(calls
+            .iter()
+            .any(|(m, p)| m == "PATCH" && p.contains("/networkpolicies")));
+        assert!(calls
+            .iter()
+            .any(|(m, p)| m == "PATCH" && p.contains("/daskclusters/c1")));
+    }
+
+    #[tokio::test]
+    async fn terminate_deletes_cluster_and_allow_policy() {
+        let (prov, rec) = prov(Fixture::default());
+        prov.terminate(&ClusterId("c1".into())).await.unwrap();
+        let calls = rec.lock().unwrap().clone();
+        assert!(calls
+            .iter()
+            .any(|(m, p)| m == "DELETE" && p.contains("/daskclusters/c1")));
+        assert!(calls
+            .iter()
+            .any(|(m, p)| m == "DELETE" && p.contains("/networkpolicies")));
+    }
+
+    #[tokio::test]
+    async fn list_maps_items_and_generation() {
+        let (prov, _rec) = prov(Fixture {
+            dask_list: vec![daskcluster_cr("c1", 2, Some("Running"))],
+            ..Default::default()
+        });
+        let list = prov.list().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id.0, "c1");
+        assert_eq!(list[0].observed_generation, Some(2));
+        assert!(list[0].spec_fingerprint.is_some());
+    }
+
+    #[tokio::test]
+    async fn cluster_nodes_splits_scheduler_and_workers() {
+        let (prov, _rec) = prov(Fixture {
+            daskcluster: Some(daskcluster_cr("c1", 1, None)),
+            pods: vec![
+                dask_pod("c1", "scheduler", "Running", true),
+                dask_pod("c1", "worker", "Running", true),
+                dask_pod("c1", "worker", "Pending", false),
+            ],
+            ..Default::default()
+        });
+        let nodes = prov
+            .cluster_nodes(&ClusterId("c1".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(nodes.head.as_ref().unwrap().is_head);
+        assert_eq!(nodes.worker_groups.len(), 1);
+        assert_eq!(nodes.worker_groups[0].nodes.len(), 2);
+        assert_eq!(nodes.worker_groups[0].ready, 1);
+    }
+
+    #[tokio::test]
+    async fn cluster_nodes_absent_cr_is_not_found() {
+        let (prov, _rec) = prov(Fixture::default());
+        let err = prov
+            .cluster_nodes(&ClusterId("gone".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProvisionError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn suspend_and_resume_are_noops() {
+        let (prov, _rec) = prov(Fixture::default());
+        prov.suspend(&ClusterId("c1".into())).await.unwrap();
+        prov.resume(&ClusterId("c1".into())).await.unwrap();
     }
 }
