@@ -880,6 +880,108 @@ mod tests {
         );
     }
 
+    /// Guards against registry drift: a handler carrying `#[utoipa::path]`
+    /// but missing from `ApiDoc`'s `paths(...)` list compiles fine and
+    /// silently drops out of the exported contract. Pins the document to
+    /// the exact operation set and cross-checks the decorator count in the
+    /// crate's sources, so adding an endpoint without registering it (or
+    /// registering without updating this list) fails here.
+    #[test]
+    fn openapi_document_registers_every_annotated_operation() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let mut actual = std::collections::BTreeSet::new();
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            for method in item.as_object().unwrap().keys() {
+                actual.insert(format!("{} {path}", method.to_uppercase()));
+            }
+        }
+
+        let expected: std::collections::BTreeSet<String> = [
+            "GET /api/v1/access/assignments",
+            "DELETE /api/v1/access/assignments/{principal}",
+            "PUT /api/v1/access/assignments/{principal}",
+            "GET /api/v1/access/roles",
+            "GET /api/v1/audit",
+            "GET /api/v1/audit/verify",
+            "POST /api/v1/auth/login",
+            "POST /api/v1/auth/logout",
+            "GET /api/v1/auth/providers",
+            "GET /api/v1/auth/tokens",
+            "POST /api/v1/auth/tokens",
+            "DELETE /api/v1/auth/tokens/{prefix}",
+            "GET /api/v1/auth/users",
+            "POST /api/v1/auth/users",
+            "PUT /api/v1/auth/users/{username}",
+            "GET /api/v1/clusters",
+            "POST /api/v1/clusters",
+            "DELETE /api/v1/clusters/{id}",
+            "GET /api/v1/clusters/{id}",
+            "GET /api/v1/clusters/{id}/events",
+            "GET /api/v1/clusters/{id}/jobs",
+            "GET /api/v1/clusters/{id}/logs",
+            "GET /api/v1/clusters/{id}/metrics",
+            "GET /api/v1/clusters/{id}/nodes",
+            "POST /api/v1/clusters/{id}/resume",
+            "POST /api/v1/clusters/{id}/suspend",
+            "GET /api/v1/identity",
+            "GET /api/v1/jobs",
+            "GET /api/v1/metrics",
+            "GET /api/v1/pools",
+            "POST /api/v1/pools",
+            "DELETE /api/v1/pools/{name}",
+            "GET /api/v1/pools/{name}",
+            "GET /api/v1/pools/{name}/allocations",
+            "DELETE /api/v1/pools/{name}/allocations/{project}",
+            "PUT /api/v1/pools/{name}/allocations/{project}",
+            "GET /api/v1/pools/{name}/usage",
+            "GET /api/v1/registry/clusters",
+            "GET /api/v1/services",
+            "POST /api/v1/services",
+            "DELETE /api/v1/services/{name}",
+            "GET /api/v1/services/{name}",
+            "GET /api/v1/settings/policy",
+            "PUT /api/v1/settings/policy",
+            "GET /api/v1/usage",
+            "GET /api/v1/version",
+            "GET /healthz",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let missing: Vec<_> = expected.difference(&actual).collect();
+        let unexpected: Vec<_> = actual.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && unexpected.is_empty(),
+            "operation set drifted — missing from doc: {missing:?}; \
+             in doc but not expected here (add to this list): {unexpected:?}"
+        );
+
+        // Cross-check the decorator count so a handler that is annotated
+        // but never registered (and so absent from both sets above) still
+        // trips the guard.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Split so the needle does not count its own occurrence here.
+        let needle = concat!("#[utoipa::", "path(");
+        let mut annotated = 0;
+        for entry in std::fs::read_dir(src_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                annotated += std::fs::read_to_string(&path)
+                    .unwrap()
+                    .matches(needle)
+                    .count();
+            }
+        }
+        assert_eq!(
+            actual.len(),
+            annotated,
+            "{annotated} #[utoipa::path] decorators in src/ but {} operations \
+             in the document — register the new handler in ApiDoc paths(...)",
+            actual.len()
+        );
+    }
+
     /// Emit the OpenAPI document to `openapi.json` at the repo root so
     /// mobula-ui (and its codegen) can vendor a committed contract without
     /// running the server. Run with `cargo test -p mobula-api export_openapi`.
